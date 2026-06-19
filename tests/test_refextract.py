@@ -778,3 +778,17 @@ class TestSectionLabelProseNotReferenceShaped:
         assert _is_reference_shaped(entry) is True, (
             f"E10 reference entry no longer reference-shaped: {entry!r}"
         )
+
+
+def test_list_enumerators_excluded_from_numeric_cites(tmp_path):
+    # "(1) … (2) … (3)" running 1..k are list enumerators (prose), not citations;
+    # a multi-number "(3,4)" and a non-run single "(5)" remain real citations.
+    doc = _build_doc(tmp_path, [
+        "We identified three phenotypes: (1) severe impairment, (2) moderate "
+        "impairment, and (3) preserved functioning across the whole cohort here.",
+        "These scores were calibrated (3,4) and validated previously (5) in "
+        "independent samples reported elsewhere in the prior literature here.",
+    ])
+    nums = [e["text"] for e in extract_references(doc)["intext"] if e["kind"] == "numeric"]
+    assert "(1)" not in nums and "(2)" not in nums and "(3)" not in nums  # enumerators dropped
+    assert "(3,4)" in nums and "(5)" in nums                              # real cites kept

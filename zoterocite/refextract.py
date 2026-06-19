@@ -369,6 +369,25 @@ def _is_numeric_cite(inner: str) -> bool:
     return True
 
 
+def _enumerator_run_indices(matches: list) -> set:
+    """Indices (into *matches*) of single-number PARENTHETICAL markers that form an
+    in-order ``1, 2, …, k`` run (k >= 2) — i.e. list enumerators like
+    ``"(1) severe …, (2) moderate …, (3) preserved …"``, which are prose, not cites.
+
+    Only single-number parentheticals are considered: bracketed ``[n]`` and
+    multi-number ``(1,2)``/``(3-5)`` are citation lists/ranges, never enumerators.
+    The run must be exactly ``1..k`` ascending, so a real single cite like ``(5)``
+    — or a non-consecutive set like ``(2), (6)`` — is left alone as a citation."""
+    singles = [(j, int(m.group(1).strip()))
+               for j, m in enumerate(matches)
+               if m.group(0).startswith("(") and m.group(1).strip().isdigit()]
+    if len(singles) < 2:
+        return set()
+    if [v for _, v in singles] == list(range(1, len(singles) + 1)):
+        return {j for j, _ in singles}
+    return set()
+
+
 def _is_placeholder_bracket(inner: str) -> bool:
     """Return True if bracketed content looks like a citation placeholder."""
     if _DEFINITE_PLACEHOLDER_RE.search(inner):
@@ -579,16 +598,20 @@ def extract_references(path) -> dict:
             })
             intext_counter += 1
 
-        # Numeric: [12], [3,4], [5-7]
-        for m in _NUMERIC_CITE_RE.finditer(txt):
-            inner = m.group(1)
-            if _is_numeric_cite(inner):
-                intext.append({
-                    "index": intext_counter,
-                    "text": m.group(0),
-                    "kind": "numeric",
-                })
-                intext_counter += 1
+        # Numeric: [12], [3,4], (1,2) — but EXCLUDE list enumerators "(1) … (2) … (3)"
+        # (single-number parentheticals running 1..k); those are prose, not citations.
+        numeric_matches = [m for m in _NUMERIC_CITE_RE.finditer(txt)
+                           if _is_numeric_cite(m.group(1))]
+        enum_idxs = _enumerator_run_indices(numeric_matches)
+        for j, m in enumerate(numeric_matches):
+            if j in enum_idxs:
+                continue
+            intext.append({
+                "index": intext_counter,
+                "text": m.group(0),
+                "kind": "numeric",
+            })
+            intext_counter += 1
 
     # -----------------------------------------------------------------------
     # 7. Scan for bracket placeholders in body paragraphs
