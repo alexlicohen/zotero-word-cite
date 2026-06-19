@@ -438,6 +438,32 @@ def scan_citations(path) -> List[dict]:
     return out
 
 
+def existing_renderings(root) -> set:
+    """Rendered citation text (``formattedCitation`` / ``plainCitation``) of every
+    existing ``ZOTERO_ITEM`` field in an already-loaded document ``root``.
+
+    Used to skip RE-citing an in-text marker that is ALREADY a live Zotero field:
+    refextract reads markers from rendered text and can't tell a live field's
+    output (e.g. ``(1,2)``) from plain typed text, so a caller about to convert
+    plain-text cites must avoid clobbering fields that are already managed.
+    """
+    out: set = set()
+    for code in _field_codes(root):
+        c = code.strip()
+        if "ZOTERO_ITEM CSL_CITATION" not in c or "{" not in c:
+            continue
+        try:
+            data = json.loads(c[c.index("{"): c.rindex("}") + 1])
+        except json.JSONDecodeError:
+            continue
+        props = data.get("properties") or {}
+        for k in ("formattedCitation", "plainCitation"):
+            v = (props.get(k) or "").strip()
+            if v:
+                out.add(v)
+    return out
+
+
 def check_links(path) -> List[dict]:
     """Verify each cited item against the configured Zotero library.
 

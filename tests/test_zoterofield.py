@@ -44,6 +44,22 @@ def test_insert_live_zotero_field(tmp_path):
     assert "(1)" in read_views(out)["accepted"]
 
 
+def test_existing_renderings_reports_live_field_text(tmp_path):
+    # existing_renderings backs the unify-refs guard that must NOT re-cite a marker
+    # already produced by a live Zotero field (which would clobber it with a raw key).
+    src = tmp_path / "src.docx"
+    new_doc(src, ["This sentence ends with a citation here."])
+    doc = Docx(src)
+    insert_citation(doc, "citation here", ["X8ISWWQ2"],
+                    itemdata=[ITEMDATA], uris=[URI], rendered="(1,2)", style="vancouver")
+    out = tmp_path / "out.docx"; doc.save(out)
+    root = Docx(out).read_tree(zoterofield.DOCUMENT)
+    assert "(1,2)" in zoterofield.existing_renderings(root)
+    # a doc with no Zotero fields yields an empty set (nothing to protect)
+    bare = tmp_path / "bare.docx"; new_doc(bare, ["No citations at all here."])
+    assert zoterofield.existing_renderings(Docx(bare).read_tree(zoterofield.DOCUMENT)) == set()
+
+
 def test_pref_added_only_once(tmp_path):
     src = tmp_path / "s.docx"
     new_doc(src, ["First spot here.", "Second spot here."])

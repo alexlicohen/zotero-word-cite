@@ -889,6 +889,13 @@ def apply_unification(
         from .paras import find_paragraphs
         return len(find_paragraphs(root, anchor)) == 1
 
+    # Rendered text of citations that are ALREADY live Zotero fields. refextract
+    # reads markers from rendered text, so a field rendering "(1,2)" is indistinguishable
+    # from plain typed "(1,2)"; re-citing such a marker would overwrite the existing
+    # field with a raw-key render. Snapshot BEFORE any insertion mutates the tree, and
+    # skip those markers below — only manual/foreign-text cites should be converted.
+    already_live = zoterofield.existing_renderings(root)
+
     # in-text markers for accepted references
     for pl in placements:
         if pl["key"] is None or pl["is_ph"]:
@@ -902,6 +909,10 @@ def apply_unification(
         # ``intext_markers``. ``_dedup_markers`` keeps each physical marker once.
         for marker in _resolve_link_markers(pl, intext_by_text, intext_by_index):
             anchor = marker["text"]
+            if anchor.strip() in already_live:
+                # Already a live Zotero field — leave it untouched (re-citing would
+                # clobber the managed field and lose its rendered text).
+                continue
             if not _anchor_is_unique(anchor):
                 report["unresolved_in_doc"].append({
                     "marker": anchor,
