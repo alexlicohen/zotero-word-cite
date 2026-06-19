@@ -1,0 +1,15 @@
+# Virtualenv / Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Secrets — never commit real credentials
+.env
+
+# Runtime caches: Zotero DOI index + Retraction Watch CSV (downloaded on demand)
+data/*
+!data/.gitkeep
+
+# macOS
+.DS_Store

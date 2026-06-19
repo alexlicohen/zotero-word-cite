@@ -1,0 +1,2 @@
+# This directory holds runtime caches (Zotero DOI index, Retraction Watch CSV).
+# The cache files themselves are gitignored; this placeholder keeps the dir.

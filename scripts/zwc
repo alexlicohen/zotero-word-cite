@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# zwc — command-line wrapper for the zotero-word-cite skill.
+#
+# Resolves the skill root from this script's location, loads .env (if present),
+# and runs the CLI from the skill-local virtualenv. Usage: ./scripts/zwc <cmd> ...
+set -uo pipefail
+
+SKILL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Load environment (Zotero API key, group/user IDs, optional NCBI/contact email).
+if [ -f "$SKILL/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$SKILL/.env"
+    set +a
+fi
+
+PY="$SKILL/.venv/bin/python"
+if [ ! -x "$PY" ]; then
+    echo "zwc: virtualenv not found at $SKILL/.venv" >&2
+    echo "     Run  ./install.sh  from $SKILL  first." >&2
+    exit 1
+fi
+
+exec env PYTHONPATH="$SKILL" "$PY" -m zoterocite.cli "$@"
