@@ -253,7 +253,7 @@ def apply_patches(patched_network, monkeypatch):
     replace_text_with_zotero_field."""
     calls = {"create": [], "insert": []}
 
-    def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None):
+    def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, attach_pdfs=False):
         calls["create"].append({"metas": metas, "collection": collection, "tags": tags,
                                 "dedup": dedup, "doi_index": doi_index})
         created = []

@@ -596,6 +596,7 @@ def apply_unification(
     add_missing: bool = True,
     track: bool = True,
     source_label: Optional[str] = None,
+    attach_pdfs: bool = False,
 ) -> dict:
     """Apply a confirmed unification plan: add missing refs to Zotero + rewrite
     the document to live Zotero fields.
@@ -623,6 +624,10 @@ def apply_unification(
     source_label:
         Tag/label identifying the source document. Defaults to the basename of
         ``path``.
+    attach_pdfs:
+        OPT-IN (default ``False``). Pass through to :func:`zotero.create_items`
+        so each newly-created item gets a best-effort open-access PDF attached.
+        Off by default — existing behaviour is unchanged.
 
     Returns
     -------
@@ -809,6 +814,7 @@ def apply_unification(
                 tags=[ADDED_TAG, source_label],
                 dedup=True,
                 doi_index=doi_index,
+                attach_pdfs=attach_pdfs,
             )
             # Map created/skipped results back to placements by DOI then title.
             created_by_doi: Dict[str, str] = {}

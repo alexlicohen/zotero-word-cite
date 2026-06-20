@@ -28,6 +28,7 @@ Write capability (v3):
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import os
@@ -1032,6 +1033,7 @@ def create_items(
     tags: Optional[list[str]] = None,
     dedup: bool = True,
     doi_index: Optional[dict[str, str]] = None,
+    attach_pdfs: bool = False,
 ) -> dict:
     """Batch-create Zotero items from CSL-JSON-ish metadata dicts.
 
@@ -1054,6 +1056,14 @@ def create_items(
         per item — passed straight to :func:`get_item_by_doi`. Callers that
         already built the index (e.g. ``unify.apply_unification``) SHOULD thread
         it in to avoid the O(N·M) re-scan (F3).
+    attach_pdfs:
+        When ``True`` (OPT-IN; default ``False`` — existing behaviour unchanged),
+        after the items are created, try to discover an open-access PDF for each
+        created item (via :func:`zoterocite.oapdf.find_oa_pdf_url` using its DOI /
+        PMID / arXiv id) and attach it through :func:`attach_pdf_to_item`.  The
+        attach reuses THIS call's write gate (no second permission check) and is
+        best-effort: a fetch/upload failure is recorded under ``pdf_skipped`` and
+        never demotes a successful create.
 
     Returns
     -------
@@ -1061,6 +1071,10 @@ def create_items(
         ``"created"``          list of ``{title, key, doi}``
         ``"skipped_existing"`` list of ``{title, existing_key}``
         ``"failed"``           list of ``{title, reason}``
+
+    When ``attach_pdfs=True``, two more keys are present:
+        ``"pdf_attached"``     list of ``{key, source_url}``
+        ``"pdf_skipped"``      list of ``{key, reason}``
 
     A single-item failure never raises — it is recorded in ``"failed"``.
     A :data:`False` result from :func:`key_can_write` causes the entire call to
@@ -1192,4 +1206,268 @@ def create_items(
                 "reason": err.get("message", "unknown error"),
             })
 
+    # Opt-in open-access PDF attach.  Runs only after the items are created and
+    # only inside this already-write-gated function, so the SAME write-permission
+    # gate (checked above) covers the attach.  Each attach is best-effort: a
+    # fetch/upload failure never demotes a successful create — the PDF outcome is
+    # recorded separately under ``result["pdf_attached"]`` / ``result["pdf_skipped"]``.
+    if attach_pdfs and result["created"]:
+        _attach_oa_pdfs_to_created(result, to_create)
+
     return result
+
+
+# ---------------------------------------------------------------------------
+# Open-access PDF attach  (opt-in; wired by create_items(attach_pdfs=True))
+# ---------------------------------------------------------------------------
+
+def _attach_oa_pdfs_to_created(result: dict, to_create: list) -> None:
+    """For each newly-created item, try to find + attach an OA PDF (best-effort).
+
+    Imported lazily so the OA/SSRF machinery (and its network) is only pulled in
+    when a caller actually opts in.  Records outcomes on ``result`` under
+    ``"pdf_attached"`` (list of ``{key, source_url}``) and ``"pdf_skipped"``
+    (list of ``{key, reason}``); never raises, never touches ``result["created"]``.
+    """
+    from . import oapdf  # lazy: only imported on the opt-in path
+
+    result.setdefault("pdf_attached", [])
+    result.setdefault("pdf_skipped", [])
+
+    # Map created records back to their source meta so we can pull pmid/arxiv too
+    # (the create record only carries title/key/doi).  to_create is [(meta, item)].
+    meta_by_doi: dict[str, dict] = {}
+    meta_by_title: dict[str, dict] = {}
+    for meta, _zitem in to_create:
+        d = (meta.get("doi") or "").strip().lower()
+        if d:
+            meta_by_doi[d] = meta
+        t = (meta.get("title") or "").strip().lower()
+        if t:
+            meta_by_title[t] = meta
+
+    for created in result["created"]:
+        key = created.get("key")
+        if not key:
+            continue
+        doi = (created.get("doi") or "").strip() or None
+        meta = (
+            meta_by_doi.get((doi or "").lower())
+            or meta_by_title.get((created.get("title") or "").strip().lower())
+            or {}
+        )
+        pmid = (str(meta.get("pmid")).strip() if meta.get("pmid") else None)
+        arxiv = (str(meta.get("arxiv")).strip() if meta.get("arxiv") else None)
+
+        if not (doi or pmid or arxiv):
+            result["pdf_skipped"].append({"key": key, "reason": "no DOI/PMID/arXiv identifier"})
+            continue
+
+        try:
+            pdf_url = oapdf.find_oa_pdf_url(doi=doi, pmid=pmid, arxiv=arxiv)
+        except Exception:  # noqa: BLE001 — never demote a successful create
+            pdf_url = None
+        if not pdf_url:
+            result["pdf_skipped"].append({"key": key, "reason": "no open-access PDF found"})
+            continue
+
+        try:
+            pdf_bytes = oapdf.fetch_pdf_guarded(pdf_url)
+        except Exception:  # noqa: BLE001
+            pdf_bytes = None
+        if not pdf_bytes:
+            result["pdf_skipped"].append({
+                "key": key,
+                "reason": f"OA URL found but no valid PDF downloaded: {pdf_url}",
+            })
+            continue
+
+        filename = _pdf_filename_for(doi, pmid, arxiv, key)
+        ok = attach_pdf_to_item(key, pdf_bytes, filename)
+        if ok:
+            result["pdf_attached"].append({"key": key, "source_url": pdf_url})
+        else:
+            result["pdf_skipped"].append({"key": key, "reason": "attach/upload failed"})
+
+
+def _pdf_filename_for(
+    doi: Optional[str], pmid: Optional[str], arxiv: Optional[str], key: str
+) -> str:
+    """A filesystem-safe ``*.pdf`` name derived from the best available id."""
+    stem = doi or (f"PMID{pmid}" if pmid else None) or (f"arXiv{arxiv}" if arxiv else None) or key
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_") or key
+    return f"{safe}.pdf"
+
+
+def _post_form(
+    path: str,
+    fields: dict[str, str],
+    *,
+    extra_headers: Optional[dict[str, str]] = None,
+    timeout: float = 60.0,
+) -> Any:
+    """POST a ``application/x-www-form-urlencoded`` body to a library path.
+
+    Used by the Zotero file-upload handshake (the upload-authorization and
+    upload-registration steps both take form bodies, not JSON).  Same auth +
+    URL construction as :func:`_post_json`; the API key is sent only in the
+    ``Zotero-API-Key`` header.  Returns parsed JSON.
+    """
+    cfg = zotero_config()
+    if not cfg:
+        missing = ", ".join(_missing_env())
+        raise RuntimeError(f"Zotero credentials not configured; set env var(s): {missing}")
+
+    prefix = "groups" if cfg["library_type"] == "group" else "users"
+    url = f"{API_BASE}/{prefix}/{cfg['library_id']}/{path.lstrip('/')}"
+    data = urllib.parse.urlencode(fields).encode("utf-8")
+    headers: dict[str, str] = {
+        "Zotero-API-Key": cfg["api_key"],
+        "Zotero-API-Version": API_VERSION,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, data=data, method="POST", headers=headers)
+    return json.loads(_urlopen_retrying(req, timeout=timeout).decode("utf-8"))
+
+
+def attach_pdf_to_item(
+    parent_key: str,
+    pdf_bytes: bytes,
+    filename: str,
+    *,
+    timeout: float = 120.0,
+) -> bool:
+    """Attach ``pdf_bytes`` as an imported-file child of the item ``parent_key``.
+
+    zotero.py is the authoritative Zotero WRITER, so the full Web-API file-upload
+    handshake lives here:
+
+    1. Create an ``imported_file`` attachment item (POST ``items``) carrying the
+       parent key, filename, content-type, and the file's md5.
+    2. Request upload authorization (POST ``items/<key>/file`` with the md5 /
+       filename / filesize / mtime; ``If-None-Match: *``).  Zotero answers with
+       either ``{"exists": 1}`` (the file is already stored — done) or a
+       presigned ``{"url", "params"/"prefix"+"suffix", "uploadKey"}``.
+    3. PUT the bytes to the presigned URL (prefix + bytes + suffix, full-upload
+       form).  This URL is Zotero's own S3 endpoint, not attacker-influenced.
+    4. Register the upload (POST ``items/<key>/file`` with ``upload=<uploadKey>``;
+       ``If-None-Match: *``).
+
+    Write permission is NOT re-checked here — the only caller is
+    :func:`create_items`, which has already gated on
+    :func:`key_can_write_status`.  Returns ``True`` on a stored file, ``False``
+    on any failure (never raises): a failed attach must not break the add path.
+    """
+    if not pdf_bytes:
+        return False
+    try:
+        md5 = hashlib.md5(pdf_bytes).hexdigest()  # noqa: S324 — Zotero's required content key, not a security digest
+        filesize = len(pdf_bytes)
+        mtime = int(time.time() * 1000)
+
+        # 1) Create the attachment item.
+        attach_item = {
+            "itemType": "attachment",
+            "linkMode": "imported_file",
+            "parentItem": parent_key,
+            "title": filename,
+            "filename": filename,
+            "contentType": "application/pdf",
+            "charset": "",
+            "tags": [],
+            "relations": {},
+            "note": "",
+        }
+        token = secrets.token_hex(16)
+        create_resp = _post_json(
+            "items", [attach_item], extra_headers={"Zotero-Write-Token": token}
+        )
+        successful = (create_resp or {}).get("successful", {})
+        if not successful:
+            return False
+        attach_key = successful.get("0", {}).get("key")
+        if not attach_key:
+            return False
+
+        # 2) Request upload authorization.
+        auth = _post_form(
+            f"items/{attach_key}/file",
+            {
+                "md5": md5,
+                "filename": filename,
+                "filesize": str(filesize),
+                "mtime": str(mtime),
+            },
+            extra_headers={"If-None-Match": "*"},
+        )
+        if not isinstance(auth, dict):
+            return False
+        if auth.get("exists"):
+            return True  # identical file already stored — nothing to upload
+
+        upload_url = auth.get("url")
+        upload_key = auth.get("uploadKey")
+        if not upload_url or not upload_key:
+            return False
+
+        # 3) PUT the bytes (full-upload: prefix + content + suffix or multipart
+        # params).  Modern Zotero returns prefix/suffix for a single-part PUT.
+        prefix = (auth.get("prefix") or "").encode("utf-8")
+        suffix = (auth.get("suffix") or "").encode("utf-8")
+        content_type = auth.get("contentType", "application/pdf")
+        if prefix or suffix:
+            put_body = prefix + pdf_bytes + suffix
+            put_req = urllib.request.Request(
+                upload_url, data=put_body, method="PUT",
+                headers={"Content-Type": content_type},
+            )
+        else:
+            # Older/multipart-params form: post the params then the file.
+            params = auth.get("params") or {}
+            boundary = "----zoterocite" + secrets.token_hex(8)
+            parts: list[bytes] = []
+            for fk, fv in params.items():
+                parts.append(f"--{boundary}\r\n".encode())
+                parts.append(
+                    f'Content-Disposition: form-data; name="{fk}"\r\n\r\n'.encode()
+                )
+                parts.append(f"{fv}\r\n".encode())
+            parts.append(f"--{boundary}\r\n".encode())
+            parts.append(
+                f'Content-Disposition: form-data; name="file"; '
+                f'filename="{filename}"\r\n'.encode()
+            )
+            parts.append(b"Content-Type: application/pdf\r\n\r\n")
+            parts.append(pdf_bytes)
+            parts.append(f"\r\n--{boundary}--\r\n".encode())
+            put_body = b"".join(parts)
+            put_req = urllib.request.Request(
+                upload_url, data=put_body, method="POST",
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            )
+        with urllib.request.urlopen(put_req, timeout=timeout):  # noqa: S310 — Zotero storage endpoint
+            pass
+
+        # 4) Register the upload.  Zotero answers this step with an empty 204,
+        # so DON'T route through _post_form (it json.loads the body and would
+        # raise on ""); issue the form POST directly and treat any 2xx as success.
+        cfg = zotero_config()
+        prefix_seg = "groups" if cfg["library_type"] == "group" else "users"
+        reg_url = f"{API_BASE}/{prefix_seg}/{cfg['library_id']}/items/{attach_key}/file"
+        reg_req = urllib.request.Request(
+            reg_url,
+            data=urllib.parse.urlencode({"upload": upload_key}).encode("utf-8"),
+            method="POST",
+            headers={
+                "Zotero-API-Key": cfg["api_key"],
+                "Zotero-API-Version": API_VERSION,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "If-None-Match": "*",
+            },
+        )
+        with urllib.request.urlopen(reg_req, timeout=timeout) as reg_resp:  # noqa: S310
+            return 200 <= (getattr(reg_resp, "status", None) or reg_resp.getcode()) < 300
+    except Exception:  # noqa: BLE001 — never break the add path on an attach failure
+        return False

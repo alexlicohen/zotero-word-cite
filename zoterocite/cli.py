@@ -197,7 +197,8 @@ def cmd_endnote_migrate(a):
                           WriteRefusedError)
     if a.apply:
         try:
-            res = apply_endnote_migration(a.doc, a.library, collection=a.collection, out=a.out)
+            res = apply_endnote_migration(a.doc, a.library, collection=a.collection, out=a.out,
+                                          attach_pdfs=a.attach_pdfs)
         except WriteRefusedError as e:
             print(f"refused: {e}", file=sys.stderr)
             print("The configured Zotero key is read-only; a write-enabled group key is required.",
@@ -274,7 +275,8 @@ def cmd_unify_refs(a):
                 else plan_unification(a.file, fetch=not a.no_fetch, offline=offline))
         rep = apply_unification(a.file, plan, decisions, out=out,
                                 add_missing=not a.no_add_missing, track=not a.no_track,
-                                source_label=Path(a.file).name)
+                                source_label=Path(a.file).name,
+                                attach_pdfs=a.attach_pdfs)
         print(json.dumps(rep, indent=2, default=str) if a.json else
               f"added {len(rep['added'])} to Zotero · matched {len(rep['matched'])} · "
               f"replaced {rep['replaced']} in doc · needs-input {len(rep['needs_input'])} · "
@@ -379,6 +381,9 @@ def build_parser():
     s.add_argument("--no-track", action="store_true", dest="no_track", help="rewrite without tracked changes")
     s.add_argument("--json", action="store_true", default=False)
     s.add_argument("-o", "--out")
+    s.add_argument("--attach-pdfs", dest="attach_pdfs", action="store_true", default=False,
+                   help="fetch + attach an open-access PDF to each newly created Zotero item "
+                        "(needs a write-enabled key)")
     s.set_defaults(fn=cmd_unify_refs)
 
     s = sub.add_parser("cite-check"); s.add_argument("file")
@@ -401,6 +406,9 @@ def build_parser():
     s.add_argument("--collection", default=None, help="Zotero collection name (default: 'Imported — review')")
     s.add_argument("-o", "--out", default=None, help="output docx for the re-cited doc (default: <doc>.zotero.docx)")
     s.add_argument("--json", action="store_true", default=False)
+    s.add_argument("--attach-pdfs", dest="attach_pdfs", action="store_true", default=False,
+                   help="fetch + attach an open-access PDF to each newly created Zotero item "
+                        "(needs a write-enabled key)")
     s.set_defaults(fn=cmd_endnote_migrate)
 
     return p

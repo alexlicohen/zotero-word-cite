@@ -462,7 +462,7 @@ class TestApply:
 
         captured = {}
 
-        def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None):
+        def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, attach_pdfs=False):
             captured["metas"] = metas
             return {"created": [{"title": m.get("title", ""), "key": f"K{i}",
                                  "doi": m.get("doi", "")} for i, m in enumerate(metas)],
@@ -508,7 +508,7 @@ class TestApply:
         offline.setattr(zotero, "key_can_write_status", lambda: True)
         offline.setattr(en.zotero, "key_can_write_status", lambda: True)
 
-        def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None):
+        def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, attach_pdfs=False):
             calls.append(("create", collection, tuple(tags or ()), len(metas)))
             return {
                 "created": [{"title": m.get("title", ""), "key": f"K{i}", "doi": m.get("doi", "")}
@@ -558,7 +558,7 @@ class TestApply:
 
         created_metas = {}
 
-        def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None):
+        def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, attach_pdfs=False):
             created_metas["n"] = len(metas)
             return {"created": [{"title": m.get("title", ""), "key": "K", "doi": ""} for m in metas],
                     "skipped_existing": [], "failed": []}
@@ -649,7 +649,7 @@ class TestApply:
 
         created_n = {}
 
-        def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None):
+        def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, attach_pdfs=False):
             created_n["n"] = len(metas)
             return {"created": [{"title": m.get("title", ""), "key": f"K{i}", "doi": m.get("doi", "")}
                                 for i, m in enumerate(metas)],

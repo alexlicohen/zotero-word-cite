@@ -719,6 +719,7 @@ def apply_endnote_migration(
     out=None,
     fetch: bool = True,
     track: bool = True,
+    attach_pdfs: bool = False,
 ) -> dict:
     """Apply a migration — the **gated write** (create items + re-cite the doc).
 
@@ -745,6 +746,10 @@ def apply_endnote_migration(
         Passed through to resolution.
     track:
         Insert citation swaps as tracked changes (default ``True``).
+    attach_pdfs:
+        OPT-IN (default ``False``). Pass through to :func:`zotero.create_items`
+        so each newly-created item gets a best-effort open-access PDF attached.
+        Off by default — existing migration behaviour is unchanged.
 
     Returns
     -------
@@ -845,6 +850,7 @@ def apply_endnote_migration(
             tags=[ADDED_TAG, source_label],
             dedup=True,
             doi_index=doi_index,
+            attach_pdfs=attach_pdfs,
         )
         # Items create_items found already present count as matched, not created.
         for s in created_report.get("skipped_existing", []):
