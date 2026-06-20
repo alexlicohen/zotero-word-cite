@@ -338,6 +338,66 @@ def test_efetch_pubmed_no_authors_returns_empty_list(monkeypatch):
     assert out["11111111"]["authors"] == []
 
 
+# ---------------------------------------------------------------------------
+# Structured authors — efetch_pubmed_authors + authors_structured field
+#
+# Back-compat: the bare ``authors`` (list of "Lastname Initials" strings) is
+# unchanged; ``authors_structured`` is an ADDITIONAL per-article field, and
+# ``efetch_pubmed_authors`` surfaces it as CSL-JSON-shaped {family, given}.
+# ---------------------------------------------------------------------------
+
+def test_authors_structured_field_back_compat(monkeypatch):
+    """The string ``authors`` is untouched; ``authors_structured`` is added
+    alongside it (existing callers/tests keep their contract)."""
+    _patch_urlopen(monkeypatch, PUBMED_XML)
+    out = entrez.efetch_pubmed(["26980150"])
+    rec = out["26980150"]
+    # Old shape preserved exactly.
+    assert rec["authors"] == ["Cohen AL", "Fox MD"]
+    # New structured field present and CSL-JSON-shaped.
+    assert rec["authors_structured"] == [
+        {"family": "Cohen", "given": "Alexander L"},  # full ForeName preferred
+        {"family": "Fox", "given": "MD"},             # falls back to Initials
+    ]
+
+
+def test_efetch_pubmed_authors_named(monkeypatch):
+    """efetch_pubmed_authors returns {pmid: [{family, given}]} for named authors."""
+    _patch_urlopen(monkeypatch, PUBMED_XML)
+    out = entrez.efetch_pubmed_authors(["26980150", "30000001"])
+    assert out["26980150"] == [
+        {"family": "Cohen", "given": "Alexander L"},
+        {"family": "Fox", "given": "MD"},
+    ]
+    assert out["30000001"] == [{"family": "Smith", "given": "JA"}]
+
+
+def test_efetch_pubmed_authors_collective_flagged(monkeypatch):
+    """A <CollectiveName> becomes {family: <name>, given: ''} so a downstream
+    corporate guard can skip it (no false person-comparison)."""
+    _patch_urlopen(monkeypatch, PUBMED_XML_COLLECTIVE)
+    out = entrez.efetch_pubmed_authors(["99999999"])
+    assert out["99999999"] == [
+        {"family": "Jones", "given": "BK"},
+        {"family": "Brain Imaging Consortium", "given": ""},
+    ]
+
+
+def test_efetch_pubmed_authors_no_authors_empty_list(monkeypatch):
+    """No AuthorList → empty structured list, no raise."""
+    _patch_urlopen(monkeypatch, PUBMED_XML_NO_AUTHORS)
+    out = entrez.efetch_pubmed_authors(["11111111"])
+    assert out["11111111"] == []
+
+
+def test_efetch_pubmed_authors_urlerror_returns_empty(monkeypatch):
+    """Network failure degrades to {} (never raises), like efetch_pubmed."""
+    def raise_urlerror(*a, **k):
+        raise urllib.error.URLError("down")
+    monkeypatch.setattr(entrez.urllib.request, "urlopen", raise_urlerror)
+    assert entrez.efetch_pubmed_authors(["26980150"]) == {}
+
+
 # DOI extraction: ArticleId[IdType=doi] (preferred) and ELocationID[EIdType=doi]
 # (fallback). The DOI is the join key for the library-dedup + retraction screen,
 # so this guards the seam end to end (no fixture above carries a DOI element).

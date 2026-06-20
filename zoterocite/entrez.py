@@ -413,18 +413,43 @@ def _parse_article(art) -> Optional[tuple[str, dict]]:
                 break
 
     # Authors: parse <AuthorList>/<Author> elements.
+    #
+    # Two shapes are produced from the SAME walk (one parse, one owner):
+    #   * ``authors``            — bare "Lastname Initials" / collective-name
+    #                              strings (the historical shape; existing
+    #                              callers and test_entrez.py depend on it).
+    #   * ``authors_structured`` — CSL-JSON-shaped ``{"family", "given"}`` dicts,
+    #                              the structured form the citation-integrity
+    #                              author cross-check feeds to
+    #                              ``refresolve._author_family_compare``.  A
+    #                              <CollectiveName> becomes ``{"family": <name>,
+    #                              "given": ""}`` so ``_is_corporate_author``'s
+    #                              org-keyword/no-given guard skips it rather than
+    #                              false-mismatching it against a person.
     authors: list[str] = []
+    authors_structured: list[dict] = []
     for author in art.findall(".//AuthorList/Author"):
         collective = _text_or_empty(author.find("CollectiveName"))
         if collective:
             authors.append(collective)
+            # No forename for a collective -> the corporate guard catches it.
+            authors_structured.append({"family": collective, "given": ""})
             continue
         last = _text_or_empty(author.find("LastName"))
         initials = _text_or_empty(author.find("Initials"))
+        forename = _text_or_empty(author.find("ForeName"))
         if not initials:
-            initials = _text_or_empty(author.find("ForeName"))
+            initials = forename
         if last:
             authors.append(f"{last} {initials}".strip())
+            # Prefer the full ForeName for ``given`` (more discriminating than
+            # bare initials); fall back to Initials.  Surname comparison in
+            # ``_author_family_compare`` only keys on ``family``, so ``given`` is
+            # advisory, but a real forename helps the corporate guard tell a
+            # person from a collective.
+            authors_structured.append(
+                {"family": last, "given": (forename or initials).strip()}
+            )
 
     # DOI: <ArticleId IdType="doi"> (PubmedData/ArticleIdList) or, failing that,
     # <ELocationID EIdType="doi"> (Article). Surfaced so DOI-keyed downstream
@@ -448,6 +473,7 @@ def _parse_article(art) -> Optional[tuple[str, dict]]:
         "journal": journal,
         "year": year,
         "authors": authors,
+        "authors_structured": authors_structured,
         "doi": doi,
     }
 
@@ -537,3 +563,31 @@ def efetch_pubmed_status(pmids: list[str]) -> tuple[dict[str, dict], dict]:
             _sleep_between_batches()
     return out, {"degraded": n_failed > 0, "n_failed_batches": n_failed,
                  "n_batches": n_batches}
+
+
+def efetch_pubmed_authors(pmids: list[str]) -> dict[str, list[dict]]:
+    """Fetch ``{pmid: [{"family", "given"}, ...]}`` — STRUCTURED PubMed authors.
+
+    The single owner of structured (CSL-JSON-shaped) PubMed authors for the
+    toolkit.  Reuses the same EFetch fetch + ``_parse_article`` parse as
+    :func:`efetch_pubmed` (no second network path), then surfaces the
+    ``authors_structured`` field that parse already produces.  Each entry is a
+    ``{"family", "given"}`` dict; a ``<CollectiveName>`` group author becomes
+    ``{"family": <collective>, "given": ""}`` so a consumer's corporate/
+    collective guard (``refresolve._is_corporate_author``) skips it.
+
+    This exists as the structured counterpart to :func:`efetch_pubmed` (whose
+    ``authors`` is a list of bare "Lastname Initials" strings and is left
+    unchanged for back-compat).  Callers that need to family-by-family compare a
+    cited author list against the authoritative PubMed record use THIS function
+    and feed the result straight to ``refresolve._author_family_compare``.
+
+    Network-resilient: any HTTP/XML/parse error yields a partial-or-empty dict,
+    never a raise (mirrors :func:`efetch_pubmed`).  PMIDs PubMed has no record
+    for, or whose article carries no ``<AuthorList>``, map to ``[]``.
+    """
+    records = efetch_pubmed(pmids)
+    return {
+        pmid: (rec.get("authors_structured") or [])
+        for pmid, rec in records.items()
+    }

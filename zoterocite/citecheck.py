@@ -494,17 +494,22 @@ def refresh_retraction_db(dest: Optional[Union[str, Path]] = None, *,
 # 3. DOI extraction from citation fields
 # ---------------------------------------------------------------------------
 
-def _extract_cited_dois(path) -> List[str]:
-    """Collect DOIs from the CSL-JSON itemData embedded in ZOTERO_ITEM fields."""
-    dois: List[str] = []
-    seen: Set[str] = set()
-    for cit in scan_citations(path):
-        for item in cit.get("items", []):
-            # scan_citations doesn't surface itemData directly; re-parse from
-            # the raw field codes to get DOIs.
-            pass
-    # scan_citations does not expose itemData — we need to re-read field codes.
-    # Re-parse directly.
+def _iter_cited_itemdata(path):
+    """Yield ``(key, itemData)`` for every cited item embedded in ZOTERO_ITEM
+    fields.
+
+    This is the SINGLE owner of "what the document cited" (structured): it walks
+    the raw field codes, parses the CSL-JSON payload, and surfaces each
+    ``citationItems[].itemData`` dict together with its item key.  Every
+    consumer that needs cited bibliographic data — DOIs, titles, authors —
+    iterates this generator instead of re-implementing the field/JSON parse.
+
+    ``scan_citations`` does not expose ``itemData``, so we re-read the field
+    codes here.  The item key is taken from ``itemData.id`` (Zotero stores
+    ``<libraryID>/<key>``; we return the trailing key) and falls back to the
+    raw ``id``.  Never raises on a malformed payload — a bad field code is
+    skipped.
+    """
     import json as _json
     root = Docx(path).read_tree(DOCUMENT)
     for code in _field_codes(root):
@@ -517,13 +522,101 @@ def _extract_cited_dois(path) -> List[str]:
             continue
         for ci in data.get("citationItems", []):
             idata = ci.get("itemData") or {}
-            doi = (idata.get("DOI") or idata.get("doi") or "").strip()
-            if doi:
-                norm_key = _normalise_doi(doi)
-                if norm_key not in seen:
-                    dois.append(doi)
-                    seen.add(norm_key)
+            raw_id = str(idata.get("id") or ci.get("id") or "").strip()
+            key = raw_id.rsplit("/", 1)[-1] if raw_id else ""
+            yield key, idata
+
+
+def _extract_cited_dois(path) -> List[str]:
+    """Collect DOIs from the CSL-JSON itemData embedded in ZOTERO_ITEM fields."""
+    dois: List[str] = []
+    seen: Set[str] = set()
+    for _key, idata in _iter_cited_itemdata(path):
+        doi = (idata.get("DOI") or idata.get("doi") or "").strip()
+        if doi:
+            norm_key = _normalise_doi(doi)
+            if norm_key not in seen:
+                dois.append(doi)
+                seen.add(norm_key)
     return dois
+
+
+# A PMID is a bare run of digits.  Zotero exposes it either as a first-class
+# CSL field ``PMID`` (rare in exported CSL-JSON) or — the common convention —
+# stuffed into the ``extra`` / ``note`` field as a ``PMID: 12345678`` line
+# (Zotero's "Extra" field round-trips arbitrary ``key: value`` lines).  Match
+# the label case-insensitively with optional colon/whitespace, anchored on a
+# word boundary so "PMID" inside a larger token (e.g. a URL) does not trigger.
+_PMID_LABEL_RE = re.compile(r"\bPMID\s*:?\s*(\d{1,9})\b", re.IGNORECASE)
+
+
+def _extract_pmid(idata: dict) -> str:
+    """Pull a PMID out of one CSL-JSON ``itemData`` dict, or ``""``.
+
+    Priority:
+      1. A first-class ``PMID`` field (``itemData["PMID"]``), digits only.
+      2. A ``PMID: <digits>`` line in the Zotero ``extra``/``note`` field —
+         the common convention for carrying a PMID through CSL-JSON, parsed
+         with :data:`_PMID_LABEL_RE` so surrounding ``key: value`` lines are
+         ignored.
+
+    Returns a bare digit string (no ``PMID`` prefix) or ``""`` when none is
+    present / parseable.  Never raises.
+    """
+    # 1. First-class CSL field.  Zotero usually omits it from CSL-JSON, but
+    # honour it when present (some exporters / manual itemData include it).
+    raw = idata.get("PMID")
+    if raw is None:
+        raw = idata.get("pmid")
+    if raw is not None:
+        s = re.sub(r"\D", "", str(raw))
+        if s:
+            return s
+
+    # 2. The "PMID: 12345678" convention in extra / note.
+    for field in ("extra", "note"):
+        blob = idata.get(field)
+        if not blob:
+            continue
+        m = _PMID_LABEL_RE.search(str(blob))
+        if m:
+            return m.group(1)
+
+    return ""
+
+
+def _extract_cited_references(path) -> List[dict]:
+    """Collect structured cited references for identity checks.
+
+    Returns one dict per cited item::
+
+        {"key": str, "doi": str, "pmid": str, "title": str, "authors": list[dict]}
+
+    where ``authors`` is the CSL-JSON ``itemData.author`` list (each
+    ``{"family": ..., "given": ...}``) and ``pmid`` is a bare digit string (or
+    ``""``) sourced from :func:`_extract_pmid` (the ``PMID`` field, else a
+    ``PMID: …`` line in ``extra``/``note``).  Shares the same field-code/
+    CSL-JSON parse as :func:`_extract_cited_dois` via
+    :func:`_iter_cited_itemdata`, so there is one owner of cited-reference
+    extraction.  Items are de-duplicated on item key when present (the same
+    source cited twice yields one entry); keyless items are kept as-is.
+    """
+    refs: List[dict] = []
+    seen_keys: Set[str] = set()
+    for key, idata in _iter_cited_itemdata(path):
+        if key and key in seen_keys:
+            continue
+        if key:
+            seen_keys.add(key)
+        doi = (idata.get("DOI") or idata.get("doi") or "").strip()
+        pmid = _extract_pmid(idata)
+        title = (idata.get("title") or "").strip()
+        authors = idata.get("author") or []
+        if not isinstance(authors, list):
+            authors = []
+        refs.append({"key": key, "doi": doi, "pmid": pmid,
+                     "title": title, "authors": authors})
+    return refs
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +655,182 @@ def _check_doi_exists(doi: str) -> bool:
 
 
 import urllib.parse  # noqa: E402 — needed for _check_doi_exists
+
+
+# ---------------------------------------------------------------------------
+# 4b. DOI<->metadata identity + author cross-check (network, opt-in)
+#
+# These two checks assert that a cited record actually MATCHES the authoritative
+# record behind its identifier — a live DOI is NOT verification.  They reuse the
+# single Crossref-by-DOI path (refresolve._crossref_doi_fetch) and the identity
+# primitives owned by refresolve; they add no second metadata fetch or name
+# matcher.  Both emit WARN (advisory): a mismatch is a strong signal worth human
+# review, not a hard failure of the gate.
+# ---------------------------------------------------------------------------
+
+def _check_doi_metadata_identity(refs: List[dict]) -> List[Finding]:
+    """Check A — assert each cited DOI resolves to the cited paper.
+
+    For every cited item carrying BOTH a DOI and a title, fetch the
+    authoritative record by DOI (the single Crossref-by-DOI path) and compare
+    the resolved title against the cited title via normalised token overlap.
+    Below the identity floor -> the DOI points at a different paper
+    ("DOI-misdirection": a wrong/fabricated DOI that resolves to a real but
+    unrelated paper; or a "mashup" of stitched-together fields).  A
+    first-author family mismatch is folded into the SAME finding to reinforce
+    the signal rather than emitting a second one.
+
+    Silently skips an item with no DOI, no cited title, or a fetch that returns
+    nothing (offline-degrade — never raises, mirroring the rest of this module).
+    """
+    from . import refresolve as _rr
+
+    findings: List[Finding] = []
+    for ref in refs:
+        doi = (ref.get("doi") or "").strip()
+        cited_title = (ref.get("title") or "").strip()
+        if not doi or not cited_title:
+            continue
+        try:
+            resolved = _rr._crossref_doi_fetch(_normalise_doi(doi))
+        except Exception:  # noqa: BLE001 — offline-degrade like the rest of citecheck
+            resolved = None
+        if not resolved:
+            continue
+        resolved_title = (resolved.get("title") or "").strip()
+        if not resolved_title:
+            continue
+
+        overlap = _rr._title_overlap(resolved_title, cited_title)
+        if overlap >= _rr._IDENTITY_TITLE_OVERLAP_MIN:
+            continue  # titles agree — same paper
+
+        key = ref.get("key") or doi
+        msg = (
+            f"citation {key!r}: DOI {doi} resolves to a different paper. "
+            f"Cited title {cited_title!r} but DOI {doi} is "
+            f"{resolved_title!r} (title overlap {overlap:.2f} < "
+            f"{_rr._IDENTITY_TITLE_OVERLAP_MIN:.2f})."
+        )
+
+        # Fold a first-author family mismatch into the same message.
+        cited_fam = _rr._first_author_family(ref.get("authors") or [])
+        resolved_fam = _rr._first_author_family(resolved.get("authors") or [])
+        if cited_fam and resolved_fam and \
+                _rr._normalize_surname(cited_fam) != _rr._normalize_surname(resolved_fam):
+            msg += (
+                f" First author also differs: {cited_fam!r}(cited) vs "
+                f"{resolved_fam!r}(DOI record)."
+            )
+
+        findings.append(Finding(
+            check="CITE-DOI-MISMATCH",
+            severity="WARN",
+            message=msg,
+            source="Crossref",
+        ))
+    return findings
+
+
+def _pubmed_authors(pmid: str) -> List[dict]:
+    """Structured PubMed authors for one PMID, or ``[]`` (offline-degrade).
+
+    Thin wrapper over :func:`entrez.efetch_pubmed_authors` — the single owner of
+    structured PubMed authors — so this module never re-implements the EFetch
+    parse.  Returns the ``[{"family", "given"}]`` list (collectives flagged as
+    ``{"family": <name>, "given": ""}`` so the corporate guard skips them) or
+    ``[]`` on any failure.  Never raises.
+    """
+    p = (pmid or "").strip()
+    if not p:
+        return []
+    try:
+        from . import entrez as _entrez
+        result = _entrez.efetch_pubmed_authors([p])
+    except Exception:  # noqa: BLE001 — offline-degrade like the rest of citecheck
+        return []
+    authors = result.get(p) or []
+    return authors if isinstance(authors, list) else []
+
+
+def _check_author_families(refs: List[dict]) -> List[Finding]:
+    """Check B — family-by-family cross-check of cited authors vs. the
+    authoritative author list.
+
+    Authoritative-source priority (the comparison itself is identical — the same
+    :func:`refresolve._author_family_compare`; only the source list differs):
+
+    * **DOI -> Crossref authors** (primary): the single Crossref-by-DOI path,
+      which yields structured ``{family, given}``.  Used whenever the cited item
+      carries a DOI and that fetch returns a non-empty author list.
+    * **PMID -> PubMed authors** (fallback): consulted ONLY when the item has no
+      DOI, or the DOI is present but Crossref returned nothing / no authors, AND
+      the item carries a PMID.  Structured authors come from
+      :func:`entrez.efetch_pubmed_authors` (the single owner of structured
+      PubMed authors); collectives arrive flagged so the corporate guard skips
+      them, exactly as on the Crossref side.
+
+    Skips silently when an item has neither a usable DOI-author list nor a PMID,
+    or every fetch returns nothing / no authors (offline-degrade — never raises,
+    mirroring the rest of this module).  Emits the same WARN ``CITE-AUTHOR-
+    MISMATCH``; the message names which authoritative source was used.
+    """
+    from . import refresolve as _rr
+
+    findings: List[Finding] = []
+    for ref in refs:
+        doi = (ref.get("doi") or "").strip()
+        pmid = (ref.get("pmid") or "").strip()
+        cited_authors = ref.get("authors") or []
+        if not cited_authors:
+            continue
+
+        # ---- Resolve the ONE authoritative author list, DOI-primary. --------
+        actual_authors: List[dict] = []
+        source_label = ""   # human-readable, embedded in the message
+        source_name = ""     # Finding.source attribution
+
+        if doi:
+            try:
+                resolved = _rr._crossref_doi_fetch(_normalise_doi(doi))
+            except Exception:  # noqa: BLE001 — offline-degrade
+                resolved = None
+            if resolved:
+                crossref_authors = resolved.get("authors") or []
+                if crossref_authors:
+                    actual_authors = crossref_authors
+                    source_label = f"the DOI record ({doi})"
+                    source_name = "Crossref"
+
+        # PMID fallback: only when DOI gave us no usable author list above.
+        if not actual_authors and pmid:
+            pubmed_authors = _pubmed_authors(pmid)
+            if pubmed_authors:
+                actual_authors = pubmed_authors
+                source_label = f"the PubMed record (PMID {pmid})"
+                source_name = "PubMed"
+
+        if not actual_authors:
+            continue  # nothing authoritative to compare against
+
+        result = _rr._author_family_compare(cited_authors, actual_authors)
+        if not result["mismatch"]:
+            continue
+
+        key = ref.get("key") or doi or (f"PMID {pmid}" if pmid else "")
+        detail = "; ".join(result["details"])
+        msg = (
+            f"citation {key!r}: author mismatch vs {source_label}: "
+            f"{detail}; count cited={result['cited_count']} vs "
+            f"source={result['actual_count']}."
+        )
+        findings.append(Finding(
+            check="CITE-AUTHOR-MISMATCH",
+            severity="WARN",
+            message=msg,
+            source=source_name,
+        ))
+    return findings
 
 
 # ---------------------------------------------------------------------------
@@ -766,5 +1035,17 @@ def cite_check(
                         source="Crossref",
                     ))
                     unavailable_note_added = True
+
+    # Step 5: DOI<->metadata identity + author cross-check (network, opt-in).
+    # Behind the same check_existence gate as step 4 because both fetch Crossref
+    # by DOI.  Both emit WARN only (advisory): a mismatch flags a likely
+    # DOI-misdirection / fabricated co-author for human review but must not
+    # hard-fail the (non-strict) validate gate — the gate fails only on ERROR
+    # (or on WARN under --strict), so WARN keeps these advisory by construction.
+    if check_existence:
+        cited_refs = _extract_cited_references(path)
+        if cited_refs:
+            findings.extend(_check_doi_metadata_identity(cited_refs))
+            findings.extend(_check_author_families(cited_refs))
 
     return findings

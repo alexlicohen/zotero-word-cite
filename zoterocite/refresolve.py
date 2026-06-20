@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -443,6 +444,210 @@ def _year_matches(candidate: dict, text: str) -> bool:
         return False
     text_years = set(_YEAR_RE.findall(text))
     return candidate_year in text_years
+
+
+# ---------------------------------------------------------------------------
+# 3b. Author / identity matching primitives
+#
+# This module is the SINGLE owner of normalised-surname comparison and the
+# corporate/collective-author guard.  Citation-integrity checks (and any other
+# consumer) import these rather than re-deriving name matching, so the
+# false-positive guards stay in one place.  These primitives are
+# brand-neutral (no project literals) so they port cleanly to the standalone
+# Zotero-citation copy.
+# ---------------------------------------------------------------------------
+
+# Title-overlap floor for asserting a resolved record is the SAME paper as the
+# cited record (Check A, DOI<->metadata identity).  Tuned so an UNRELATED paper
+# trips it (a wrong-but-live DOI resolves to a title sharing almost no content
+# tokens -> Jaccard near 0) while benign subtitle/formatting noise does not: a
+# correct cite that drops or adds a subtitle clause still shares the great
+# majority of its content tokens, keeping Jaccard well above this floor.  The
+# resolve_reference confidence ladder uses 0.30 (_TITLE_OVERLAP_MEDIUM) merely
+# to *promote* a candidate; here we are *accusing* a DOI of pointing at the
+# wrong paper, so we keep the bar deliberately low to avoid false alarms and
+# only fire when the titles genuinely diverge.
+_IDENTITY_TITLE_OVERLAP_MIN = 0.30
+
+
+def _normalize_surname(name: str) -> str:
+    """Fold a surname to a comparable ASCII-lowercase key.
+
+    Strips combining diacritics (NFKD), maps a handful of single-glyph
+    digraphs/ligatures that NFKD does not decompose, drops non-letter
+    punctuation, and collapses whitespace.  So "Çolakoğlu" and "Colakoglu"
+    fold to the same key — without this, a diacritic-stripped source vs. a
+    composed cited name would false-MISMATCH.
+    """
+    n = unicodedata.normalize("NFKD", name or "")
+    n = "".join(c for c in n if not unicodedata.combining(c))
+    n = n.lower().strip()
+    multi = {"ß": "ss", "þ": "th", "ł": "l", "đ": "d", "ı": "i",
+             "ø": "o", "æ": "ae", "œ": "oe"}
+    for k, v in multi.items():
+        n = n.replace(k, v)
+    n = re.sub(r"[^a-z\s\-]", "", n)
+    n = re.sub(r"\s+", " ", n).strip()
+    return n
+
+
+# Collective/corporate author markers.  A name carrying any of these is an
+# organisation, not a person, and must be SKIPPED from the family-by-family
+# comparison (else it false-MISMATCHes against the person at that position in
+# the authoritative list).
+_ORG_AUTHOR_RE = re.compile(
+    r"\b("
+    r"Group|Committee|Society|Association|Collaborat\w+|Consortium|Network|"
+    r"Panel|Initiative|Organi[sz]ation|Investigators|Trialists|Task\s+Force|"
+    r"Working\s+Group|Study\s+Group|Foundation|Institute|Council|Federation|"
+    r"College|WHO|EASL|AHA|ACC|ESC|NICE|AASLD"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_corporate_author(family: str, given: str = "") -> bool:
+    """True when an author entry denotes an organisation, not a person.
+
+    Signals: a CSL literal author still carrying brace delimiters ``{``/``}``;
+    an org keyword present with NO given/forename (people have a forename, a
+    collective name does not); or an org keyword in a single-field literal that
+    lacks the ``family, given`` comma structure of a personal name.
+    """
+    fam = (family or "").strip()
+    giv = (given or "").strip()
+    blob = f"{fam} {giv}".strip()
+    if not blob:
+        # An empty entry is not a person to compare; treat as corporate/skip.
+        return True
+    # A surviving brace means a CSL literal (institutional) author.
+    if "{" in blob or "}" in blob:
+        return True
+    has_org_kw = bool(_ORG_AUTHOR_RE.search(blob))
+    if not has_org_kw:
+        return False
+    # Org keyword present.  A real person at this position would have a given
+    # name; a bare collective (no given name) with an org keyword is corporate.
+    if not giv:
+        return True
+    # Org keyword inside a single literal field with no comma structure -> the
+    # whole thing is a collective rendered as one string.
+    if "," not in blob:
+        return True
+    return False
+
+
+def _author_family_compare(cited: list, actual: list) -> dict:
+    """Family-by-family + count cross-check of two author lists.
+
+    Both ``cited`` and ``actual`` are CSL-JSON-shaped lists of
+    ``{"family": ..., "given": ...}`` (or anything exposing ``.get``).
+    ``actual`` is the AUTHORITATIVE list (e.g. Crossref-by-DOI).
+
+    Comparison rules (the corporate/collective guard is load-bearing — without
+    it a collective author false-MISMATCHes a person):
+
+    * Corporate/collective entries on EITHER side at a position are skipped
+      (not compared) — they are organisations, not surnames.
+    * For the overlapping positions ``[0, min(len(cited), len(actual)))`` we
+      compare normalised surnames; any positional inequality is a mismatch.
+    * Any CITED author at a position BEYOND the authoritative list length is a
+      mismatch — a real list cannot have fewer authors than were cited, so an
+      extra cited name cannot be intentional truncation; it is a fabricated /
+      mis-pasted co-author.
+    * Count handling: cited FEWER than actual is, by default, treated as the
+      common CSL ``et al`` truncation and is NOT reported on its own.  Zotero
+      itemData typically carries no truncation marker we could key on, so the
+      safe default is to suppress a bare "cited has fewer authors" count
+      mismatch (it is overwhelmingly intentional et-al shortening, not an
+      error).  Cited MORE than actual is always reported via the
+      beyond-length rule above.
+
+    Returns::
+
+        {
+            "mismatch": bool,            # any positional or beyond-length issue
+            "details": list[str],        # human-readable per-issue lines
+            "cited_count": int,          # personal authors counted as cited
+            "actual_count": int,         # personal authors in authoritative list
+            "cited_total": int,          # raw cited length (incl. collectives)
+            "actual_total": int,         # raw actual length (incl. collectives)
+        }
+    """
+    cited = cited or []
+    actual = actual or []
+    details: list[str] = []
+    mismatch = False
+
+    n = min(len(cited), len(actual))
+    for i in range(n):
+        c = cited[i] if isinstance(cited[i], dict) else {}
+        a = actual[i] if isinstance(actual[i], dict) else {}
+        c_fam = (c.get("family") or "").strip()
+        a_fam = (a.get("family") or "").strip()
+        # Skip organisational authors on either side — comparing a collective
+        # name to a person's surname would be a guaranteed false mismatch.
+        if _is_corporate_author(c_fam, c.get("given") or "") or \
+                _is_corporate_author(a_fam, a.get("given") or ""):
+            continue
+        if _normalize_surname(c_fam) != _normalize_surname(a_fam):
+            mismatch = True
+            details.append(
+                f"author #{i + 1} family {c_fam!r}(cited) != {a_fam!r}(source)"
+            )
+
+    # Cited authors beyond the authoritative list length: a real author list
+    # cannot be SHORTER than what was cited, so these cannot be et-al truncation
+    # — they are fabricated / mis-pasted names.  Skip corporate entries.
+    for i in range(len(actual), len(cited)):
+        c = cited[i] if isinstance(cited[i], dict) else {}
+        c_fam = (c.get("family") or "").strip()
+        if _is_corporate_author(c_fam, c.get("given") or ""):
+            continue
+        mismatch = True
+        details.append(
+            f"author #{i + 1} {c_fam!r}(cited) has no counterpart in the "
+            f"source author list (cannot be et-al truncation)"
+        )
+
+    # Personal-author counts (collectives excluded) for the message.
+    def _persons(lst: list) -> int:
+        out = 0
+        for e in lst:
+            if not isinstance(e, dict):
+                continue
+            if _is_corporate_author(
+                (e.get("family") or "").strip(), e.get("given") or ""
+            ):
+                continue
+            out += 1
+        return out
+
+    return {
+        "mismatch": mismatch,
+        "details": details,
+        "cited_count": _persons(cited),
+        "actual_count": _persons(actual),
+        "cited_total": len(cited),
+        "actual_total": len(actual),
+    }
+
+
+def _first_author_family(authors: list) -> Optional[str]:
+    """Return the first PERSONAL author's raw family name, or None.
+
+    Skips leading corporate/collective entries so a consortium byline does not
+    masquerade as the first author.
+    """
+    for a in authors or []:
+        if not isinstance(a, dict):
+            continue
+        fam = (a.get("family") or "").strip()
+        if _is_corporate_author(fam, a.get("given") or ""):
+            continue
+        if fam:
+            return fam
+    return None
 
 
 def _metadata_from_candidate(c: dict) -> dict:

@@ -25,10 +25,18 @@ from zoterocite.findings import Finding
 GROUP_BASE = "http://zotero.org/groups/2504198/items/"
 
 
-def _make_itemdata(key: str, doi: str = "", title: str = "") -> dict:
+def _make_itemdata(key: str, doi: str = "", title: str = "",
+                   authors: list = None, pmid: str = "",
+                   extra: str = "") -> dict:
     d: dict = {"id": f"2504198/{key}", "type": "article-journal", "title": title or f"Paper {key}"}
     if doi:
         d["DOI"] = doi
+    if authors is not None:
+        d["author"] = authors
+    if pmid:
+        d["PMID"] = pmid
+    if extra:
+        d["extra"] = extra
     return d
 
 
@@ -44,9 +52,12 @@ def _build_doc(tmp_path: Path, paragraphs: list[str], citations: list[dict]) -> 
         keys = cit["keys"]
         dois = cit.get("dois", [""] * len(keys))
         titles = cit.get("titles", [None] * len(keys))
+        authors = cit.get("authors", [None] * len(keys))
+        pmids = cit.get("pmids", [""] * len(keys))
+        extras = cit.get("extras", [""] * len(keys))
         itemdata = [
-            _make_itemdata(k, doi=d, title=t or "")
-            for k, d, t in zip(keys, dois, titles)
+            _make_itemdata(k, doi=d, title=t or "", authors=au, pmid=pm, extra=ex)
+            for k, d, t, au, pm, ex in zip(keys, dois, titles, authors, pmids, extras)
         ]
         uris = [GROUP_BASE + k for k in keys]
         add_bib = cit.get("add_bibliography", False)
@@ -1029,3 +1040,474 @@ class TestCheckDoiExistsSemantics:
         monkeypatch.setattr(cc.urllib.request, "urlopen", fake)
         cc._check_doi_exists("10.1234/real")
         assert captured["ua"] == "zotero-word-cite/1.0 (mailto:lab@example.org)"
+
+
+# ---------------------------------------------------------------------------
+# CITE-DOI-MISMATCH + CITE-AUTHOR-MISMATCH
+#
+# DOI<->metadata identity and family-by-family author cross-check. A live DOI is
+# NOT verification: the resolved title/authors must MATCH the cited ones. Both
+# fetch Crossref-by-DOI, so they ride behind check_existence=True. All network
+# is monkeypatched at refresolve._crossref_doi_fetch (the single Crossref-by-DOI
+# path) — no real requests.
+# ---------------------------------------------------------------------------
+
+def _resolved(doi="", title="", authors=None, year=None, journal=None,
+              item_type="journal-article"):
+    """Build a refresolve._parse_crossref_item-shaped record (what
+    _crossref_doi_fetch returns)."""
+    return {
+        "doi": doi or None,
+        "title": title or None,
+        "authors": authors or [],
+        "year": year,
+        "journal": journal,
+        "type": item_type,
+        "score": None,
+        "preprint": False,
+    }
+
+
+def _au(*families):
+    """CSL-JSON author list from family names (given derived from family)."""
+    return [{"family": f, "given": f[:1]} for f in families]
+
+
+class TestDoiMetadataIdentity:
+    """Check A — DOI must resolve to the cited paper, not merely be live."""
+
+    def _patch_fetch(self, monkeypatch, mapping):
+        """Map normalised DOI -> resolved record."""
+        import zoterocite.refresolve as rr
+        from zoterocite.citecheck import _normalise_doi
+
+        def fake(doi):
+            return mapping.get(_normalise_doi(doi))
+
+        monkeypatch.setattr(rr, "_crossref_doi_fetch", fake)
+
+    def test_matching_title_and_authors_is_silent(self, tmp_path, monkeypatch):
+        """(1) Resolved title+authors match the cited ones → no findings."""
+        self._patch_fetch(monkeypatch, {
+            "10.1/match": _resolved(
+                doi="10.1/match",
+                title="Lesion network mapping of focal brain lesions",
+                authors=_au("Cohen", "Fox"),
+            ),
+        })
+        out = _build_doc(
+            tmp_path,
+            ["Claim here."],
+            [{
+                "anchor": "Claim here",
+                "keys": ["MATCH"],
+                "dois": ["10.1/match"],
+                "titles": ["Lesion network mapping of focal brain lesions"],
+                "authors": [_au("Cohen", "Fox")],
+                "add_bibliography": True,
+            }],
+        )
+        findings = cite_check(out, check_existence=True,
+                              rw_csv=Path("/nonexistent/rw.csv"))
+        bad = [f for f in findings
+               if f.check in ("CITE-DOI-MISMATCH", "CITE-AUTHOR-MISMATCH")]
+        assert bad == [], bad
+
+    def test_doi_resolves_to_different_paper_warns(self, tmp_path, monkeypatch):
+        """(2) The DOI is live but resolves to a totally unrelated paper →
+        CITE-DOI-MISMATCH WARN (DOI-misdirection)."""
+        self._patch_fetch(monkeypatch, {
+            "10.1/wrong": _resolved(
+                doi="10.1/wrong",
+                title="Photosynthesis in tropical orchids under drought",
+                authors=_au("Mendez"),
+            ),
+        })
+        out = _build_doc(
+            tmp_path,
+            ["Claim here."],
+            [{
+                "anchor": "Claim here",
+                "keys": ["WRONG"],
+                "dois": ["10.1/wrong"],
+                "titles": ["Lesion network mapping of focal brain lesions"],
+                "authors": [_au("Cohen")],
+                "add_bibliography": True,
+            }],
+        )
+        findings = cite_check(out, check_existence=True,
+                              rw_csv=Path("/nonexistent/rw.csv"))
+        mism = [f for f in findings if f.check == "CITE-DOI-MISMATCH"]
+        assert len(mism) == 1
+        assert mism[0].severity == "WARN"
+        # Message names both titles + the DOI, and folds in the author mismatch.
+        assert "10.1/wrong" in mism[0].message
+        assert "Lesion network mapping" in mism[0].message
+        assert "Photosynthesis in tropical orchids" in mism[0].message
+        assert "First author also differs" in mism[0].message
+
+
+class TestAuthorFamilyCrossCheck:
+    """Check B — family-by-family author cross-check against Crossref-by-DOI."""
+
+    def _patch_fetch(self, monkeypatch, mapping):
+        import zoterocite.refresolve as rr
+        from zoterocite.citecheck import _normalise_doi
+
+        def fake(doi):
+            return mapping.get(_normalise_doi(doi))
+
+        monkeypatch.setattr(rr, "_crossref_doi_fetch", fake)
+
+    def _doc(self, tmp_path, doi, title, cited_authors):
+        return _build_doc(
+            tmp_path,
+            ["Claim here."],
+            [{
+                "anchor": "Claim here",
+                "keys": ["K"],
+                "dois": [doi],
+                "titles": [title],
+                "authors": [cited_authors],
+                "add_bibliography": True,
+            }],
+        )
+
+    def test_fabricated_coauthor_at_position_3_warns(self, tmp_path, monkeypatch):
+        """(3) A cited co-author at position #3 differs from the source →
+        CITE-AUTHOR-MISMATCH WARN."""
+        title = "Network localization of neurological symptoms"
+        self._patch_fetch(monkeypatch, {
+            "10.2/paper": _resolved(
+                doi="10.2/paper", title=title,
+                authors=_au("Cohen", "Drysdale", "Fox", "Pascual-Leone"),
+            ),
+        })
+        out = self._doc(
+            tmp_path, "10.2/paper", title,
+            # position #3 fabricated: "Ghost" replaces "Fox"
+            _au("Cohen", "Drysdale", "Ghost", "Pascual-Leone"),
+        )
+        findings = cite_check(out, check_existence=True,
+                              rw_csv=Path("/nonexistent/rw.csv"))
+        mism = [f for f in findings if f.check == "CITE-AUTHOR-MISMATCH"]
+        assert len(mism) == 1
+        assert mism[0].severity == "WARN"
+        assert "author #3" in mism[0].message
+        assert "Ghost" in mism[0].message and "Fox" in mism[0].message
+
+    def test_corporate_collective_author_is_silent(self, tmp_path, monkeypatch):
+        """(4) A collective/corporate author is skipped from family comparison →
+        no false CITE-AUTHOR-MISMATCH (the guard works)."""
+        title = "Outcomes of a multicentre randomized trial"
+        # Source has a collective byline at position #2; the cited record carries
+        # the same collective. A naive surname compare would explode here.
+        self._patch_fetch(monkeypatch, {
+            "10.3/trial": _resolved(
+                doi="10.3/trial", title=title,
+                authors=[
+                    {"family": "Cohen", "given": "A"},
+                    {"family": "EASL Study Group", "given": ""},
+                ],
+            ),
+        })
+        out = self._doc(
+            tmp_path, "10.3/trial", title,
+            [
+                {"family": "Cohen", "given": "A"},
+                {"family": "EASL Study Group", "given": ""},
+            ],
+        )
+        findings = cite_check(out, check_existence=True,
+                              rw_csv=Path("/nonexistent/rw.csv"))
+        mism = [f for f in findings if f.check == "CITE-AUTHOR-MISMATCH"]
+        assert mism == [], mism
+
+    def test_cited_fewer_authors_is_silent(self, tmp_path, monkeypatch):
+        """(5) Cited FEWER authors than the source (CSL et-al truncation) →
+        SILENT by default (no bare count-mismatch finding)."""
+        title = "A long-author-list consortium paper"
+        self._patch_fetch(monkeypatch, {
+            "10.4/long": _resolved(
+                doi="10.4/long", title=title,
+                authors=_au("Cohen", "Drysdale", "Fox", "Pascual-Leone",
+                            "Grafman", "Boes"),
+            ),
+        })
+        # Cited only the first three (et-al truncation in the rendered cite).
+        out = self._doc(
+            tmp_path, "10.4/long", title,
+            _au("Cohen", "Drysdale", "Fox"),
+        )
+        findings = cite_check(out, check_existence=True,
+                              rw_csv=Path("/nonexistent/rw.csv"))
+        mism = [f for f in findings if f.check == "CITE-AUTHOR-MISMATCH"]
+        assert mism == [], mism
+
+    def test_diacritic_fold_is_silent_teeth(self, tmp_path, monkeypatch):
+        """(6) TEETH: cited 'Çolakoğlu' vs source 'Colakoglu' must be SILENT.
+
+        Proves the normalizer earns its place — without NFKD/diacritic folding
+        these would false-MISMATCH on a purely cosmetic Unicode difference.
+        """
+        title = "A neuroimaging study"
+        self._patch_fetch(monkeypatch, {
+            "10.5/dia": _resolved(
+                doi="10.5/dia", title=title,
+                authors=[{"family": "Colakoglu", "given": "M"}],  # ASCII source
+            ),
+        })
+        out = self._doc(
+            tmp_path, "10.5/dia", title,
+            [{"family": "Çolakoğlu", "given": "M"}],  # Çolakoğlu cited
+        )
+        findings = cite_check(out, check_existence=True,
+                              rw_csv=Path("/nonexistent/rw.csv"))
+        mism = [f for f in findings if f.check == "CITE-AUTHOR-MISMATCH"]
+        assert mism == [], mism
+
+    def test_extra_cited_author_beyond_source_warns(self, tmp_path, monkeypatch):
+        """A cited author BEYOND the source list length cannot be et-al
+        truncation → CITE-AUTHOR-MISMATCH WARN."""
+        title = "A two-author paper"
+        self._patch_fetch(monkeypatch, {
+            "10.6/two": _resolved(
+                doi="10.6/two", title=title,
+                authors=_au("Cohen", "Fox"),
+            ),
+        })
+        out = self._doc(
+            tmp_path, "10.6/two", title,
+            _au("Cohen", "Fox", "Phantom"),  # 3rd has no counterpart
+        )
+        findings = cite_check(out, check_existence=True,
+                              rw_csv=Path("/nonexistent/rw.csv"))
+        mism = [f for f in findings if f.check == "CITE-AUTHOR-MISMATCH"]
+        assert len(mism) == 1
+        assert mism[0].severity == "WARN"
+        assert "no counterpart" in mism[0].message
+
+
+# ---------------------------------------------------------------------------
+# CITE-AUTHOR-MISMATCH via PMID (PubMed authoritative source)
+#
+# Round-2 extension: when a cited ref has NO DOI (or Crossref-by-DOI returns no
+# authors) but DOES carry a PMID, the family-by-family cross-check fetches
+# STRUCTURED authors from PubMed (entrez.efetch_pubmed_authors — the single
+# owner) and runs the SAME refresolve._author_family_compare.  All network is
+# monkeypatched at entrez.efetch_pubmed_authors and refresolve._crossref_doi_fetch
+# — no real requests.
+# ---------------------------------------------------------------------------
+
+class TestAuthorFamilyCrossCheckPubMed:
+    """Check B, PMID branch — authoritative author list from PubMed."""
+
+    def _patch_pubmed(self, monkeypatch, mapping):
+        """Map PMID -> structured author list ([{family, given}])."""
+        import zoterocite.entrez as ent
+
+        def fake(pmids):
+            return {p: mapping.get(str(p)) for p in pmids if str(p) in mapping}
+
+        monkeypatch.setattr(ent, "efetch_pubmed_authors", fake)
+
+    def _patch_crossref(self, monkeypatch, mapping):
+        """Map normalised DOI -> resolved record (None when absent)."""
+        import zoterocite.refresolve as rr
+        from zoterocite.citecheck import _normalise_doi
+
+        def fake(doi):
+            return mapping.get(_normalise_doi(doi))
+
+        monkeypatch.setattr(rr, "_crossref_doi_fetch", fake)
+
+    def _pmid_doc(self, tmp_path, pmid, cited_authors, *, doi="", extra=""):
+        return _build_doc(
+            tmp_path,
+            ["Claim here."],
+            [{
+                "anchor": "Claim here",
+                "keys": ["K"],
+                "dois": [doi],
+                "pmids": [pmid] if not extra else [""],
+                "extras": [extra],
+                "titles": ["A PMID-only paper"],
+                "authors": [cited_authors],
+                "add_bibliography": True,
+            }],
+        )
+
+    def test_pmid_only_fabricated_coauthor_warns(self, tmp_path, monkeypatch):
+        """PMID-only ref (no DOI) with a fabricated co-author #3 vs the PubMed
+        authoritative list → exactly one CITE-AUTHOR-MISMATCH WARN.
+
+        This is also the TEETH test: it would only pass if the PMID branch is
+        actually taken (no DOI is present, so the Crossref path cannot fire).
+        """
+        self._patch_pubmed(monkeypatch, {
+            "26980150": _au("Cohen", "Drysdale", "Fox", "Pascual-Leone"),
+        })
+        out = self._pmid_doc(
+            tmp_path, "26980150",
+            # position #3 fabricated: "Ghost" replaces "Fox"
+            _au("Cohen", "Drysdale", "Ghost", "Pascual-Leone"),
+        )
+        findings = cite_check(out, check_existence=True,
+                              rw_csv=Path("/nonexistent/rw.csv"))
+        mism = [f for f in findings if f.check == "CITE-AUTHOR-MISMATCH"]
+        assert len(mism) == 1
+        assert mism[0].severity == "WARN"
+        assert "author #3" in mism[0].message
+        assert "Ghost" in mism[0].message and "Fox" in mism[0].message
+        # The message must name PubMed/PMID as the authoritative source.
+        assert "PMID 26980150" in mism[0].message
+        assert mism[0].source == "PubMed"
+
+    def test_pmid_only_clean_is_silent(self, tmp_path, monkeypatch):
+        """PMID-only ref whose cited authors match the PubMed record → silent."""
+        self._patch_pubmed(monkeypatch, {
+            "26980150": _au("Cohen", "Drysdale", "Fox"),
+        })
+        out = self._pmid_doc(
+            tmp_path, "26980150",
+            _au("Cohen", "Drysdale", "Fox"),
+        )
+        findings = cite_check(out, check_existence=True,
+                              rw_csv=Path("/nonexistent/rw.csv"))
+        mism = [f for f in findings if f.check == "CITE-AUTHOR-MISMATCH"]
+        assert mism == [], mism
+
+    def test_pmid_collective_author_is_silent(self, tmp_path, monkeypatch):
+        """A PubMed CollectiveName author (flagged {family, given=''}) is skipped
+        by the corporate guard → no false CITE-AUTHOR-MISMATCH."""
+        # PubMed record: one named author + a collective at position #2, exactly
+        # as entrez.efetch_pubmed_authors emits a <CollectiveName>.
+        self._patch_pubmed(monkeypatch, {
+            "99999999": [
+                {"family": "Jones", "given": "BK"},
+                {"family": "Brain Imaging Consortium", "given": ""},
+            ],
+        })
+        out = self._pmid_doc(
+            tmp_path, "99999999",
+            [
+                {"family": "Jones", "given": "BK"},
+                {"family": "Brain Imaging Consortium", "given": ""},
+            ],
+        )
+        findings = cite_check(out, check_existence=True,
+                              rw_csv=Path("/nonexistent/rw.csv"))
+        mism = [f for f in findings if f.check == "CITE-AUTHOR-MISMATCH"]
+        assert mism == [], mism
+
+    def test_doi_present_does_not_consult_pmid(self, tmp_path, monkeypatch):
+        """A ref WITH a DOI uses the Crossref path; PubMed is NOT consulted when
+        Crossref returns authors (existing behaviour unchanged)."""
+        title = "A PMID-only paper"
+        # Crossref returns a clean matching author list for the DOI.
+        self._patch_crossref(monkeypatch, {
+            "10.7/has-doi": _resolved(
+                doi="10.7/has-doi", title=title,
+                authors=_au("Cohen", "Fox"),
+            ),
+        })
+        # PubMed, if (wrongly) consulted, would report a DIFFERENT list that
+        # would trip a mismatch — so a clean result proves PubMed was skipped.
+        pubmed_calls = []
+
+        def fake_pubmed(pmids):
+            pubmed_calls.append(list(pmids))
+            return {"26980150": _au("Ghost", "Phantom")}
+
+        import zoterocite.entrez as ent
+        monkeypatch.setattr(ent, "efetch_pubmed_authors", fake_pubmed)
+
+        out = self._pmid_doc(
+            tmp_path, "26980150",
+            _au("Cohen", "Fox"),
+            doi="10.7/has-doi",
+        )
+        findings = cite_check(out, check_existence=True,
+                              rw_csv=Path("/nonexistent/rw.csv"))
+        mism = [f for f in findings if f.check == "CITE-AUTHOR-MISMATCH"]
+        assert mism == [], mism
+        # PubMed must not have been consulted at all.
+        assert pubmed_calls == [], pubmed_calls
+
+    def test_doi_crossref_empty_falls_back_to_pmid(self, tmp_path, monkeypatch):
+        """DOI present but Crossref returns NO authors → fall back to PMID, and
+        a fabricated co-author there still trips a WARN naming PubMed."""
+        title = "A PMID-only paper"
+        # Crossref resolves but with an empty author list.
+        self._patch_crossref(monkeypatch, {
+            "10.8/no-authors": _resolved(
+                doi="10.8/no-authors", title=title, authors=[],
+            ),
+        })
+        self._patch_pubmed(monkeypatch, {
+            "26980150": _au("Cohen", "Fox"),
+        })
+        out = self._pmid_doc(
+            tmp_path, "26980150",
+            _au("Cohen", "Ghost"),  # #2 fabricated
+            doi="10.8/no-authors",
+        )
+        findings = cite_check(out, check_existence=True,
+                              rw_csv=Path("/nonexistent/rw.csv"))
+        mism = [f for f in findings if f.check == "CITE-AUTHOR-MISMATCH"]
+        assert len(mism) == 1
+        assert "PMID 26980150" in mism[0].message
+        assert mism[0].source == "PubMed"
+
+    def test_pmid_from_extra_field(self, tmp_path, monkeypatch):
+        """A PMID carried in the Zotero 'extra' field as 'PMID: 12345678' is
+        parsed and drives the PubMed cross-check."""
+        self._patch_pubmed(monkeypatch, {
+            "26980150": _au("Cohen", "Fox"),
+        })
+        out = self._pmid_doc(
+            tmp_path, "",  # no first-class PMID field
+            _au("Cohen", "Ghost"),  # #2 fabricated
+            extra="DOI: none\nPMID: 26980150\nsome other note",
+        )
+        findings = cite_check(out, check_existence=True,
+                              rw_csv=Path("/nonexistent/rw.csv"))
+        mism = [f for f in findings if f.check == "CITE-AUTHOR-MISMATCH"]
+        assert len(mism) == 1
+        assert "PMID 26980150" in mism[0].message
+
+
+# ---------------------------------------------------------------------------
+# _extract_pmid unit coverage (field + extra/note conventions)
+# ---------------------------------------------------------------------------
+
+class TestExtractPmid:
+    def test_first_class_pmid_field(self):
+        from zoterocite.citecheck import _extract_pmid
+        assert _extract_pmid({"PMID": "12345678"}) == "12345678"
+
+    def test_pmid_field_numeric(self):
+        from zoterocite.citecheck import _extract_pmid
+        assert _extract_pmid({"PMID": 12345678}) == "12345678"
+
+    def test_pmid_from_extra_labelled(self):
+        from zoterocite.citecheck import _extract_pmid
+        assert _extract_pmid({"extra": "PMID: 26980150"}) == "26980150"
+
+    def test_pmid_from_extra_no_space(self):
+        from zoterocite.citecheck import _extract_pmid
+        assert _extract_pmid({"extra": "PMID:26980150"}) == "26980150"
+
+    def test_pmid_from_note_among_other_lines(self):
+        from zoterocite.citecheck import _extract_pmid
+        blob = "DOI: 10.1/x\nPMID: 30000001\nPMCID: PMC123"
+        assert _extract_pmid({"note": blob}) == "30000001"
+
+    def test_first_class_field_beats_extra(self):
+        from zoterocite.citecheck import _extract_pmid
+        assert _extract_pmid({"PMID": "111", "extra": "PMID: 222"}) == "111"
+
+    def test_no_pmid_returns_empty(self):
+        from zoterocite.citecheck import _extract_pmid
+        assert _extract_pmid({"extra": "DOI: 10.1/x"}) == ""
+        assert _extract_pmid({}) == ""
