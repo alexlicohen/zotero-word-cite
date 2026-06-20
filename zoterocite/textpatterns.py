@@ -337,7 +337,9 @@ DOI_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Trailing punctuation that is part of the surrounding prose, not the DOI.
+# Trailing punctuation that is part of the surrounding prose, not the DOI.  The
+# canonical DOI key (citecheck._normalise_doi) strips a trailing ')' the same
+# way, so both DOI cleaners agree — keep them in lockstep if this changes.
 _DOI_TRAILING_PUNCT_RE = re.compile(r"[.,);:\]]+$")
 
 

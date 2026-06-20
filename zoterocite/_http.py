@@ -28,6 +28,7 @@ from __future__ import annotations
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Optional
 
@@ -154,6 +155,13 @@ def http_get(
     req_headers = {"User-Agent": user_agent()}
     if headers:
         req_headers.update(headers)
+
+    # Scheme allow-list (defense-in-depth): this is the shared fetch primitive,
+    # so never let a caller-supplied URL make urlopen read a local file or other
+    # non-web resource (``file://``, ``ftp://``, …) — an SSRF / local-file-read
+    # vector. Only http(s) is fetched; anything else fails closed like any error.
+    if urllib.parse.urlparse(url).scheme.lower() not in ("http", "https"):
+        return None
 
     attempts = max(0, int(retries)) + 1  # original + retries
     last_was_retryable = False

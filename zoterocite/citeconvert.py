@@ -895,15 +895,20 @@ def convert_to_zotero(
         resolved_itemdata: List[dict] = []
         resolved_uris: List[str] = []
         any_miss = False
-        skip_field = False
+        n_fresh = 0          # resolved items NOT already cited via Zotero elsewhere
         for meta in metas:
             cache_key = _meta_cache_key(meta)
 
-            # (a) already Zotero-managed elsewhere in the doc → don't convert.
-            if cache_key and cache_key in already_zotero:
+            # (a) An item already cited via a Zotero field ELSEWHERE in the doc is
+            # a duplicate — but in a GROUPED foreign cite it must still be kept so
+            # the co-citation at THIS location survives. Dropping it (the old
+            # behaviour) silently lost a reference from the sentence. Count it as
+            # deduped and resolve it like any library item; the WHOLE field is
+            # skipped after the loop only when EVERY item is already-Zotero (a pure
+            # duplicate of existing cites — see the n_fresh check below).
+            already = bool(cache_key and cache_key in already_zotero)
+            if already:
                 deduped += 1
-                any_miss = True
-                continue
 
             # (b) seen this work already in THIS run (another foreign cite) → reuse.
             if cache_key and cache_key in match_cache:
@@ -911,11 +916,14 @@ def convert_to_zotero(
                 if cached is _MISS:
                     any_miss = True
                     continue
-                deduped += 1
+                if not already:
+                    deduped += 1
                 hit = cached  # type: ignore[assignment]
                 resolved_keys.append(hit["key"])
                 resolved_itemdata.append(hit["itemdata"])
                 resolved_uris.append(hit["uri"])
+                if not already:
+                    n_fresh += 1
                 continue
 
             # (c) fresh library lookup.
@@ -945,9 +953,15 @@ def convert_to_zotero(
             resolved_keys.append(key)
             resolved_itemdata.append(idata)
             resolved_uris.append(uri)
+            if not already:
+                n_fresh += 1
 
         if not resolved_keys:
             continue  # nothing matched for this field — leave it untouched
+        if n_fresh == 0:
+            # Every resolved item is already cited via Zotero elsewhere — this
+            # whole field is a pure duplicate; leave the existing cites untouched.
+            continue
 
         rendered = "; ".join(
             zotero.formatted_citations(resolved_keys, style=style, kind="citation")
@@ -961,6 +975,9 @@ def convert_to_zotero(
             doc, locator,
             keys=resolved_keys, itemdata=resolved_itemdata, uris=resolved_uris,
             rendered=rendered, style=style, track=track,
+            # Per-field discriminator so two fields citing the SAME item(s) get
+            # distinct citationIDs (Zotero requires per-field-unique IDs).
+            seed=f["index"],
         )
         converted.append({
             "manager": manager,

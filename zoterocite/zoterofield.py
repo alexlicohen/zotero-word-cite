@@ -249,6 +249,17 @@ def _build_zotero_field_xml(
     located foreign field's id). Returns the run XML (begin/instr/sep/result/end).
     """
     extras = extras or [{} for _ in keys]
+    # zip() would SILENTLY truncate to the shortest list, dropping or mis-pairing
+    # citation items. Fail loudly instead: a field must carry exactly one
+    # itemData/uri/extras per key. (cite_into guards this too; this is the shared
+    # builder's own backstop for every other entry point.)
+    if not (len(keys) == len(itemdata) == len(uris) == len(extras)):
+        raise ValueError(
+            "zotero field lists are not aligned with keys "
+            f"(keys={len(keys)}, itemdata={len(itemdata)}, uris={len(uris)}, "
+            f"extras={len(extras)}); refusing to build a field that would silently "
+            "drop or mis-pair citation items"
+        )
     citation_items = []
     for key, idata, uri, ex in zip(keys, itemdata, uris, extras):
         ci = {"id": idata.get("id", key), "uris": [uri], "itemData": idata}
@@ -541,6 +552,7 @@ def replace_field_with_zotero(
     track: bool = False,
     author: str = "zotero-word-cite",
     date: Optional[str] = None,
+    seed: Optional[object] = None,
 ) -> Docx:
     """Swap a located *foreign* citation field for a live Zotero ``ZOTERO_ITEM``
     field, preserving its paragraph position.
@@ -560,12 +572,22 @@ def replace_field_with_zotero(
 
     Multiple ``keys`` group into ONE Zotero field (a foreign multi-source cite
     maps to one grouped Zotero citation).
+
+    ``seed`` is a per-field discriminator folded into the field's ``citationID``.
+    Zotero requires every citation field in a document to carry a UNIQUE
+    citationID; deriving it from ``keys`` alone would make two fields citing the
+    same item(s) collide (Zotero then merges/renumbers them on refresh). Callers
+    converting many fields MUST pass a value unique to each field (e.g. its
+    document-order index). When ``None`` the legacy keys-only seed is used.
     """
     date = date or now_iso()
     ensure_pref(doc, style)
     root = doc.tree(DOCUMENT)
+    # Unique citationID per field: fold the caller's per-field ``seed`` into the
+    # seed so two fields citing the same key set don't share a citationID.
+    id_seed = [str(seed), *keys] if seed is not None else list(keys)
     field_xml = _build_zotero_field_xml(
-        keys, keys, itemdata, uris,
+        id_seed, keys, itemdata, uris,
         rendered=rendered, rendered_html=rendered_html, extras=extras,
     )
     new_runs = _runs(field_xml)

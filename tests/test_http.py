@@ -300,3 +300,14 @@ def test_consumer_ua_reflects_override(monkeypatch):
     monkeypatch.setattr(_http.urllib.request, "urlopen", fake)
     icite.fetch_icite(["12345678"])
     assert captured["ua"] == "zotero-word-cite/1.0 (mailto:lab@example.org)"
+
+
+def test_http_get_rejects_non_http_scheme(monkeypatch):
+    # The shared fetch primitive must never open a file:// (or other non-web) URL.
+    import urllib.request
+    from zoterocite import _http
+    def _boom(*a, **k):
+        raise AssertionError("urlopen must not be called for a non-http scheme")
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+    assert _http.http_get("file:///etc/passwd", timeout=1) is None
+    assert _http.http_get("ftp://example.com/x", timeout=1) is None

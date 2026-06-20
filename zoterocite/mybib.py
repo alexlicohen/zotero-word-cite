@@ -154,6 +154,7 @@ def fetch_mybib_works_status(
     seen_dois: set[str] = set()
     all_pmids: list[str] = []      # ordered, deduped
     doi_only: list[str] = []       # DOIs that never appeared with a PMID on the page
+    paired_dois: set[str] = set()  # DOIs that sit in a PMID's citation block (lowercased)
 
     try:
         for page_num in range(1, max_pages + 1):
@@ -182,6 +183,28 @@ def fetch_mybib_works_status(
 
             # Extract DOIs (bare or with prefix) via the project extractor.
             page_dois = extract_dois(html)
+
+            # Pair each PMID with the first DOI inside its citation block (the
+            # span up to the next pmid= attribute): that DOI is the paper's own
+            # and must NOT later be emitted as a standalone "doi-only" work even
+            # when PubMed efetch fails to echo the DOI back for that PMID — the
+            # common phantom-duplicate. Suppression only; efetch stays
+            # authoritative for a work's doi field.
+            pmid_starts = [m.start() for m in _PMID_ATTR_RE.finditer(html)]
+            if pmid_starts and page_dois:
+                low = html.lower()
+                doi_at: list[tuple[int, str]] = []
+                for d in page_dois:
+                    pos = low.find(d.lower())
+                    if pos >= 0:
+                        doi_at.append((pos, d))
+                doi_at.sort()
+                for i, ps in enumerate(pmid_starts):
+                    nxt = pmid_starts[i + 1] if i + 1 < len(pmid_starts) else len(html)
+                    for dpos, d in doi_at:
+                        if ps < dpos < nxt:
+                            paired_dois.add(d.lower())
+                            break
 
             # Check for new content.
             new_pmids = [p for p in page_pmids if p not in seen_pmids]
@@ -259,8 +282,8 @@ def fetch_mybib_works_status(
     # Coerce each meta doi to str (tolerates doi=None) before .lower().
     pmid_doi_set = {((meta.get(p) or {}).get("doi") or "").lower() for p in all_pmids}
     for doi in doi_only:
-        if doi.lower() in pmid_doi_set:
-            continue  # already emitted via the PMID path
+        if doi.lower() in pmid_doi_set or doi.lower() in paired_dois:
+            continue  # already a PMID's DOI (efetch echo OR page citation-block pairing)
         results.append({
             "doi": doi,
             "pmid": "",

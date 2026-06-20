@@ -441,6 +441,48 @@ class TestPlan:
 # ===========================================================================
 
 class TestApply:
+    def test_below_high_confidence_imports_parsed_not_resolved_metadata(self, tmp_path, offline):
+        # A record that resolves only at MEDIUM confidence (a possible mismatch)
+        # must be migrated with the EndNote export's OWN parsed metadata, never an
+        # uncertain (possibly wrong) resolved work's title/DOI.
+        ris = ("TY  - JOUR\nTI  - Parsed Authoritative Title\n"
+               "DO  - 10.123/parsed\nPY  - 2020\nER  -\n")
+        lib = _write(tmp_path, "lib.ris", ris)
+        doc = _build_doc(tmp_path)
+
+        def wrong_medium_resolve(text, *, fetch=True):
+            return {"input": text,
+                    "metadata": {"title": "WRONG Resolved Work",
+                                 "doi": "10.999/wrong", "year": "1999"},
+                    "confidence": "medium", "source": "crossref",
+                    "candidates": [], "identifiers": {}}
+        offline.setattr(en.refresolve, "resolve_reference", wrong_medium_resolve)
+        offline.setattr(en.zotero, "key_can_write", lambda: True)
+        offline.setattr(en.zotero, "key_can_write_status", lambda: True)
+
+        captured = {}
+
+        def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None):
+            captured["metas"] = metas
+            return {"created": [{"title": m.get("title", ""), "key": f"K{i}",
+                                 "doi": m.get("doi", "")} for i, m in enumerate(metas)],
+                    "skipped_existing": [], "failed": []}
+
+        def fake_convert(path, *, out=None, managers=("endnote",), track=False, **kw):
+            return {"out": str(out), "converted": [], "unmatched": [],
+                    "deduped": 0, "classification": {"counts": {}, "items": []}}
+
+        offline.setattr(en.zotero, "create_items", fake_create_items)
+        offline.setattr(en.citeconvert, "convert_to_zotero", fake_convert)
+
+        apply_endnote_migration(doc, lib, out=tmp_path / "o.docx")
+        metas = captured["metas"]
+        assert len(metas) == 1
+        m = metas[0]
+        assert m["title"] == "Parsed Authoritative Title", m
+        assert m["doi"] == "10.123/parsed", m
+        assert "WRONG" not in m["title"] and m["doi"] != "10.999/wrong"
+
     def test_refuses_without_write_key(self, tmp_path, offline):
         lib = _write(tmp_path, "lib.xml", ENDNOTE_XML)
         doc = _build_doc(tmp_path)

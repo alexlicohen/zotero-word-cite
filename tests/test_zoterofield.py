@@ -299,3 +299,11 @@ def test_ensure_pref_optin_online_still_validates(tmp_path, monkeypatch):
     doc = Docx(src)
     with pytest.raises(ValueError):
         zoterofield.ensure_pref(doc, "natuer-neuroscience", validate_online=True)
+
+
+def test_build_field_rejects_misaligned_lists():
+    # zip() would silently truncate; mismatched key/itemdata/uri lengths must raise.
+    import pytest as _pytest
+    from zoterocite.zoterofield import _build_zotero_field_xml
+    with _pytest.raises(ValueError):
+        _build_zotero_field_xml(["s"], ["K1", "K2"], [{"id": "a"}], ["u1"])

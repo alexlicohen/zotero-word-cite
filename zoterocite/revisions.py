@@ -603,17 +603,15 @@ def _apply_inplace_plain_edits(p, edits, plain_runs, ids, author, date) -> bool:
                                        _make_run(new_sub, anchor_rpr)))
                 cursor = lb
             else:                                     # pure insertion at boundary pa
-                # Owned by this run if pa is strictly inside, or pa == s on the FIRST
-                # run (so a leading insertion isn't double-emitted), or pa == e on the
-                # LAST run (trailing insertion).
-                owns = (s < pa < e) or (pa == s and ri == 0) or (pa == e and ri == n_runs - 1)
-                # If pa == e and there is a NEXT plain run, let the next run own it as
-                # its pa == s boundary instead — but only when that next run exists.
-                if pa == e and ri < n_runs - 1:
-                    owns = False
-                if pa == s and ri > 0:
-                    # boundary between two runs: owned by the PREVIOUS run's pa == e.
-                    owns = False
+                # Own the boundary on the run ENDING at pa (the previous run) plus
+                # any strictly-interior point; the global-start boundary (pa == 0,
+                # which no run ends at) is owned by the first run. Attaching to the
+                # run that ENDS at pa places the inserted text at that run's end —
+                # i.e. BEFORE any following complex field — so an insertion at a
+                # prose|field seam lands before the citation, not after it. Exactly
+                # one run owns each seam, so the <w:ins> is never dropped (the old
+                # pair of deferral rules left an internal seam owned by neither).
+                owns = (s < pa <= e) or (pa == s and ri == 0)
                 if not owns:
                     continue
                 if pa > cursor:

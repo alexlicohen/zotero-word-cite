@@ -22,7 +22,9 @@ from zoterocite import Docx, add_comment, new_doc
 from zoterocite.docxio import DOCUMENT
 from zoterocite.ooxml import NS, qn
 from zoterocite.paras import iter_paragraphs
-from zoterocite.refextract import _is_reference_shaped, extract_references
+from zoterocite.refextract import (
+    _is_reference_shaped, _is_placeholder_bracket, extract_references,
+)
 
 W = NS["w"]
 
@@ -158,6 +160,24 @@ class TestIntext:
 
 
 class TestPlaceholders:
+    def test_ref_cite_substring_brackets_not_placeholders(self):
+        # Ordinary bracketed prose that merely CONTAINS the letters ref/cite must
+        # NOT be misread as a citation placeholder (it would demand a spurious
+        # confirm in the unify plan). Genuine citation markers still match.
+        assert not _is_placeholder_bracket("preferred dose")
+        assert not _is_placeholder_bracket("referral pathway")
+        assert not _is_placeholder_bracket("cross-referenced data")
+        # genuine placeholders are still detected
+        assert _is_placeholder_bracket("CITE")
+        assert _is_placeholder_bracket("ref?")
+        assert _is_placeholder_bracket("citation needed")
+        assert _is_placeholder_bracket("Smith 2020")   # bare year
+        # plural / singular / numbered ref stubs are still detected
+        assert _is_placeholder_bracket("reference")
+        assert _is_placeholder_bracket("refs")
+        assert _is_placeholder_bracket("citations")
+        assert _is_placeholder_bracket("ref12")
+
     def test_bracket_placeholder_found(self, full_doc):
         result = extract_references(full_doc)
         brackets = [p for p in result["placeholders"] if p["kind"] == "bracket"]
@@ -845,3 +865,13 @@ def test_multinumber_and_nonrun_single_kept(tmp_path):
     ])
     nums = _numeric_cites(doc)
     assert "(3,4)" in nums and "(5)" in nums
+
+
+def test_mismatched_bracket_not_a_numeric_cite(tmp_path):
+    # "[12)" / "(12]" have mismatched delimiters and must not be captured as a
+    # numeric citation (a malformed anchor that would fail to locate at apply).
+    src = tmp_path / "mm.docx"
+    new_doc(str(src), ["Good [12] and (3,4), but mismatched [12) and (5] here."])
+    nums = [m["text"] for m in extract_references(src)["intext"] if m["kind"] == "numeric"]
+    assert "[12]" in nums and "(3,4)" in nums
+    assert "[12)" not in nums and "(5]" not in nums

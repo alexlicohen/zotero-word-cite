@@ -558,12 +558,15 @@ def _reorder_by_keys(
     requested key *i* with a DIFFERENT work's metadata when the orders diverge —
     the CRIT-3 mis-binding. This function makes the binding explicit by key.
 
-    Items whose own key cannot be recovered (``None``) keep their response-order
-    position as a last resort but are NOT consumed by key-matching, so they can
-    never be mis-attributed to a key they don't belong to. A requested key with no
-    matching returned item yields ``None`` at that position (the caller decides
+    Items whose own key cannot be recovered (``None``) are used positionally ONLY
+    when the ENTIRE response is keyless — the legacy/stub shape where response
+    order is the only signal we have. If ANY item's key was recovered, a keyless
+    item is an unrelated object (a returned child note/attachment, or a malformed
+    ``id``) and is NEVER bound to a requested key: binding it would embed the
+    wrong work's metadata into that citation (a CRIT-3 mis-bind). A requested key
+    with no keyed match then yields ``None`` at that position (the caller decides
     whether to placeholder or drop it) and a surfaced :class:`UserWarning` — a
-    missing item must never shift the others.
+    missing item must never shift, nor be impersonated by, the others.
     """
     by_key: dict[str, Any] = {}
     unkeyed: list[Any] = []
@@ -575,20 +578,21 @@ def _reorder_by_keys(
             unkeyed.append(it)
     ordered: list[Any] = []
     missing: list[str] = []
+    # Positional fallback is safe ONLY when no key was recoverable at all. With a
+    # partially-keyed response, an unkeyed item is an unrelated object and binding
+    # it to a missing requested key would mis-attribute another work's metadata.
+    allow_positional = not by_key
     unkeyed_iter = iter(unkeyed)
     for key in item_keys:
         if key in by_key:
             ordered.append(by_key[key])
+            continue
+        stub = next(unkeyed_iter, None) if allow_positional else None
+        if stub is not None:
+            ordered.append(stub)
         else:
-            # No keyed match. Fall back to an unkeyed item only if one is left
-            # (e.g. a response that carries no recoverable keys at all — the
-            # legacy/stub shape); otherwise the key is genuinely absent.
-            stub = next(unkeyed_iter, None)
-            if stub is not None:
-                ordered.append(stub)
-            else:
-                ordered.append(None)
-                missing.append(key)
+            ordered.append(None)
+            missing.append(key)
     if missing:
         warnings.warn(
             f"Zotero {what} omitted {len(missing)} requested item(s) "

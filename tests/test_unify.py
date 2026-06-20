@@ -933,3 +933,26 @@ class TestLiveFieldGuard:
             "the live Zotero field rendering '(1,2)' must survive intact in the output doc"
         )
         assert report["replaced"] >= 1, "at least one plain-text citation was converted"
+
+
+# ===========================================================================
+# Numeric range expansion: "[5-7]" links refs 5, 6 AND 7 (not just endpoints)
+# ===========================================================================
+
+class TestNumericRangeExpansion:
+    """unify._numeric_marker_targets expands a citation range to EVERY number in
+    it, so the interior references of a Vancouver "[5-7]" marker are linked too —
+    splitting on the hyphen used to link only the two endpoints."""
+
+    def test_range_expands_to_all_interior_numbers(self):
+        assert unify._numeric_marker_targets("[5-7]") == [5, 6, 7]
+        assert unify._numeric_marker_targets("(5–7)") == [5, 6, 7]   # en-dash
+        assert unify._numeric_marker_targets("[3,4]") == [3, 4]
+        assert unify._numeric_marker_targets("[3, 5-7, 9]") == [3, 5, 6, 7, 9]
+
+    def test_single_and_degenerate_ranges(self):
+        assert unify._numeric_marker_targets("[12]") == [12]
+        assert unify._numeric_marker_targets("[7-7]") == [7]
+        # reversed / absurdly large ranges fall back to endpoints (no explosion)
+        assert unify._numeric_marker_targets("[9-2]") == [9, 2]
+        assert unify._numeric_marker_targets("[1-9999]") == [1, 9999]

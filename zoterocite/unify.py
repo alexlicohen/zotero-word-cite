@@ -78,12 +78,27 @@ def _numbering_to_int(numbering: Optional[str]) -> Optional[int]:
 
 
 def _numeric_marker_targets(marker_text: str) -> List[int]:
-    """All citation numbers in a numeric in-text marker (``"[3,4]"`` → ``[3, 4]``)."""
+    """All citation numbers in a numeric in-text marker, EXPANDING ranges.
+
+    ``"[3,4]"`` → ``[3, 4]``; ``"[5-7]"`` → ``[5, 6, 7]``. A Vancouver/NIH range
+    cites *every* reference in it, so the interior numbers must be linked too —
+    splitting on the hyphen (the old behaviour) linked only the two endpoints and
+    silently left every middle reference of a range with no in-text anchor.
+    """
     inner = marker_text.strip().strip("[]()")
     nums: List[int] = []
-    for part in re.split(r"[,\-–]", inner):
+    for part in inner.split(","):
         part = part.strip()
-        if part.isdigit():
+        m = re.fullmatch(r"(\d+)\s*[-–]\s*(\d+)", part)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            # Expand a sane ascending span; on a reversed or absurdly large range
+            # (a typo) fall back to just the endpoints rather than emit thousands.
+            if lo <= hi and hi - lo <= 100:
+                nums.extend(range(lo, hi + 1))
+            else:
+                nums.extend(n for n in (lo, hi))
+        elif part.isdigit():
             nums.append(int(part))
     return nums
 

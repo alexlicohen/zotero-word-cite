@@ -925,3 +925,41 @@ class TestKeyCanWriteStatus:
         assert "verify" in reason and "retry" in reason
         # must NOT assert a definitive "does not have write access".
         assert "does not have write access" not in reason
+
+
+# ---------------------------------------------------------------------------
+# _reorder_by_keys — CRIT-3 mis-binding guard
+# ---------------------------------------------------------------------------
+
+class TestReorderByKeys:
+    """Binding each requested key to the returned item whose own key matches it,
+    and refusing to bind a keyless item to a key it may not belong to."""
+
+    def test_partial_unkeyed_response_does_not_misbind(self):
+        # Request A,B,C; response has A (keyed) + one keyless item. B must NOT be
+        # bound to the keyless item (it could be a child note/attachment) — it
+        # fails safe to None instead of embedding the wrong work's metadata.
+        import warnings
+        items = [{"id": "2504198/A", "title": "Paper A"},
+                 {"title": "MYSTERY note, no key"}]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out = zotero._reorder_by_keys(["A", "B", "C"], items, what="test")
+        assert out[0]["title"] == "Paper A"
+        assert out[1] is None          # B: keyless item NOT bound here
+        assert out[2] is None          # C: genuinely absent
+        # the keyless item is never attributed to any requested key
+        assert all(o is None or o.get("title") != "MYSTERY note, no key" for o in out)
+
+    def test_fully_keyless_response_keeps_positional_legacy(self):
+        # When NO key is recoverable at all (legacy/stub shape), response order is
+        # the only signal and positional binding is preserved.
+        items = [{"title": "first"}, {"title": "second"}]
+        out = zotero._reorder_by_keys(["A", "B"], items, what="test")
+        assert [o["title"] for o in out] == ["first", "second"]
+
+    def test_keyed_response_reordered_to_requested_order(self):
+        # Zotero serves in library order; we must reorder to the requested order.
+        items = [{"id": "g/B"}, {"id": "g/A"}]      # library order B, A
+        out = zotero._reorder_by_keys(["A", "B"], items, what="test")
+        assert [o["id"] for o in out] == ["g/A", "g/B"]

@@ -27,8 +27,10 @@ The shared group library is a shared resource, so the WRITE is high-stakes:
 * The actual write happens only under an explicit ``apply=True`` AND a
   write-enabled key (:func:`zotero.key_can_write`); :func:`apply_endnote_migration`
   refuses otherwise (same gate as :func:`unify.apply_unification`).
-* Any reference MATCH below ``high`` confidence is a candidate to confirm, never
-  auto-asserted (surfaced in the plan; never silently created).
+* A reference MATCH below ``high`` confidence is never auto-asserted: the record
+  is still migrated, but using the EndNote export's OWN parsed metadata rather
+  than an uncertain (possibly wrong) resolved match, so a mis-resolved work's
+  title/DOI is never silently written into the shared group.
 * **Retracted** references are flagged and never auto-imported.
 
 The only network mutation is the confirm-gated, dedup-hard, tagged Zotero write.
@@ -813,7 +815,13 @@ def apply_endnote_migration(
                 "doi": entry["canonical_doi"],
             })
             continue
-        to_create_metas.append(_meta_to_zotero_meta(entry["resolution"], rec))
+        # A resolved MATCH is asserted into the shared library only when it is
+        # HIGH confidence. Below that the match may be the WRONG work, so import
+        # the EndNote export's OWN parsed metadata instead of an uncertain
+        # resolution — never silently write a mis-resolved work's title/DOI into
+        # the group (governance: below-high matches are not auto-asserted).
+        resolution = entry["resolution"] if entry.get("tier") == "high" else None
+        to_create_metas.append(_meta_to_zotero_meta(resolution, rec))
 
     # ---- the WRITE: create items (deduped, tagged, in-collection) ------------
     # Thread the already-built DOI index into create_items so its per-item dedup

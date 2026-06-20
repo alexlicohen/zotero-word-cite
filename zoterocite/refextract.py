@@ -226,10 +226,17 @@ _PLACEHOLDER_CONTENT_RE = re.compile(
 _PLACEHOLDER_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 _PLACEHOLDER_BRACKET_RE = re.compile(r"\[([^\]]{1,80})\]")
 
-# Patterns that identify definitely-citation brackets (override other filters)
+# Patterns that identify definitely-citation brackets (override other filters).
+# The keyword alternation is word-bounded so an ordinary bracket whose content
+# merely CONTAINS the letters "ref"/"cite" — "[preferred]", "[referral pathway]",
+# "[cross-referenced data]" — is NOT misread as a citation placeholder (which
+# would demand a spurious confirm/resolution in the unify plan). The cite/ref
+# families allow a plural 's' and a trailing reference number ("refs", "ref12",
+# "citations", "references") so those genuine stubs are still detected; a bare
+# "?" matches anywhere (an explicit uncertainty marker).
 _DEFINITE_PLACEHOLDER_RE = re.compile(
     r"(?i:^\s*(CITE|CITATION|REF|REF\?|CITE\?|ref\?|cite\?)\s*$)"
-    r"|(?i:cite|ref|citation|todo|\?|et\s+al)",
+    r"|(?i:\b(?:cites?|references?|citations?|refs?|todo|et\s+al)\b|\bref\.?\s*\d|\?)",
 )
 
 # DOI pattern for comment scanning — shared bare-DOI body (byte-identical to the
@@ -654,8 +661,12 @@ def extract_references(path) -> dict:
 
         # Numeric: [12], [3,4], (1,2) — but EXCLUDE list enumerators "(1) … (2) … (3)"
         # (single-number parentheticals running 1..k); those are prose, not citations.
+        # The open/close bracket character class is independent in the pattern, so
+        # reject MISMATCHED pairs ("[12)", "(12]") here — a malformed marker would
+        # otherwise become a broken anchor that fails to locate at apply time.
         numeric_matches = [m for m in _NUMERIC_CITE_RE.finditer(txt)
-                           if _is_numeric_cite(m.group(1))]
+                           if _is_numeric_cite(m.group(1))
+                           and (m.group(0)[0], m.group(0)[-1]) in (("[", "]"), ("(", ")"))]
         enum_idxs = _enumerator_run_indices(numeric_matches, txt)
         for j, m in enumerate(numeric_matches):
             if j in enum_idxs:

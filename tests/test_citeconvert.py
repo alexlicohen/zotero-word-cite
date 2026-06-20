@@ -454,6 +454,23 @@ class TestConvert:
         keys = [it["key"] for cit in scan_citations(res["out"]) for it in cit["items"]]
         assert keys.count("MENKEY1") == 2
 
+    def test_same_item_cited_twice_gets_distinct_citation_ids(self, tmp_path, fake_zotero):
+        # Regression: two foreign fields citing the SAME item must convert to two
+        # live Zotero fields with DISTINCT citationIDs. Zotero requires every
+        # field's citationID to be unique; deriving it from keys alone collides,
+        # and Zotero then merges/renumbers the two citations on refresh.
+        path = build_mixed_doc(tmp_path, with_dup=True, with_word=False,
+                               with_zotero=False, with_manual=False)
+        out = tmp_path / "ids.docx"
+        res = convert_to_zotero(path, out=out, managers=("mendeley",))
+        cits = scan_citations(res["out"])
+        # both converted fields reference the same single item ...
+        keys = [it["key"] for cit in cits for it in cit["items"]]
+        assert keys.count("MENKEY1") == 2
+        # ... but each field carries a distinct citationID (no collision).
+        cids = [c["citationID"] for c in cits]
+        assert len(cids) == len(set(cids)), f"duplicate citationID across fields: {cids}"
+
     def test_dedup_against_existing_zotero(self, tmp_path, fake_zotero):
         # A Mendeley cite whose DOI is already Zotero-managed must NOT be converted.
         src = tmp_path / "s.docx"
@@ -476,6 +493,38 @@ class TestConvert:
         assert res["deduped"] >= 1
         # nothing converted (the only foreign cite was a dup of an existing item)
         assert res["converted"] == []
+
+    def test_grouped_cite_keeps_item_already_zotero_elsewhere(self, tmp_path, fake_zotero):
+        # A grouped foreign cite [A, B] where B is already cited via Zotero
+        # elsewhere must convert to a field citing BOTH A and B — B must not be
+        # silently dropped from the co-citation at this location.
+        src = tmp_path / "g.docx"
+        new_doc(src, ["Grouped foreign cite of two works here.",
+                      "Existing zotero of work B here."])
+        doc = Docx(src)
+        root = doc.tree(DOCUMENT)
+        grouped = " ADDIN CSL_CITATION " + json.dumps({
+            "citationItems": [
+                {"id": "A", "itemData": {"title": "Work A", "DOI": "10.1000/widgets.2001",
+                                         "issued": {"date-parts": [["2019"]]}},
+                 "uris": ["http://mendeley.com/a"]},
+                {"id": "B", "itemData": {"title": "Work B", "DOI": "10.5555/already",
+                                         "issued": {"date-parts": [["2020"]]}},
+                 "uris": ["http://mendeley.com/b"]},
+            ],
+            "mendeley": {"plainTextFormattedCitation": "(a,b)"},
+            "schema": "https://github.com/citation-style-language/schema/raw/master/csl-citation.json",
+        }) + " "
+        _append_complex_field(_find_para(root, "Grouped foreign cite"), grouped)
+        _append_complex_field(_find_para(root, "Existing zotero of work B"), ZOTERO_INSTR)
+        p = tmp_path / "p.docx"; doc.save(p)
+
+        out = tmp_path / "o.docx"
+        res = convert_to_zotero(p, out=out, managers=("mendeley",))
+        cits = scan_citations(res["out"])
+        keysets = [{it["key"] for it in c["items"]} for c in cits]
+        # exactly one converted field cites BOTH A (MENKEY1) and B (ZKEY)
+        assert {"MENKEY1", "ZKEY"} in keysets, keysets
 
     def test_unmatched_recorded_not_fabricated(self, tmp_path, fake_zotero):
         # Mendeley cite to a DOI NOT in the fake library -> unmatched, not converted.

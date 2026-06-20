@@ -193,6 +193,32 @@ class TestFetchMybibWorks:
         assert doi_entry["pmid"] == ""
         assert doi_entry["source"] == "mybib"
 
+    def test_no_phantom_doi_only_when_efetch_omits_pmid_doi(self, monkeypatch):
+        """A paper whose PMID and DOI sit in the same citation block must NOT be
+        emitted twice when PubMed efetch fails to echo the DOI back for that PMID
+        — the page-block pairing suppresses the standalone doi-only duplicate."""
+        def fake_http_get(url: str, timeout: float = 10.0):
+            if "page=1" in url:
+                return (
+                    b'<html><body>'
+                    b'<div pmid="11111111">Paper with a DOI</div>'
+                    b'<a href="https://doi.org/10.1234/cool">doi</a>'
+                    b'</body></html>'
+                )
+            return _page3_html()
+
+        monkeypatch.setattr(mybib_module, "_http_get", fake_http_get)
+        # efetch returns the record but WITHOUT the DOI (a common real case).
+        monkeypatch.setattr(mybib_module.entrez, "efetch_pubmed",
+                            lambda ids: {"11111111": {"title": "Paper with a DOI",
+                                                      "year": "2021", "doi": ""}})
+
+        works = fetch_mybib_works(_VALID_URL)
+        # exactly one work — the PMID entry — and NO phantom titleless doi-only entry.
+        assert len(works) == 1
+        assert works[0]["pmid"] == "11111111"
+        assert not any(w["pmid"] == "" and w["doi"] == "10.1234/cool" for w in works)
+
     def test_doi_in_pmid_entry_not_duplicated_as_doi_only(self, monkeypatch):
         """A DOI that also appears in a PMID's Entrez record must not emit a second doi-only entry."""
         def fake_http_get(url: str, timeout: float = 10.0):
@@ -340,13 +366,15 @@ class TestFix2DoiNone:
         assert pmid_entry["doi"] == ""  # None coerced to empty string
 
     def test_doi_none_in_doi_only_set_does_not_raise(self, monkeypatch):
-        """None doi in meta used for pmid_doi_set must not raise."""
+        """None doi in meta used for pmid_doi_set must not raise; a genuinely
+        standalone DOI (not in any PMID's citation block — here it precedes the
+        only pmid) is still emitted as a doi-only entry."""
         def fake_http_get(url: str, timeout: float = 10.0):
             if "page=1" in url:
                 return (
                     b'<html><body>'
-                    b'<div pmid="12345678">A</div>'
                     b'<a href="https://doi.org/10.9999/dataset">link</a>'
+                    b'<div pmid="12345678">A</div>'
                     b'</body></html>'
                 )
             return b'<html><body></body></html>'
