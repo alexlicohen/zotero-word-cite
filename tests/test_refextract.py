@@ -780,15 +780,68 @@ class TestSectionLabelProseNotReferenceShaped:
         )
 
 
-def test_list_enumerators_excluded_from_numeric_cites(tmp_path):
-    # "(1) … (2) … (3)" running 1..k are list enumerators (prose), not citations;
-    # a multi-number "(3,4)" and a non-run single "(5)" remain real citations.
+def _numeric_cites(doc) -> list:
+    """Kept numeric in-text markers' text (``e["text"]`` for numeric kinds)."""
+    return [e["text"] for e in extract_references(doc)["intext"] if e["kind"] == "numeric"]
+
+
+def test_enumerator_colon_introduced_dropped(tmp_path):
+    # DROP: colon-introduced numbered list inside a single sentence — prose, not cites.
     doc = _build_doc(tmp_path, [
         "We identified three phenotypes: (1) severe impairment, (2) moderate "
-        "impairment, and (3) preserved functioning across the whole cohort here.",
-        "These scores were calibrated (3,4) and validated previously (5) in "
-        "independent samples reported elsewhere in the prior literature here.",
+        "impairment, and (3) preserved functioning across the cohort here.",
     ])
-    nums = [e["text"] for e in extract_references(doc)["intext"] if e["kind"] == "numeric"]
-    assert "(1)" not in nums and "(2)" not in nums and "(3)" not in nums  # enumerators dropped
-    assert "(3,4)" in nums and "(5)" in nums                              # real cites kept
+    nums = _numeric_cites(doc)
+    assert "(1)" not in nums and "(2)" not in nums and "(3)" not in nums
+
+
+def test_enumerator_verb_introduced_no_colon_dropped(tmp_path):
+    # DROP: verb-introduced list (no colon before "(1)") — markers 1..k are list items.
+    doc = _build_doc(tmp_path, [
+        "The patient had (1) seizures, (2) developmental delay, and (3) hypotonia "
+        "at baseline evaluation here.",
+    ])
+    nums = _numeric_cites(doc)
+    assert "(1)" not in nums and "(2)" not in nums and "(3)" not in nums
+
+
+def test_sequential_citations_across_sentences_kept(tmp_path):
+    # KEEP: genuine sequential Vancouver/NIH cites across separate sentences.
+    doc = _build_doc(tmp_path, [
+        "We found A (1). Later we confirmed B (2). Finally we observed C (3) in the cohort.",
+    ])
+    nums = _numeric_cites(doc)
+    assert "(1)" in nums and "(2)" in nums and "(3)" in nums
+
+
+def test_claim_trailing_citations_kept(tmp_path):
+    # KEEP: claim-trailing cites — markers are NOT followed by lowercase list-item prose
+    #       (e.g. "(2)," / "(3) in"), so no enumerator run forms.
+    doc = _build_doc(tmp_path, [
+        "The effect was robust as shown (1) and confirmed (2), though others "
+        "disagree (3) in this area.",
+    ])
+    nums = _numeric_cites(doc)
+    assert "(1)" in nums and "(2)" in nums and "(3)" in nums
+
+
+def test_mixed_enumerator_run_then_trailing_citation(tmp_path):
+    # MIXED: (1),(2),(3) are a colon-introduced list (dropped); (4) is a real cite
+    #        (preceded by prose, not a list separator) and is KEPT.
+    doc = _build_doc(tmp_path, [
+        "We saw three phenotypes: (1) severe, (2) moderate, and (3) preserved, "
+        "consistent with prior work (4) in the field.",
+    ])
+    nums = _numeric_cites(doc)
+    assert "(1)" not in nums and "(2)" not in nums and "(3)" not in nums
+    assert "(4)" in nums
+
+
+def test_multinumber_and_nonrun_single_kept(tmp_path):
+    # KEEP: a multi-number "(3,4)" and a non-run single "(5)" are real citations.
+    doc = _build_doc(tmp_path, [
+        "These scores were calibrated (3,4) and validated previously (5) in "
+        "independent samples here.",
+    ])
+    nums = _numeric_cites(doc)
+    assert "(3,4)" in nums and "(5)" in nums

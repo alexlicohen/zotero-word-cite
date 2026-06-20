@@ -369,22 +369,76 @@ def _is_numeric_cite(inner: str) -> bool:
     return True
 
 
-def _enumerator_run_indices(matches: list) -> set:
-    """Indices (into *matches*) of single-number PARENTHETICAL markers that form an
-    in-order ``1, 2, …, k`` run (k >= 2) — i.e. list enumerators like
-    ``"(1) severe …, (2) moderate …, (3) preserved …"``, which are prose, not cites.
+def _enumerator_run_indices(matches: list, txt: str) -> set:
+    """Indices (into *matches*) of single-number PARENTHETICAL markers that form a
+    numbered-list / clause enumerator run — e.g.
+    ``"(1) severe …, (2) moderate …, and (3) preserved …"`` — which are prose, not
+    citations.  Distinguished from GENUINE sequential Vancouver/NIH citations
+    (which also surface as ``(1),(2),(3)…`` for the first-cited refs) by
+    SENTENCE SCOPE + POSITION rather than by ascending value alone.
 
-    Only single-number parentheticals are considered: bracketed ``[n]`` and
+    Only single-number parentheticals are candidates: bracketed ``[n]`` and
     multi-number ``(1,2)``/``(3-5)`` are citation lists/ranges, never enumerators.
-    The run must be exactly ``1..k`` ascending, so a real single cite like ``(5)``
-    — or a non-consecutive set like ``(2), (6)`` — is left alone as a citation."""
-    singles = [(j, int(m.group(1).strip()))
-               for j, m in enumerate(matches)
-               if m.group(0).startswith("(") and m.group(1).strip().isdigit()]
-    if len(singles) < 2:
+
+    A run starts at the first candidate with ``value == 1`` whose marker is
+    immediately followed by lowercase prose (a list item).  It extends through
+    each subsequent candidate ONLY while ALL hold: the value is the next
+    consecutive integer (2, 3, …); the marker is followed by lowercase prose; the
+    marker is preceded by a clause/list separator (``:`` ``;`` ``,`` or
+    ``and``/``or`` — list position); and no sentence-ending punctuation
+    (``.`` ``!`` ``?``) separates it from the previous run marker (single-sentence
+    scope).  The value-1 marker need NOT satisfy the boundary condition, so a
+    verb-introduced list ("The patient had (1) seizures, (2) …, and (3) …") is
+    still caught.  Markers ``2..k`` DO require the boundary.
+
+    Returns the set of run-member ``i`` indices when the run length is >= 2, else
+    an empty set — so sequential citations across sentences ("A (1). … B (2). …"),
+    claim-trailing citations ("robust (1) and confirmed (2)"), and isolated cites
+    ("(5)") are left alone as citations."""
+    candidates = [(i, int(m.group(1).strip()), m)
+                  for i, m in enumerate(matches)
+                  if m.group(0).startswith("(") and m.group(1).strip().isdigit()]
+
+    def _right_is_item(m) -> bool:
+        right = txt[m.end():].lstrip()
+        return bool(right) and right[0].isalpha() and right[0].islower()
+
+    def _left_is_boundary(m) -> bool:
+        left = txt[:m.start()].rstrip()
+        return (
+            left == ""
+            or left[-1] in ":;,"
+            or re.search(r"\b(?:and|or)$", left) is not None
+        )
+
+    # Find ONE run beginning at the first value-1, lowercase-followed candidate.
+    start_pos = None
+    for pos, (_, value, m) in enumerate(candidates):
+        if value == 1 and _right_is_item(m):
+            start_pos = pos
+            break
+    if start_pos is None:
         return set()
-    if [v for _, v in singles] == list(range(1, len(singles) + 1)):
-        return {j for j, _ in singles}
+
+    run = [candidates[start_pos]]            # each entry is (i, value, m)
+    expected_next = 2
+    prev_m = candidates[start_pos][2]
+    for cand in candidates[start_pos + 1:]:
+        _, value, m = cand
+        if value != expected_next:
+            break
+        if not _right_is_item(m):
+            break
+        if not _left_is_boundary(m):
+            break
+        if re.search(r"[.!?]", txt[prev_m.end():m.start()]):
+            break
+        run.append(cand)
+        expected_next += 1
+        prev_m = m
+
+    if len(run) >= 2:
+        return {i for i, _, _ in run}
     return set()
 
 
@@ -602,7 +656,7 @@ def extract_references(path) -> dict:
         # (single-number parentheticals running 1..k); those are prose, not citations.
         numeric_matches = [m for m in _NUMERIC_CITE_RE.finditer(txt)
                            if _is_numeric_cite(m.group(1))]
-        enum_idxs = _enumerator_run_indices(numeric_matches)
+        enum_idxs = _enumerator_run_indices(numeric_matches, txt)
         for j, m in enumerate(numeric_matches):
             if j in enum_idxs:
                 continue
