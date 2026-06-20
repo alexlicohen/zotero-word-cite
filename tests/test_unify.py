@@ -21,8 +21,9 @@ from pathlib import Path
 
 import pytest
 
-from zoterocite import new_doc
+from zoterocite import new_doc, Docx, insert_citation
 from zoterocite import unify
+from zoterocite import zoterofield
 
 
 # ===========================================================================
@@ -807,3 +808,128 @@ class TestF7Integration:
         assert "(Smith et al., 2020)" in smith_anchors
         # And it never tried to anchor the now-converted foreign pseudo-marker.
         assert all("Foreign" not in a for a, _ in inserts)
+
+
+# ===========================================================================
+# Regression: apply_unification must NOT re-cite an in-text marker whose text
+# already matches a live Zotero field's rendered text (the unify-refs guard,
+# commit b666cd5).  ``existing_renderings`` snapshots live fields before any
+# insertion and the apply loop skips matching anchors.
+# ===========================================================================
+
+class TestLiveFieldGuard:
+    """End-to-end: a doc with an existing live ZOTERO_ITEM field rendering
+    '(1,2)' must NOT have that marker clobbered by apply_unification, while a
+    genuine plain-text in-text cite '(Smith et al., 2020)' still converts."""
+
+    def test_apply_does_not_recite_live_field_marker(
+        self, tmp_path, monkeypatch
+    ):
+        # Build a draft that contains BOTH:
+        #   (a) a live ZOTERO_ITEM field rendering "(1,2)" — already managed
+        #   (b) a plain-text "(Smith et al., 2020)" — a genuine unmanaged cite
+        # plus a reference list entry that lets Smith resolve as high-confidence.
+        src = tmp_path / "live_guard.docx"
+        new_doc(src, [
+            "Background supported by prior work here.",   # anchor for live field
+            "Tuberous sclerosis is associated with ASD (Smith et al., 2020).",
+            "References",
+            "1. Smith J, et al. Tuberous sclerosis and autism. J Neurol. 2020.",
+        ])
+
+        # Embed a live ZOTERO_ITEM field at the "prior work" anchor, rendering "(1,2)".
+        # This simulates a citation that Zotero already manages in the document.
+        G = "http://zotero.org/groups/2504198/items/"
+        doc = Docx(src)
+        insert_citation(
+            doc, "prior work",
+            ["LIVEKEY1", "LIVEKEY2"],
+            itemdata=[
+                {"id": "2504198/LIVEKEY1", "type": "article-journal",
+                 "title": "Prior work alpha"},
+                {"id": "2504198/LIVEKEY2", "type": "article-journal",
+                 "title": "Prior work beta"},
+            ],
+            uris=[G + "LIVEKEY1", G + "LIVEKEY2"],
+            rendered="(1,2)",
+            style="vancouver",
+        )
+        doc.save(src)
+
+        # Confirm the live field is now in the doc and existing_renderings sees it.
+        root = Docx(src).read_tree(zoterofield.DOCUMENT)
+        assert "(1,2)" in zoterofield.existing_renderings(root), (
+            "precondition: existing_renderings must report the live field's text"
+        )
+
+        # Standard network + write patches (reuse the module-level helpers).
+        monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve)
+        monkeypatch.setattr(
+            unify.zotero, "library_doi_index",
+            lambda **kw: {"10.1/smith2020": "SMITHKEY"},
+        )
+        monkeypatch.setattr(unify.citecheck, "ensure_retraction_db",
+                            lambda **kw: (None, None))
+        monkeypatch.setattr(unify.zotero, "key_can_write_status", lambda: True)
+        monkeypatch.setattr(unify.zotero, "key_can_write", lambda: True)
+        monkeypatch.setattr(unify.zotero, "item_uri",
+                            lambda key: G + key)
+        monkeypatch.setattr(unify.zotero, "create_items",
+                            lambda metas, **k: {
+                                "created": [{"title": m.get("title", ""),
+                                             "key": "NEW_" + m.get("doi", "").split("/")[-1],
+                                             "doi": m.get("doi", "")} for m in metas],
+                                "skipped_existing": [], "failed": [],
+                            })
+
+        insert_calls: list[dict] = []
+
+        def _recording_insert(doc, anchor, keys, **kw):
+            insert_calls.append({"anchor": anchor, "keys": list(keys)})
+            return doc
+
+        monkeypatch.setattr(
+            unify.zoterofield, "replace_text_with_zotero_field",
+            _recording_insert,
+        )
+
+        # Plan: Smith is high/auto (in-library as SMITHKEY).
+        plan = unify.plan_unification(src)
+
+        # Verify the plan has at least Smith's markers, so apply has something to do.
+        smith_ref = next(
+            (r for r in plan["references"]
+             if "smith" in r.get("input", "").lower()),
+            None,
+        )
+        assert smith_ref is not None, "Smith ref must appear in the plan"
+        smith_markers = {m["text"] for m in (smith_ref.get("intext_markers") or [])}
+        assert any("Smith" in t for t in smith_markers), (
+            "Smith's plan entry must carry the '(Smith et al., 2020)' marker"
+        )
+
+        # Run apply — naively it would try to re-cite "(1,2)" too if not guarded.
+        out = tmp_path / "live_guard_out.docx"
+        report = unify.apply_unification(
+            src, plan, {"accept": []}, out=out, track=True,
+        )
+
+        # --- Core assertion: the live field's rendered text was NEVER attempted ---
+        insert_anchors = {c["anchor"] for c in insert_calls}
+        assert "(1,2)" not in insert_anchors, (
+            "apply_unification must NOT attempt to re-cite '(1,2)' — "
+            "it is already backed by a live Zotero field (existing_renderings guard)"
+        )
+
+        # --- Smith's plain-text marker was still converted (the real cite converts) ---
+        assert "(Smith et al., 2020)" in insert_anchors, (
+            "apply_unification must still convert the plain-text '(Smith et al., 2020)' marker"
+        )
+
+        # --- Output doc must still have exactly the original live ZOTERO_ITEM field ---
+        out_root = Docx(out).read_tree(zoterofield.DOCUMENT)
+        out_renderings = zoterofield.existing_renderings(out_root)
+        assert "(1,2)" in out_renderings, (
+            "the live Zotero field rendering '(1,2)' must survive intact in the output doc"
+        )
+        assert report["replaced"] >= 1, "at least one plain-text citation was converted"
