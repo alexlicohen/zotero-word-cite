@@ -319,3 +319,93 @@ def test_insertion_before_citation_field_lands_before_it(tmp_path):
     assert read_views(out)["rejected"] == "aa bb (7) cc."
     assert validate(out).ok
     _field_intact(_xml(out), "(7)")
+
+
+# -- reject of a tracked CITATION CONVERSION restores a LIVE field ------------
+def _foreign_field_doc(tmp_path, lead, instr_code, rendered, tail, *, name="fc.docx"):
+    """A one-paragraph doc carrying a real FOREIGN complex citation field
+    (``lead`` + begin/instrText(instr_code)/separate/<t>rendered/end + ``tail``).
+    Returns ``(src_path, [field_run_elements])`` — the field runs are what a
+    citeconvert locator passes to :func:`replace_field_with_zotero` as ``runs``."""
+    src = tmp_path / name
+    new_doc(src, [{"runs": [{"text": lead}]}])
+    doc = Docx(src)
+    root = doc.tree(DOCUMENT)
+    p = list(root.iter(qn("w:p")))[0]
+    field_runs = _runs(_field_runs(instr_code, _plain_run(rendered)))
+    for r in field_runs:
+        p.append(r)
+    tr = etree.SubElement(p, qn("w:r"))
+    tt = etree.SubElement(tr, qn("w:t"))
+    tt.set(qn("xml:space"), "preserve"); tt.text = tail
+    doc.save(src)
+    return src
+
+
+def test_reject_of_tracked_citation_conversion_restores_live_field(tmp_path):
+    """REJECTING a tracked citation conversion must restore the ORIGINAL field as a
+    LIVE field — its ``<w:instrText>`` code, not a dead ``<w:delInstrText>``.
+
+    ``replace_field_with_zotero(track=True)`` wraps the removed foreign field in
+    ``<w:del>`` (its ``<w:instrText>`` becomes ``<w:delInstrText>``) and the new
+    Zotero field in ``<w:ins>``. ``reject_all`` drops the ``<w:ins>`` (new field
+    gone) and restores the ``<w:del>``; the restored field code MUST be converted
+    back to ``<w:instrText>`` so Word treats it as a live field that refreshes —
+    otherwise it stays a dead ``<w:delInstrText>`` showing cached text that never
+    renumbers. (Mirrors the ``<w:delText>`` -> ``<w:t>`` restore.)"""
+    from zoterocite.zoterofield import replace_field_with_zotero
+
+    foreign_code = 'ADDIN EN.CITE {"original":"endnote-field"}'
+    src = _foreign_field_doc(
+        tmp_path, "We replicated the prior finding ", foreign_code, "(6)",
+        " across cohorts.")
+
+    # Capture the field runs (the conversion locator) from a fresh load: every run
+    # that is part of the complex field — the begin/separate/end fldChar markers, the
+    # instrText, and the rendered "(6)" between separate and end — i.e. every run that
+    # is NOT the lead/tail plain prose.
+    doc = Docx(src)
+    root = doc.tree(DOCUMENT)
+    p = list(root.iter(qn("w:p")))[0]
+    field_runs = [r for r in p if r.tag == qn("w:r")
+                  and (r.find(qn("w:t")) is None
+                       or (r.find(qn("w:t")).text or "") == "(6)")]
+
+    replace_field_with_zotero(
+        doc, {"runs": field_runs},
+        keys=["zk1"], itemdata=[{"id": "zk1"}], uris=["http://zotero.org/x/items/zk1"],
+        rendered="(6)", track=True, author=AC)
+    conv = tmp_path / "conv.docx"; doc.save(conv)
+    cbody = _xml(conv)
+    # Precondition: the conversion produced the dead-field shape inside <w:del>.
+    assert "<w:delInstrText" in cbody, "conversion should strike the old field code"
+    assert "EN.CITE" in cbody, "old EndNote code should still be present (struck)"
+
+    # ACCEPT -> the new Zotero field stands, the old EndNote field is gone.
+    da = Docx(conv); accept_all(da)
+    acc = tmp_path / "acc.docx"; da.save(acc)
+    abody = _xml(acc)
+    assert "ZOTERO_ITEM" in abody, "accepted conversion must keep the new Zotero field"
+    assert "EN.CITE" not in abody, "accepted conversion must drop the old EndNote field"
+    assert "<w:delInstrText" not in abody
+    assert validate(acc).ok
+
+    # REJECT -> the original EndNote field is restored LIVE (no dead delInstrText).
+    dr = Docx(conv); reject_all(dr)
+    rej = tmp_path / "rej.docx"; dr.save(rej)
+    rbody = _xml(rej)
+    rroot = Docx(rej).tree(DOCUMENT)
+
+    # THE BUG: a restored field code must NOT remain a dead <w:delInstrText>.
+    assert rroot.find(".//" + qn("w:delInstrText")) is None, (
+        "rejected conversion left a DEAD <w:delInstrText> field — Word shows cached "
+        "text but the field will not refresh/renumber")
+    # The original live field code is back as <w:instrText> carrying EN.CITE.
+    live_codes = [it.text or "" for it in rroot.iter(qn("w:instrText"))]
+    assert any("EN.CITE" in c for c in live_codes), (
+        f"original EndNote field code not restored as a live <w:instrText>: {live_codes!r}")
+    # The new Zotero field is gone (its <w:ins> was rejected).
+    assert "ZOTERO_ITEM" not in rbody
+    # No tracked markup survives a full reject.
+    assert "<w:del " not in rbody and "<w:ins " not in rbody
+    assert validate(rej).ok

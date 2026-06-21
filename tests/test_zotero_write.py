@@ -963,3 +963,32 @@ class TestReorderByKeys:
         items = [{"id": "g/B"}, {"id": "g/A"}]      # library order B, A
         out = zotero._reorder_by_keys(["A", "B"], items, what="test")
         assert [o["id"] for o in out] == ["g/A", "g/B"]
+
+
+class TestYearFromDate:
+    """``_year_from_date`` must return a 4-digit year or ``None`` — never leak a
+    non-numeric date string ("in press", "n.d.", "forthcoming") or a stray short
+    run ("21") as the "year". A leaked string corrupts the rendered reference
+    (e.g. ``in press;12(3):1-9``) and the author-year sort key. Sibling extractors
+    ``cite._year_from`` / ``zoterolocal._year_from_date`` already do this."""
+
+    def test_extracts_four_digit_year(self):
+        assert zotero._year_from_date("2021-12") == "2021"
+        assert zotero._year_from_date("2021") == "2021"
+        assert zotero._year_from_date("May 2021") == "2021"
+        assert zotero._year_from_date("2021-12-01 1") == "2021"
+
+    def test_non_numeric_date_yields_none_not_the_string(self):
+        for bad in ("in press", "n.d.", "forthcoming", "submitted"):
+            assert zotero._year_from_date(bad) is None, (
+                f"{bad!r} must not leak as the year"
+            )
+
+    def test_short_numeric_run_is_not_a_year(self):
+        # Fewer than 4 digits is not a plausible year and must not leak.
+        assert zotero._year_from_date("21") is None
+        assert zotero._year_from_date("199") is None
+
+    def test_empty_and_none_yield_none(self):
+        assert zotero._year_from_date("") is None
+        assert zotero._year_from_date(None) is None

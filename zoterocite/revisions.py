@@ -989,32 +989,6 @@ def tracked_insert_paragraphs(doc: Docx, anchor: str, blocks: list, *, author: s
     return doc
 
 
-def tracked_replace_in_paragraph(doc: Docx, anchor: str, old_text: str, new_text: str,
-                                 *, author: str, date: Optional[str] = None) -> bool:
-    """Surgically replace the FIRST occurrence of ``old_text`` with ``new_text`` as
-    a tracked change (``<w:del>old</w:del><w:ins>new</w:ins>``) IN PLACE, touching
-    ONLY the single plain-text run that contains ``old_text``.
-
-    This is the FIELD-SAFE alternative to ``tracked_replace_paragraph``: it never
-    rebuilds the paragraph from reassembled text, so citation FIELDS (runs carrying
-    ``<w:fldChar>``/``<w:instrText>``) and every other run are left physically
-    untouched. ``old_text`` must lie wholly within one plain ``<w:t>`` run; if it
-    spans runs, is absent, or appears only inside a field, NO change is made and
-    ``False`` is returned (so the caller can fall back). Returns ``True`` on
-    success.
-
-    Thin public wrapper over the shared :func:`_surgical_replace_run` core — the
-    same single-run split the unified word-edit dispatcher uses for
-    ineligible/cited paragraphs; this entry point does an EXPLICIT caller-supplied
-    old->new replace.
-    """
-    date = date or now_iso()
-    root = doc.tree(DOCUMENT)
-    ids = _Ids(_max_rev_id(root))
-    p = find_paragraph(root, anchor)
-    return _surgical_replace_run(p, old_text, new_text, ids, author, date)
-
-
 def tracked_delete_paragraph_text(doc: Docx, anchor: str, *, author: str,
                                   date: Optional[str] = None) -> Docx:
     date = date or now_iso()
@@ -1205,10 +1179,17 @@ def reject_all(doc: Docx) -> Docx:
         ins.getparent().remove(ins)
     for mt in root.findall(".//" + qn("w:moveTo")):
         mt.getparent().remove(mt)
-    # deletions are restored: <w:delText> -> <w:t>, then unwrap
+    # deletions are restored: <w:delText> -> <w:t> AND <w:delInstrText> ->
+    # <w:instrText> (a struck complex-field code), then unwrap. Restoring the field
+    # code as LIVE <w:instrText> is essential: a tracked CITATION conversion strikes
+    # the original field as <w:delInstrText>, so rejecting it must give back a live
+    # field that Word refreshes/renumbers — not a dead delInstrText showing stale
+    # cached text. Mirrors the delText -> t restore.
     for d in root.findall(".//" + qn("w:del")):
         for dt in d.findall(".//" + qn("w:delText")):
             dt.tag = qn("w:t")
+        for di in d.findall(".//" + qn("w:delInstrText")):
+            di.tag = qn("w:instrText")
         _unwrap(d)
     # move-froms are restored (content already uses normal <w:t>): just unwrap
     for mf in root.findall(".//" + qn("w:moveFrom")):
@@ -1321,8 +1302,3 @@ def spread_timestamps(doc: Docx, author: str, start: Optional[str] = None,
             el.set(dq, stamp)
             updated += 1
     return updated
-
-
-# -- path convenience --------------------------------------------------------
-def open_doc(path: str | Path) -> Docx:
-    return Docx(path)

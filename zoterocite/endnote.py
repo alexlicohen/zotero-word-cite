@@ -415,26 +415,18 @@ def validate_folder(records: List[dict]) -> List[Finding]:
 # ===========================================================================
 
 def _load_retraction_db() -> Dict[str, dict]:
-    """Load the Retraction Watch DB, degrading to ``{}`` on any failure."""
-    try:
-        rw_path, _note = citecheck.ensure_retraction_db()
-    except Exception:  # noqa: BLE001
-        return {}
-    if rw_path is None:
-        return {}
-    try:
-        return citecheck.load_retraction_db(rw_path)
-    except Exception:  # noqa: BLE001
-        return {}
+    """Load the Retraction Watch DB, degrading to ``{}`` on any failure.
+
+    Routes through the single owner :func:`citecheck.load_retraction_map` with
+    ``allow_network=True`` (explicit) — preserving this caller's always-allow-
+    refresh policy: a missing/stale cache is auto-refreshed when online.
+    """
+    return citecheck.load_retraction_map(allow_network=True)
 
 
 def _retracted(doi: Optional[str], rw_db: Dict[str, dict]) -> bool:
-    if not doi or not rw_db:
-        return False
-    rec = rw_db.get(citecheck._normalise_doi(doi))
-    if not rec:
-        return False
-    return (rec.get("nature") or "").strip().lower() == "retraction"
+    """True iff ``doi`` is a retraction — the single owner's per-DOI verdict."""
+    return citecheck.is_retraction(doi or "", rw_db)
 
 
 # ===========================================================================

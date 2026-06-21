@@ -130,6 +130,31 @@ def test_check_links_flags_broken_and_external(tmp_path, monkeypatch):
     assert status["XKEY"] == "external"
 
 
+def test_check_links_degrades_when_credentials_unconfigured(tmp_path, monkeypatch):
+    # With no Zotero credentials, check_links must NOT raise — it cannot verify a
+    # key against the library, so each keyed item degrades to "unverified" instead
+    # of leaking a RuntimeError to the caller (read-only QC must stay non-fatal).
+    src = tmp_path / "c.docx"
+    new_doc(src, ["A claim here with a cite here."])
+    doc = Docx(src)
+    G = "http://zotero.org/groups/2504198/items/"
+    insert_citation(doc, "cite here", ["KEY1"], itemdata=[{"id": "1", "title": "T"}],
+                    uris=[G + "KEY1"], rendered="(1)")
+    out = tmp_path / "c_out.docx"; doc.save(out)
+
+    # No credentials configured: zotero_config returns {} and item_exists would raise.
+    monkeypatch.setattr(zotero, "zotero_config", lambda: {})
+
+    def _boom(key):  # must never be reached once we early-out on no-cred
+        raise AssertionError("item_exists must not be called without credentials")
+    monkeypatch.setattr(zotero, "item_exists", _boom)
+
+    rows = check_links(out)  # must not raise
+    assert len(rows) == 1
+    assert rows[0]["key"] == "KEY1"
+    assert rows[0]["status"] == "unverified"
+
+
 # --------------------------------------------------------------------------- #
 # CRIT-3 / F1 end-to-end: cite_into must bind each citationItem's embedded
 # itemData/id to ITS OWN uri/key even when Zotero returns csljson in a different
@@ -237,6 +262,30 @@ def test_cite_into_single_key_unchanged(tmp_path, monkeypatch):
     assert len(cits) == 1 and len(cits[0]["items"]) == 1
     assert cits[0]["items"][0]["key"] == "SOLO"
     assert cits[0]["items"][0]["title"] == "Solo paper"
+    assert validate(out).ok
+
+
+def test_cite_into_grouped_marker_is_placeholder_not_fabricated_join(tmp_path, monkeypatch):
+    """A grouped cite_into must NOT store a fabricated '(A); (B)' display marker:
+    Zotero renders a group as ONE '(1,2)' marker, never a '; '-join of per-item
+    ones, so joining corrupts the cached display + the existing_renderings dedup
+    guard. A multi-key group stores the neutral '(citation)' placeholder (the
+    live field carries the real citationItems; Word/Zotero regenerate the true
+    grouped marker on refresh). Pre-fix this stored '(AAA); (BBB)'."""
+    src = tmp_path / "s.docx"
+    new_doc(src, ["A combined claim citing two papers here."])
+    _group_creds(monkeypatch)
+    monkeypatch.setattr(zotero, "_get_json", lambda req: {"items": [
+        {"id": f"{GROUP}/AAA", "title": "Alpha paper"},
+        {"id": f"{GROUP}/BBB", "title": "Beta paper"},
+    ]})
+    monkeypatch.setattr(zotero, "formatted_citations",
+                        lambda keys, **k: [f"({x})" for x in keys])
+    out = tmp_path / "out.docx"
+    cite_into(src, "two papers", keys=["AAA", "BBB"], out=out)
+    body = Docx(out).raw("word/document.xml").decode()
+    assert "); (" not in body          # the fabricated per-item separator is gone
+    assert "(citation)" in body         # neutral grouped placeholder stored instead
     assert validate(out).ok
 
 

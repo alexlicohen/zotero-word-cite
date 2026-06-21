@@ -9,39 +9,29 @@ import urllib.error
 
 import pytest
 
+import zoterocite._http as _http_mod
 import zoterocite.refresolve as rr
 
 
 # ---------------------------------------------------------------------------
-# Fake urlopen plumbing (mirrors test_entrez.py pattern)
+# Fake http_get plumbing — patch the shared GET primitive, not raw urlopen.
+# refresolve now routes all Crossref fetches through _http.http_get, so
+# tests patch that seam instead of urllib.request.urlopen.
 # ---------------------------------------------------------------------------
 
-class _FakeResp:
-    def __init__(self, body: bytes):
-        self._body = body
-
-    def read(self):
-        return self._body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-
 def _patch_urlopen(monkeypatch, body: bytes):
-    """Patch urllib.request.urlopen in the refresolve module."""
-    def fake(req, timeout=None):
-        return _FakeResp(body)
-    monkeypatch.setattr(rr.urllib.request, "urlopen", fake)
+    """Patch _http.http_get to return *body* (simulates a successful response)."""
+    monkeypatch.setattr(_http_mod, "http_get", lambda url, **kw: body)
 
 
 def _patch_urlopen_error(monkeypatch, exc=None):
-    """Patch urlopen to raise URLError (simulates network failure)."""
-    def fake(req, timeout=None):
-        raise urllib.error.URLError("network failure (monkeypatched)")
-    monkeypatch.setattr(rr.urllib.request, "urlopen", fake)
+    """Patch _http.http_get to return None (simulates network failure).
+
+    _http.http_get never raises — callers treat None as 'no response'.
+    Previously this patched urlopen to raise URLError; now the contract is
+    the same (caller sees a failure), but expressed via None return.
+    """
+    monkeypatch.setattr(_http_mod, "http_get", lambda url, **kw: None)
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +132,21 @@ class TestExtractIdentifier:
         result = rr.extract_identifier(text)
         assert result["arxiv"] == "2301.01234"
 
+    def test_arxiv_id_surfaced_from_doi(self):
+        # citation-resolve-lookup-8: an arXiv id carried only as a 10.48550/arXiv.
+        # DOI (no explicit "arXiv:" label) must still populate arxiv= so the
+        # zero-round-trip arXiv shortcut is not lost.
+        text = "Vaswani A et al. Attention is all you need. doi:10.48550/arXiv.1706.03762"
+        result = rr.extract_identifier(text)
+        assert result["doi"] == "10.48550/arxiv.1706.03762"
+        assert result["arxiv"] == "1706.03762"
+
+    def test_non_arxiv_doi_leaves_arxiv_none(self):
+        # A normal journal DOI must NOT populate arxiv.
+        text = "Fox MD. 10.1038/nature12345. Nature 2013."
+        result = rr.extract_identifier(text)
+        assert result["arxiv"] is None
+
     def test_plain_author_year_all_none(self):
         text = "Fox MD, Buckner RL. Mapping symptoms to brain networks. Brain 2019;142:3138-3150."
         result = rr.extract_identifier(text)
@@ -238,11 +243,11 @@ class TestResolveReference:
             "score": 99.0,
         }
 
-        def fake(req, timeout=None):
-            captured["url"] = req.full_url
-            return _FakeResp(_crossref_single_response(canned))
+        def fake(url, **kw):
+            captured["url"] = url
+            return _crossref_single_response(canned)
 
-        monkeypatch.setattr(rr.urllib.request, "urlopen", fake)
+        monkeypatch.setattr(_http_mod, "http_get", fake)
 
         result = rr.resolve_reference(
             "Harris CR et al. [10.1038/s41586-020-2649-2] Nature 2020."
@@ -694,7 +699,7 @@ class TestCheckPreprintStatus:
     def test_fetch_false_skips_network(self, monkeypatch):
         def boom(*a, **k):
             raise AssertionError("must not hit network when fetch=False")
-        monkeypatch.setattr(rr.urllib.request, "urlopen", boom)
+        monkeypatch.setattr(_http_mod, "http_get", boom)
         result = rr.check_preprint_status("10.1101/2020.01.01.123456", fetch=False)
         assert result["is_preprint"] is True
         assert result["published_doi"] is None
@@ -707,6 +712,51 @@ class TestCheckPreprintStatus:
         _patch_urlopen(monkeypatch, body)
         ref_string = f"Smith J et al. A study. bioRxiv doi:{preprint_doi}"
         result = rr.check_preprint_status(ref_string)
+        assert result["is_preprint"] is True
+        assert result["published_doi"] == published
+
+    # -- citation-resolve-lookup-7 ------------------------------------------
+    # The published DOI is not guaranteed to be is-preprint-of[0], nor always
+    # under the is-preprint-of key. Scan all entries across is-preprint-of /
+    # is-version-of / has-version and take the first DOI-typed id.
+
+    def test_published_doi_found_past_index_zero(self, monkeypatch):
+        """A non-DOI entry at [0] must not hide the DOI entry at [1]."""
+        preprint_doi = "10.1101/2020.01.01.123456"
+        published = "10.1212/WNL.0000000000014567"
+        item = {
+            "DOI": preprint_doi,
+            "title": ["A preprint title"],
+            "type": "posted-content",
+            "relation": {
+                "is-preprint-of": [
+                    # [0] carries a non-DOI id (the old code stopped here -> None)
+                    {"id": "32000000", "id-type": "pmid", "asserted-by": "publisher"},
+                    {"id": published, "id-type": "doi", "asserted-by": "publisher"},
+                ]
+            },
+        }
+        _patch_urlopen(monkeypatch, _crossref_single_response(item))
+        result = rr.check_preprint_status(preprint_doi)
+        assert result["is_preprint"] is True
+        assert result["published_doi"] == published
+
+    def test_published_doi_found_under_is_version_of(self, monkeypatch):
+        """The link may live under is-version-of, not is-preprint-of."""
+        preprint_doi = "10.1101/2020.01.01.123456"
+        published = "10.1093/brain/awz200"
+        item = {
+            "DOI": preprint_doi,
+            "title": ["A preprint title"],
+            "type": "posted-content",
+            "relation": {
+                "is-version-of": [
+                    {"id": published, "id-type": "doi", "asserted-by": "publisher"},
+                ]
+            },
+        }
+        _patch_urlopen(monkeypatch, _crossref_single_response(item))
+        result = rr.check_preprint_status(preprint_doi)
         assert result["is_preprint"] is True
         assert result["published_doi"] == published
 

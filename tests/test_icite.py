@@ -97,6 +97,7 @@ def test_fetch_icite_null_metrics_become_none(monkeypatch):
 def test_fetch_icite_batches_across_chunk_boundary(monkeypatch):
     """More than _BATCH pmids => multiple calls, each returning its own slice."""
     monkeypatch.setattr(icite, "_BATCH", 2)
+    monkeypatch.setattr(icite, "_sleep_between_batches", lambda: None)
     calls = []
 
     def fake_get(url, timeout=icite._TIMEOUT):
@@ -113,6 +114,43 @@ def test_fetch_icite_batches_across_chunk_boundary(monkeypatch):
     assert len(out) == 5
     assert len(calls) == 3  # 2 + 2 + 1
     assert all(rec["rcr"] == 1.0 for rec in out.values())
+
+
+# ---------------------------------------------------------------------------
+# citation-resolve-lookup-3: a multi-batch fetch must pause BETWEEN batches
+# (entrez parity) so the unauthenticated iCite endpoint is not hammered. The
+# pause fires N-1 times for N batches (never after the last), and a single
+# batch never sleeps.
+# ---------------------------------------------------------------------------
+
+def test_fetch_icite_sleeps_between_batches(monkeypatch):
+    monkeypatch.setattr(icite, "_BATCH", 2)
+    sleeps = {"n": 0}
+    monkeypatch.setattr(icite, "_sleep_between_batches",
+                        lambda: sleeps.__setitem__("n", sleeps["n"] + 1))
+
+    def fake_get(url, timeout=icite._TIMEOUT):
+        ids = _pmids_from_url(url)
+        data = [{"pmid": int(p), "relative_citation_ratio": 1.0,
+                 "citation_count": 1, "nih_percentile": 1.0, "year": 2020,
+                 "authors": []} for p in ids]
+        return json.dumps({"data": data}).encode("utf-8")
+
+    monkeypatch.setattr(icite, "_http_get", fake_get)
+    # 5 pmids @ _BATCH=2 => 3 batches => exactly 2 inter-batch pauses.
+    icite.fetch_icite(["1", "2", "3", "4", "5"])
+    assert sleeps["n"] == 2
+
+
+def test_fetch_icite_single_batch_no_sleep(monkeypatch):
+    sleeps = {"n": 0}
+    monkeypatch.setattr(icite, "_sleep_between_batches",
+                        lambda: sleeps.__setitem__("n", sleeps["n"] + 1))
+    _patch_http(monkeypatch, single={"data": [
+        {"pmid": 1, "relative_citation_ratio": 2.0, "citation_count": 5,
+         "nih_percentile": 80.0, "year": 2019, "authors": []}]})
+    icite.fetch_icite(["1"])
+    assert sleeps["n"] == 0
 
 
 def test_fetch_icite_empty_input_returns_empty():
@@ -167,6 +205,7 @@ def test_fetch_icite_string_authors_fallback(monkeypatch):
 def test_fetch_icite_partial_batch_failure_keeps_good(monkeypatch):
     """One batch errors (None), the other succeeds => partial result, no raise."""
     monkeypatch.setattr(icite, "_BATCH", 1)
+    monkeypatch.setattr(icite, "_sleep_between_batches", lambda: None)
 
     def fake_get(url, timeout=icite._TIMEOUT):
         if "pmids=2" in url:
@@ -212,6 +251,7 @@ def test_fetch_icite_status_partial_batch_failure_is_degraded(monkeypatch):
     # Two batches: first OK, second fetch fails (None). The map is partial AND
     # the status flags it degraded (the missing pmids are not "unknown to iCite").
     monkeypatch.setattr(icite, "_BATCH", 2)
+    monkeypatch.setattr(icite, "_sleep_between_batches", lambda: None)
 
     def fake_get(url, timeout=icite._TIMEOUT):
         ids = _pmids_from_url(url)

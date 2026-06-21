@@ -81,7 +81,7 @@ def _instr_of_fldsimple(el: etree._Element) -> str:
 
 
 def _iter_fields(root: etree._Element) -> List[dict]:
-    """Yield every field in document order with a positional handle.
+    """Yield every citation field, each with a UNIQUE positional handle.
 
     Each descriptor::
 
@@ -91,8 +91,16 @@ def _iter_fields(root: etree._Element) -> List[dict]:
           "runs": [<w:r>, ...]   # complex: begin..end runs (siblings)
           "el":   <w:fldSimple>  # fldSimple carrier
           "sdt":  <w:sdt>        # sdt carrier (Word built-in citation)
-          "index": int,          # document-order index across all fields
+          "index": int,          # unique per-field handle (see ordering note)
         }
+
+    Ordering: fields are emitted GROUPED BY CARRIER — first every Word built-in
+    citation ``<w:sdt>``, then every ``<w:fldSimple>``, then every complex field
+    — and ``index`` is assigned in that emission order. It is NOT a document
+    position. The only guarantee callers may rely on is that ``index`` is unique
+    per field (it discriminates two fields citing the same key set so their
+    Zotero ``citationID``s don't collide); current consumers also only need
+    uniqueness/visit-once, never document order.
 
     Complex fields split across runs are reassembled (instrText concatenated).
     Nested fields are tracked with a stack; the OUTERMOST field is what we hand
@@ -963,9 +971,26 @@ def convert_to_zotero(
             # whole field is a pure duplicate; leave the existing cites untouched.
             continue
 
-        rendered = "; ".join(
-            zotero.formatted_citations(resolved_keys, style=style, kind="citation")
-        ) or "(citation)"
+        # Render the in-text marker stored as formattedCitation/plainCitation (a
+        # PRE-REFRESH display value also used by the existing_renderings dedup
+        # guard). Zotero's per-item ``include=citation`` returns ONE marker per
+        # item; a single grouped field, however, renders as ONE marker (e.g.
+        # "(1,2)" / "(1-3)"), which the per-item API cannot synthesise. Joining
+        # the per-item markers with "; " (the old behaviour) fabricated a
+        # separator Zotero never produces for one field ("(1); (2)"), corrupting
+        # both first-open display and the dedup guard. For a single resolved key
+        # the per-item marker IS correct; for a GROUP we store a neutral
+        # placeholder (the live field carries the real citationItems and Word/
+        # Zotero regenerate the true grouped marker on refresh).
+        if len(resolved_keys) == 1:
+            rendered = (
+                "".join(
+                    zotero.formatted_citations(resolved_keys, style=style, kind="citation")
+                )
+                or "(citation)"
+            )
+        else:
+            rendered = "(citation)"
 
         locator = {"runs": f["runs"]} if f["carrier"] == "complex" else {"sdt": f.get("sdt")}
         if f["carrier"] == "fldSimple":

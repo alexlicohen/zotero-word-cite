@@ -640,12 +640,49 @@ def test_default_rw_path():
 # ---------------------------------------------------------------------------
 
 def test_refresh_has_default_url_but_rejects_empty():
-    # refresh_retraction_db now defaults to the Crossref Labs endpoint; only an
+    # refresh_retraction_db defaults to the public GitLab raw CSV; only an
     # explicitly empty url is rejected (no network call happens here).
     from zoterocite.citecheck import refresh_retraction_db, RETRACTION_WATCH_URL
-    assert RETRACTION_WATCH_URL.startswith("https://api.labs.crossref.org/data/retractionwatch")
+    assert RETRACTION_WATCH_URL.startswith(
+        "https://gitlab.com/crossref/retraction-watch-data/-/raw/main/")
     with pytest.raises(ValueError):
         refresh_retraction_db(url="")
+
+
+# ---------------------------------------------------------------------------
+# The Retraction Watch CSV now comes from the canonical public GitLab raw blob
+# (Crossref deprecated the api.labs.crossref.org Labs endpoint and points to
+# GitLab). The GitLab raw blob needs no polite-pool mailto and no auth, and
+# serves the byte-identical 21-column schema the parser already expects.
+# ---------------------------------------------------------------------------
+
+def test_retraction_watch_url_is_gitlab_raw_csv():
+    from zoterocite.citecheck import RETRACTION_WATCH_URL
+    assert RETRACTION_WATCH_URL == (
+        "https://gitlab.com/crossref/retraction-watch-data/-/raw/main/retraction_watch.csv")
+    assert "mailto=" not in RETRACTION_WATCH_URL
+    assert "api.labs.crossref.org" not in RETRACTION_WATCH_URL
+
+
+def test_refresh_default_url_is_gitlab_raw_no_mailto(monkeypatch):
+    # The default download URL must be the GitLab raw CSV — no mailto query, even
+    # with a contact-email override set. Capture the URL that reaches urlopen.
+    import zoterocite.citecheck as cc
+
+    monkeypatch.delenv("NCBI_EMAIL", raising=False)
+    monkeypatch.setenv("ZOTERO_WORD_CITE_CONTACT_EMAIL", "lab@example.org")
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        raise RuntimeError("stop after URL capture")  # avoid reading a body
+
+    monkeypatch.setattr(cc.urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(RuntimeError):
+        cc.refresh_retraction_db(dest="/tmp/does-not-matter.csv")
+    assert captured["url"] == (
+        "https://gitlab.com/crossref/retraction-watch-data/-/raw/main/retraction_watch.csv")
+    assert "mailto=" not in captured["url"]
 
 
 def test_refresh_with_bad_url(tmp_path):
@@ -1511,3 +1548,167 @@ class TestExtractPmid:
         from zoterocite.citecheck import _extract_pmid
         assert _extract_pmid({"extra": "DOI: 10.1/x"}) == ""
         assert _extract_pmid({}) == ""
+
+
+# ---------------------------------------------------------------------------
+# load_retraction_map / is_retraction — the single-owner consolidation API.
+# These are the primitives litsearch / endnote / unify / biocheck / biotailor
+# now route their DB-load + per-DOI verdict through, instead of re-wrapping
+# ensure_retraction_db + load_retraction_db each.
+# ---------------------------------------------------------------------------
+
+class TestIsRetraction:
+    """is_retraction is THE per-DOI verdict; mirror check_retractions exactly."""
+
+    DB = {
+        "10.1234/retracted": {"nature": "Retraction"},
+        "10.5678/concern": {"nature": "Expression of concern"},
+        "10.9/correction": {"nature": "Correction"},
+        "10.3/reinstated": {"nature": "Reinstatement"},
+    }
+
+    def test_retracted_doi_is_flagged(self):
+        from zoterocite.citecheck import is_retraction
+        # TEETH: a genuine retraction must be caught.
+        assert is_retraction("10.1234/retracted", self.DB) is True
+
+    def test_clean_doi_is_false(self):
+        from zoterocite.citecheck import is_retraction
+        assert is_retraction("10.0/never-heard-of-it", self.DB) is False
+
+    def test_concern_correction_reinstatement_are_not_retractions(self):
+        from zoterocite.citecheck import is_retraction
+        # Only "retraction" is a hard retraction (the ERROR predicate); the rest
+        # are advisory and must NOT be excluded.
+        assert is_retraction("10.5678/concern", self.DB) is False
+        assert is_retraction("10.9/correction", self.DB) is False
+        assert is_retraction("10.3/reinstated", self.DB) is False
+
+    def test_predicate_matches_check_retractions_exactly(self):
+        """is_retraction must agree with check_retractions' ERROR verdict for the
+        SAME DOI/db — proving the two share one predicate (mutation guard: if the
+        predicate were flipped/loosened, these would diverge)."""
+        from zoterocite.citecheck import is_retraction, check_retractions
+        for doi, rec in self.DB.items():
+            findings = check_retractions([doi], {doi: rec})
+            is_error = any(f.severity == "ERROR" for f in findings)
+            assert is_retraction(doi, {doi: rec}) is is_error, doi
+
+    def test_nature_is_case_and_whitespace_insensitive(self):
+        from zoterocite.citecheck import is_retraction
+        db = {"10.1/x": {"nature": "  RETRACTION  "}}
+        assert is_retraction("10.1/x", db) is True
+
+    def test_normalises_doi_before_lookup(self):
+        """A DOI with a URL prefix / trailing punctuation still matches (same
+        _normalise_doi the DB is keyed with)."""
+        from zoterocite.citecheck import is_retraction
+        assert is_retraction("https://doi.org/10.1234/RETRACTED.", self.DB) is True
+
+    def test_empty_doi_or_db_is_false(self):
+        from zoterocite.citecheck import is_retraction
+        assert is_retraction("", self.DB) is False
+        assert is_retraction(None, self.DB) is False  # type: ignore[arg-type]
+        assert is_retraction("10.1234/retracted", {}) is False
+
+
+class TestLoadRetractionMap:
+    """load_retraction_map is THE DB-load entrypoint with a per-caller network
+    policy.  allow_network=False must NEVER touch the network (biocheck policy);
+    allow_network=True routes through ensure_retraction_db (endnote/unify policy)."""
+
+    def _seed_cache(self, tmp_path, monkeypatch):
+        import zoterocite.citecheck as cc
+        csv_path = tmp_path / "rw.csv"
+        _write_rw_csv(csv_path, [
+            {"OriginalPaperDOI": "10.1/retracted", "RetractionNature": "Retraction",
+             "Title": "A retracted paper"},
+            {"OriginalPaperDOI": "10.2/concern", "RetractionNature": "Expression of concern",
+             "Title": "A concerning paper"},
+        ])
+        # Point default_rw_path at our seeded cache so the no-network branch finds it.
+        monkeypatch.setattr(cc, "default_rw_path", lambda: csv_path)
+        return cc, csv_path
+
+    def test_no_network_loads_cached_map_without_touching_network(self, tmp_path, monkeypatch):
+        cc, _ = self._seed_cache(tmp_path, monkeypatch)
+        # REFUSE the network entirely: ensure_retraction_db AND refresh both blow up.
+        def _refuse(*a, **k):
+            raise AssertionError("allow_network=False must NOT hit the network")
+        monkeypatch.setattr(cc, "ensure_retraction_db", _refuse)
+        monkeypatch.setattr(cc, "refresh_retraction_db", _refuse)
+
+        db = cc.load_retraction_map(allow_network=False)
+
+        assert db["10.1/retracted"]["nature"] == "Retraction"
+        # And the verdict gates correctly off this map.
+        assert cc.is_retraction("10.1/retracted", db) is True
+        assert cc.is_retraction("10.2/concern", db) is False
+
+    def test_no_network_missing_cache_is_empty_no_network(self, tmp_path, monkeypatch):
+        import zoterocite.citecheck as cc
+        missing = tmp_path / "does-not-exist.csv"
+        monkeypatch.setattr(cc, "default_rw_path", lambda: missing)
+        def _refuse(*a, **k):
+            raise AssertionError("allow_network=False must NOT hit the network")
+        monkeypatch.setattr(cc, "ensure_retraction_db", _refuse)
+        assert cc.load_retraction_map(allow_network=False) == {}
+
+    def test_network_branch_routes_through_ensure(self, tmp_path, monkeypatch):
+        cc, csv_path = self._seed_cache(tmp_path, monkeypatch)
+        calls = {"ensure": 0}
+        def _spy_ensure(*a, **k):
+            calls["ensure"] += 1
+            return csv_path, None
+        monkeypatch.setattr(cc, "ensure_retraction_db", _spy_ensure)
+
+        db = cc.load_retraction_map(allow_network=True)
+
+        assert calls["ensure"] == 1            # the network path IS consulted
+        assert db["10.1/retracted"]["nature"] == "Retraction"
+
+    def test_network_branch_degrades_to_empty_when_unavailable(self, monkeypatch):
+        import zoterocite.citecheck as cc
+        monkeypatch.setattr(cc, "ensure_retraction_db", lambda *a, **k: (None, None))
+        assert cc.load_retraction_map(allow_network=True) == {}
+
+    def test_never_raises_on_internal_failure(self, monkeypatch):
+        import zoterocite.citecheck as cc
+        def _boom(*a, **k):
+            raise RuntimeError("kaboom")
+        monkeypatch.setattr(cc, "ensure_retraction_db", _boom)
+        # Must degrade to {}, never propagate.
+        assert cc.load_retraction_map(allow_network=True) == {}
+
+
+class TestRetractionNetworkPolicyPreserved:
+    """PRESERVATION guard for the network-policy divergences the consolidation
+    must keep: endnote/unify ALWAYS allow a network refresh.  Spy on
+    ensure_retraction_db at the citecheck seam.
+
+    (grant-forge also pins the biocheck "cached-only, no auto-refresh" divergence
+    here; biocheck is a grant-only biosketch module absent from the public
+    citation engine, so only the shared endnote/unify consumers are exercised.)"""
+
+    def test_endnote_allows_refresh(self, monkeypatch):
+        import zoterocite.citecheck as cc
+        import zoterocite.endnote as endnote
+        calls = {"ensure": 0}
+        monkeypatch.setattr(
+            cc, "ensure_retraction_db",
+            lambda *a, **k: (calls.__setitem__("ensure", calls["ensure"] + 1) or (None, None)),
+        )
+        endnote._load_retraction_db()
+        assert calls["ensure"] == 1   # endnote DID consult the auto-refresh path
+
+    def test_unify_allows_refresh(self, monkeypatch):
+        import zoterocite.citecheck as cc
+        calls = {"ensure": 0}
+        monkeypatch.setattr(
+            cc, "ensure_retraction_db",
+            lambda *a, **k: (calls.__setitem__("ensure", calls["ensure"] + 1) or (None, None)),
+        )
+        # unify loads the db via citecheck.load_retraction_map(allow_network=True)
+        # inside plan_unification; exercise that path directly through the owner.
+        cc.load_retraction_map(allow_network=True)
+        assert calls["ensure"] == 1

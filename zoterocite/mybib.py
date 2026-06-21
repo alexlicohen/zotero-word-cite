@@ -164,9 +164,8 @@ def fetch_mybib_works_status(
                 # A fetch failure mid-pagination TRUNCATES the bibliography. Mark
                 # the result incomplete rather than passing a partial list off as
                 # the whole thing (F5).
-                if page_num <= max_pages:
-                    status["incomplete"] = True
-                    status["reason"] = f"page {page_num} fetch failed"
+                status["incomplete"] = True
+                status["reason"] = f"page {page_num} fetch failed"
                 break
 
             status["pages_fetched"] = page_num

@@ -21,6 +21,7 @@ No new dependencies: stdlib ``urllib`` only, mirroring
 from __future__ import annotations
 
 import json
+import time
 import urllib.parse
 from typing import Optional
 
@@ -34,6 +35,17 @@ _BASE_URL = "https://icite.od.nih.gov/api/pubs"
 # length sane and stay polite. ~200 pmids/call is comfortable.
 _BATCH = 200
 _TIMEOUT = 15.0
+# Small courtesy pause between consecutive batches so a multi-batch fetch does
+# not hammer the unauthenticated iCite endpoint (and risk a 429). iCite has no
+# API-key tier, so this is a single fixed value rather than entrez's key-gated
+# pair; it mirrors entrez's _sleep_between_batches pattern (sleep BETWEEN
+# batches, never after the last). Indirected through time.sleep so tests can
+# patch it out.
+_SLEEP_BETWEEN_BATCHES = 0.34
+
+
+def _sleep_between_batches() -> None:
+    time.sleep(_SLEEP_BETWEEN_BATCHES)
 
 
 def _http_get(url: str, timeout: float = _TIMEOUT) -> Optional[bytes]:
@@ -184,6 +196,12 @@ def fetch_icite_status(pmids, *, timeout: float = _TIMEOUT) -> tuple[dict[str, d
     n_failed = 0
     for i in range(0, len(clean), _BATCH):
         n_batches += 1
+        # Pause before every batch after the first so consecutive requests are
+        # spaced out (entrez does the same with _sleep_between_batches). Placed
+        # at the top of the loop body — guarded on i>0 — so it never fires after
+        # the final batch and a single-batch fetch never sleeps.
+        if i > 0:
+            _sleep_between_batches()
         batch = clean[i:i + _BATCH]
         q = urllib.parse.urlencode({"pmids": ",".join(batch)})
         url = f"{_BASE_URL}?{q}"

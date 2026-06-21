@@ -377,8 +377,18 @@ def cite_into(
             f"(keys={len(keys)}, itemdata={len(itemdata)}, uris={len(uris)}); "
             "refusing to insert a citation that could bind the wrong reference."
         )
-    rendered_html = "; ".join(
-        zotero.formatted_citations(keys, style=style, kind="citation", strip=False)) or None
+    if len(keys) > 1:
+        # A grouped citation field renders as ONE marker (e.g. "(1,2)"/"(1-3)");
+        # Zotero's per-item ``include=citation`` API cannot synthesise that, and
+        # "; ".join fabricates a separator Zotero never produces, corrupting the
+        # cached display + the existing_renderings dedup guard. Store a neutral
+        # placeholder — the live field carries the real citationItems and
+        # Word/Zotero regenerate the true grouped marker on refresh. (Single-key
+        # path is unchanged: a one-element join has no separator.)
+        rendered_html = "(citation)"
+    else:
+        rendered_html = "; ".join(
+            zotero.formatted_citations(keys, style=style, kind="citation", strip=False)) or None
     bib = "\n".join(zotero.formatted_citations(keys, style=style, kind="bib")) if add_bibliography else ""
     doc = Docx(path)
     insert_citation(doc, anchor, keys, itemdata=itemdata, uris=uris, extras=extras,
@@ -480,12 +490,18 @@ def check_links(path) -> List[dict]:
 
     Returns one dict per cited item: ``{"key","title","uri","status"}`` where
     status is ``ok`` (present in the configured group), ``broken`` (its key is
-    not in the configured library — deleted/moved), or ``external`` (the URI
-    points at a different library, which we can't check).
+    not in the configured library — deleted/moved), ``external`` (the URI points
+    at a different library, which we can't check), or ``unverified`` (Zotero
+    credentials are not configured, so a keyed item can't be checked against the
+    library — we degrade rather than raise, since this is read-only QC).
     """
     from . import zotero
     cfg = zotero.zotero_config()
     mine = f"{cfg.get('library_type')}s:{cfg.get('library_id')}" if cfg else None
+    # Without credentials we cannot reach the library at all; a keyed item is
+    # therefore "unverified" (we never call item_exists, which would raise). A
+    # keyless item (a structural defect) is still detectable offline as "broken".
+    have_creds = bool(cfg)
     cache: dict = {}
     results: List[dict] = []
     for cit in scan_citations(path):
@@ -495,6 +511,8 @@ def check_links(path) -> List[dict]:
                 status = "external"
             elif not key:
                 status = "broken"
+            elif not have_creds:
+                status = "unverified"
             else:
                 if key not in cache:
                     cache[key] = zotero.item_exists(key)
@@ -529,9 +547,15 @@ def _wrap_runs_as_del(runs: List[etree._Element], rev_id: int, author: str, date
     d.set(qn("w:date"), date)
     for r in runs:
         parent.remove(r)
-        for t in r.findall(qn("w:t")):
+        # Use ``iter`` (not ``findall``) so text/instr nested below the run — e.g.
+        # under a Word built-in citation's ``<w:sdtContent>`` when ``r`` is the
+        # ``<w:sdt>`` itself — is converted to its tracked-deletion variant. With
+        # ``findall`` only the run's DIRECT children were touched, leaving a LIVE
+        # ``<w:instrText>``/``<w:t>`` (a live field + original text) inside the
+        # ``<w:del>`` for the sdt carrier.
+        for t in r.iter(qn("w:t")):
             t.tag = qn("w:delText")
-        for it in r.findall(qn("w:instrText")):
+        for it in r.iter(qn("w:instrText")):
             it.tag = qn("w:delInstrText")
         d.append(r)
     parent.insert(idx, d)

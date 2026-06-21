@@ -113,7 +113,9 @@ class Docx:
     def add_part(self, name: str, data: bytes, content_type: Optional[str] = None) -> None:
         """Add a brand-new part (e.g. comments.xml). Registers a [Content_Types] override."""
         if name not in self._raw:
-            self._order.append(zipfile.ZipInfo(name))
+            info = zipfile.ZipInfo(name)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            self._order.append(info)
         self._raw[name] = data
         self._trees.pop(name, None)
         self._dirty.discard(name)

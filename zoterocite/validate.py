@@ -9,11 +9,18 @@ naming, leftover template guidance) and never fail the gate.
 Errors:
     * malformed XML in any ``.xml``/``.rels`` part (root cause of repair dialogs)
     * empty accepted-view text (round-trip produced nothing)
+    * a MEASURED whole-document page count over a configured ``max_pages``. This
+      is the one limit that can fail the gate: it is a real, rendered page count
+      (via :func:`zoterocite.pagefit.page_count`), and it is how the gate enforces
+      a pack's ``max_pages`` / an explicit ``--page-limit`` as a HARD cap. It is an
+      ERROR only when a page renderer (LibreOffice) is present to measure it;
+      without one the count is unverifiable and degrades to a WARNING (below).
 
-Warnings:
+Warnings (advisory — never fail the gate):
     * accepted word count over a configured ``max_words``
-    * unverifiable ``max_pages`` (no renderer is invoked)
+    * unverifiable ``max_pages`` (no page renderer installed — count not measurable)
     * per-element word limits, when the section heading can be located
+    * per-section ``<name>_max_pages`` (per-section page counts are not measurable)
     * filename not matching a naming convention regex
     * leftover template markers like ``[300 word maximum]``
 """
@@ -122,7 +129,10 @@ def validate(
         path: path to the .docx to validate.
         limits: optional dict with any of the keys ``max_words`` (int),
             ``max_pages`` (int), ``element_limits`` (dict of heading -> max
-            words). All produce WARNINGS only.
+            words). These produce WARNINGS, EXCEPT a ``max_pages`` overflow that
+            can be MEASURED (a page renderer is installed): that is an ERROR and
+            fails the gate (it is how a pack/`--page-limit` page cap is enforced).
+            An unverifiable ``max_pages`` (no renderer) degrades to a WARNING.
         naming: optional regex string; a WARNING is raised if the filename does
             not match it.
 
@@ -189,6 +199,14 @@ def validate(
             if pages is not None:
                 info["pages"] = pages
                 if pages > max_pages:
+                    # ERROR (blocking): a whole-document page overflow is a real,
+                    # MEASURED, hard limit — it is the mechanism by which the gate
+                    # (gate.run_gate folds these errors into VAL-ERR) enforces a
+                    # pack's max_pages and an explicit --page-limit as a HARD cap
+                    # that fails the gate. Caveat: this requires a page renderer
+                    # (LibreOffice) to be installed; without one page_count returns
+                    # None and the overflow can only be WARNED as unverifiable (the
+                    # else branch) — you cannot block on a limit you cannot measure.
                     errors.append(
                         f"document is {pages} pages, exceeds max_pages={max_pages}"
                     )
@@ -280,15 +298,13 @@ def validate(
         try:
             from .citecheck import (
                 _extract_cited_dois,
-                ensure_retraction_db,
-                load_retraction_db,
+                load_retraction_map,
                 check_retractions,
             )
             dois = _extract_cited_dois(path)
             if dois:
-                rw_path, _note = ensure_retraction_db(allow_network=False)
-                if rw_path and Path(rw_path).exists():
-                    db = load_retraction_db(rw_path)
+                db = load_retraction_map(allow_network=False)
+                if db:
                     for f in check_retractions(dois, db):
                         if getattr(f, "severity", "") == "ERROR":
                             errors.append(f.message)

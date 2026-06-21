@@ -119,6 +119,15 @@ def extract_identifier(text: str) -> dict:
     m = _ARXIV_RE.search(text)
     if m:
         arxiv = m.group(1)
+    elif doi and doi.startswith(_ARXIV_DOI_PREFIX):
+        # arXiv mints DOIs as ``10.48550/arXiv.<id>`` (the id itself is what we
+        # need for the zero-round-trip arXiv shortcut). The DOI was lowercased by
+        # ``_normalise_doi`` above, so the suffix here is ``arxiv.<id>``.
+        suffix = doi[len(_ARXIV_DOI_PREFIX):]
+        if suffix.lower().startswith("arxiv."):
+            candidate = suffix[len("arxiv."):].strip()
+            if candidate:
+                arxiv = candidate
 
     isbn: Optional[str] = None
     m = _ISBN_RE.search(text)
@@ -234,11 +243,8 @@ def check_preprint_status(doi: str, *, fetch: bool = True) -> dict:
     # we need the raw ``relation`` field not surfaced by _parse_crossref_item).
     safe_doi = urllib.parse.quote(doi_clean, safe="/")
     url = f"{_CROSSREF_WORKS}/{safe_doi}"
-    req = urllib.request.Request(url, headers={"User-Agent": _http.user_agent()})
-    try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:  # noqa: S310
-            body = resp.read()
-    except Exception:  # noqa: BLE001
+    body = _http.http_get(url, timeout=_TIMEOUT, headers={"Accept": "application/json"})
+    if body is None:
         return base_result
 
     try:
@@ -248,19 +254,31 @@ def check_preprint_status(doi: str, *, fetch: bool = True) -> dict:
 
     message = data.get("message") or {}
 
-    # Crossref encodes the published-version link under
-    # ``relation.is-preprint-of`` (a list of relation objects).
+    # Crossref encodes the published-version link under ``relation``. The
+    # canonical key is ``is-preprint-of`` but some records express the link as
+    # ``is-version-of`` / ``has-version`` instead. Each is a LIST of relation
+    # objects; the DOI we want is not guaranteed to be entry [0] (a record may
+    # carry a non-DOI id — e.g. a PMID or URI — at [0] and the DOI at [1]), so
+    # scan every entry across all three relation lists and take the first one
+    # whose ``id-type`` is explicitly ``"doi"``.
     relation = message.get("relation") or {}
-    is_preprint_of = relation.get("is-preprint-of") or []
-
     published_doi: Optional[str] = None
 
-    if is_preprint_of and isinstance(is_preprint_of, list):
-        first = is_preprint_of[0]
-        if isinstance(first, dict):
+    for rel_key in ("is-preprint-of", "is-version-of", "has-version"):
+        entries = relation.get(rel_key) or []
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
             # Only trust the id as a DOI when id-type is explicitly "doi".
-            if first.get("id-type") == "doi":
-                published_doi = (first.get("id") or "").strip() or None
+            if entry.get("id-type") == "doi":
+                candidate = (entry.get("id") or "").strip() or None
+                if candidate:
+                    published_doi = candidate
+                    break
+        if published_doi:
+            break
 
     return {
         "is_preprint": is_pre,
@@ -341,11 +359,8 @@ def crossref_bibliographic(query: str, *, rows: int = 5) -> list[dict]:
         "mailto": _http.contact_email(),
     })
     url = f"{_CROSSREF_WORKS}?{params}"
-    req = urllib.request.Request(url, headers={"User-Agent": _http.user_agent()})
-    try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:  # noqa: S310
-            body = resp.read()
-    except Exception:  # noqa: BLE001
+    body = _http.http_get(url, timeout=_TIMEOUT, headers={"Accept": "application/json"})
+    if body is None:
         return []
 
     try:
@@ -388,10 +403,7 @@ def _title_overlap(candidate_title: Optional[str], input_text: str) -> float:
         return 0.0
     a = _title_tokens(candidate_title)
     b = _title_tokens(input_text)
-    union = a | b
-    if not union:
-        return 0.0
-    return len(a & b) / len(union)
+    return textpatterns.jaccard(a, b)
 
 
 def _first_author_surname_in_text(candidate: dict, text: str) -> bool:
@@ -658,11 +670,8 @@ def _crossref_doi_fetch(doi: str) -> Optional[dict]:
     """Fetch a single work by DOI from Crossref. Returns parsed item or None."""
     safe_doi = urllib.parse.quote(doi, safe="/")
     url = f"{_CROSSREF_WORKS}/{safe_doi}"
-    req = urllib.request.Request(url, headers={"User-Agent": _http.user_agent()})
-    try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:  # noqa: S310
-            body = resp.read()
-    except Exception:  # noqa: BLE001
+    body = _http.http_get(url, timeout=_TIMEOUT, headers={"Accept": "application/json"})
+    if body is None:
         return None
     try:
         data = json.loads(body.decode("utf-8"))

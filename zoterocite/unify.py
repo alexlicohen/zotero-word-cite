@@ -294,23 +294,17 @@ def plan_unification(
     ]
 
     # ---- retraction DB (loaded once, offline-resilient) -------------------
+    # Single owner: citecheck.load_retraction_map. allow_network=True (explicit)
+    # preserves this caller's always-allow-refresh policy (was a no-arg
+    # ensure_retraction_db()); it routes through ensure_retraction_db so the
+    # unify tests' monkeypatch on citecheck.ensure_retraction_db / .load_retraction_db
+    # is still honoured. Degrades to {} (never fails planning).
     rw_db: Dict[str, dict] = {}
     if check_retractions:
-        rw_path, _note = citecheck.ensure_retraction_db()
-        if rw_path is not None:
-            try:
-                rw_db = citecheck.load_retraction_db(rw_path)
-            except Exception:  # noqa: BLE001 — degrade gracefully, never fail planning
-                rw_db = {}
+        rw_db = citecheck.load_retraction_map(allow_network=True)
 
     def _retracted(doi: Optional[str]) -> bool:
-        if not doi or not rw_db:
-            return False
-        norm = citecheck._normalise_doi(doi)
-        rec = rw_db.get(norm)
-        if not rec:
-            return False
-        return (rec.get("nature") or "").strip().lower() == "retraction"
+        return citecheck.is_retraction(doi or "", rw_db)
 
     # ---- fetch library DOI index ONCE for all reference lookups -------------
     # READ-ONLY path: a DEGRADED read (LibraryUnavailableError) must NOT crash

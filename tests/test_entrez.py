@@ -227,6 +227,67 @@ def test_normalize_pmcid_variants():
 
 
 # ---------------------------------------------------------------------------
+# doi_or_pmid_to_pmcid  (DOI/PMID -> PMCID, forward direction)
+# ---------------------------------------------------------------------------
+
+_IDCONV_FORWARD_JSON = b"""{
+  "status": "ok",
+  "records": [
+    {"pmcid": "PMC4734147", "pmid": "26980150", "doi": "10.1/x"}
+  ]
+}"""
+
+
+def test_doi_or_pmid_to_pmcid_returns_pmcid(monkeypatch):
+    """doi_or_pmid_to_pmcid resolves a DOI to its PMCID."""
+    _patch_urlopen(monkeypatch, _IDCONV_FORWARD_JSON)
+    result = entrez.doi_or_pmid_to_pmcid("10.1/x")
+    assert result == "PMC4734147"
+
+
+def test_doi_or_pmid_to_pmcid_pmid_input(monkeypatch):
+    """doi_or_pmid_to_pmcid works with a bare PMID as input."""
+    _patch_urlopen(monkeypatch, _IDCONV_FORWARD_JSON)
+    result = entrez.doi_or_pmid_to_pmcid("26980150")
+    assert result == "PMC4734147"
+
+
+def test_doi_or_pmid_to_pmcid_no_pmcid_in_record(monkeypatch):
+    """When the record has no pmcid, returns None."""
+    no_pmcid = b'{"status": "ok", "records": [{"pmid": "26980150", "errmsg": "no PMC"}]}'
+    _patch_urlopen(monkeypatch, no_pmcid)
+    result = entrez.doi_or_pmid_to_pmcid("10.1/x")
+    assert result is None
+
+
+def test_doi_or_pmid_to_pmcid_network_failure_returns_none(monkeypatch):
+    """Network failure degrades to None, never raises."""
+    def raise_urlerror(*a, **k):
+        raise urllib.error.URLError("offline")
+    monkeypatch.setattr(entrez.urllib.request, "urlopen", raise_urlerror)
+    assert entrez.doi_or_pmid_to_pmcid("10.1/x") is None
+
+
+def test_doi_or_pmid_to_pmcid_empty_input(monkeypatch):
+    """Empty string input returns None without hitting the network."""
+    def boom(*a, **k):
+        raise AssertionError("must not hit the network on empty input")
+    monkeypatch.setattr(entrez.urllib.request, "urlopen", boom)
+    assert entrez.doi_or_pmid_to_pmcid("") is None
+
+
+def test_doi_or_pmid_to_pmcid_uses_canonical_endpoint(monkeypatch):
+    """The helper calls the canonical pmc.ncbi.nlm.nih.gov endpoint, not the legacy one."""
+    captured: list = []
+    _patch_urlopen(monkeypatch, _IDCONV_FORWARD_JSON, capture=captured)
+    entrez.doi_or_pmid_to_pmcid("10.1/x")
+    assert captured, "expected one request"
+    url = captured[0]
+    assert "pmc.ncbi.nlm.nih.gov" in url
+    assert "www.ncbi.nlm.nih.gov" not in url
+
+
+# ---------------------------------------------------------------------------
 # efetch_pubmed
 # ---------------------------------------------------------------------------
 

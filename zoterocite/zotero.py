@@ -70,7 +70,7 @@ class LibraryUnavailableError(RuntimeError):
     """
 
 
-def _strip_html(s: str) -> str:
+def strip_html(s: str) -> str:
     """Zotero returns rendered citations as HTML; reduce to plain text."""
     return html.unescape(_HTML_TAG.sub("", s or "")).strip()
 
@@ -644,7 +644,7 @@ def formatted_citations(
         for item in ordered
         if isinstance(item, dict) and kind in item
     ]
-    return [_strip_html(v) for v in vals] if strip else vals
+    return [strip_html(v) for v in vals] if strip else vals
 
 
 def item_uri(key: str) -> str:
@@ -721,7 +721,14 @@ def _creators_to_authors(creators: list[dict]) -> list[str]:
 
 
 def _year_from_date(date: str) -> Optional[str]:
-    """Pull a 4-digit year from a Zotero ``date`` string (e.g. ``"2021-12"``)."""
+    """Pull a 4-digit year from a Zotero ``date`` string (e.g. ``"2021-12"``).
+
+    Returns ``None`` when no 4-digit run is present. A non-numeric date such as
+    ``"in press"`` / ``"n.d."`` / ``"forthcoming"`` (or a stray short run like
+    ``"21"``) must NOT leak as the "year": it would corrupt the rendered
+    reference (e.g. ``in press;12(3):1-9``) and the author-year sort key. Matches
+    the sibling extractors ``cite._year_from`` / ``zoterolocal._year_from_date``.
+    """
     date = (date or "").strip()
     run = ""
     for ch in date:
@@ -731,7 +738,7 @@ def _year_from_date(date: str) -> Optional[str]:
                 return run
         else:
             run = ""
-    return date or None
+    return None
 
 
 def to_reference(item: dict) -> "cite.Reference":

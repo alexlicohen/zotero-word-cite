@@ -401,6 +401,20 @@ def extract_pmids(text: str) -> list[str]:
 PMCID_RE = re.compile(r"PMC\d+", re.IGNORECASE)
 
 
+def jaccard(a: set, b: set) -> float:
+    """Jaccard similarity |A ∩ B| / |A ∪ B| with empty-set guard.
+
+    Returns 0.0 when either set is empty (union is empty) rather than
+    raising ZeroDivisionError.  Both callers (consistency._title_overlap
+    and refresolve._title_overlap) apply their own domain tokenisers before
+    calling this, keeping the tokeniser divergence intentional and separate.
+    """
+    union = a | b
+    if not union:
+        return 0.0
+    return len(a & b) / len(union)
+
+
 def extract_pmcids(text: str) -> list[str]:
     """Return the de-duplicated PMCIDs (``PMC`` + digits) in *text*.
 

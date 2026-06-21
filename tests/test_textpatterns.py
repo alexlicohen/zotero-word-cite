@@ -18,6 +18,7 @@ from zoterocite.textpatterns import (
     SUPPL_TABLE_LEGEND_LINE_RE,
     extract_fig_refs,
     extract_table_refs,
+    jaccard,
 )
 
 
@@ -386,3 +387,69 @@ class TestExtractTableRefs:
 
     def test_no_suppl(self):
         assert extract_table_refs("Table S1") == set()
+
+
+# ---------------------------------------------------------------------------
+# jaccard — shared Jaccard helper (Fix 1 consolidation)
+# ---------------------------------------------------------------------------
+
+class TestJaccard:
+    """textpatterns.jaccard(a, b) — set math correctness and edge cases."""
+
+    def test_identical_sets(self):
+        assert jaccard({1, 2, 3}, {1, 2, 3}) == 1.0
+
+    def test_disjoint_sets(self):
+        assert jaccard({1, 2}, {3, 4}) == 0.0
+
+    def test_partial_overlap(self):
+        # |{1,2} ∩ {2,3}| / |{1,2} ∪ {2,3}| = 1 / 3
+        assert jaccard({"a", "b"}, {"b", "c"}) == pytest.approx(1 / 3)
+
+    def test_empty_both(self):
+        assert jaccard(set(), set()) == 0.0
+
+    def test_empty_a(self):
+        assert jaccard(set(), {"x"}) == 0.0
+
+    def test_empty_b(self):
+        assert jaccard({"x"}, set()) == 0.0
+
+    def test_subset(self):
+        # {1} ⊂ {1,2,3}: overlap=1, union=3
+        assert jaccard({1}, {1, 2, 3}) == pytest.approx(1 / 3)
+
+    def test_string_tokens(self):
+        a = {"lesion", "network", "mapping"}
+        b = {"lesion", "network", "behavior"}
+        # intersection={lesion,network}, union={lesion,network,mapping,behavior}
+        assert jaccard(a, b) == pytest.approx(2 / 4)
+
+
+class TestJaccardDelegation:
+    """Verify the refresolve _title_overlap wrapper delegates to textpatterns.jaccard.
+
+    (grant-forge also has a consistency._title_overlap wrapper covered by the same
+    delegation test there; consistency is a grant-only module, not part of the
+    public citation engine, so only the refresolve wrapper is exercised here.)
+    """
+
+    def test_refresolve_title_overlap_delegates(self, monkeypatch):
+        """refresolve._title_overlap must call textpatterns.jaccard."""
+        import zoterocite.textpatterns as tp
+        import zoterocite.refresolve as rr
+
+        calls = []
+        original = tp.jaccard
+
+        def spy(a, b):
+            calls.append((a, b))
+            return original(a, b)
+
+        monkeypatch.setattr(tp, "jaccard", spy)
+        result = rr._title_overlap(
+            "Lesion network mapping reveals neuroanatomical basis",
+            "Lesion network mapping localizes neuropsychiatric symptoms",
+        )
+        assert calls, "refresolve._title_overlap did not call textpatterns.jaccard"
+        assert 0.0 < result < 1.0

@@ -15,6 +15,14 @@ class Finding:
         message: human-readable description.
         location: optional string like "para 3" or "page 2, char 45".
         source: citation (NIH doc, spec section, etc.).
+        data: optional structured side-channel for a consumer that needs the
+            UNTRUNCATED source of the finding (not just the human-readable
+            message). Defaults to ``None`` so every existing constructor and the
+            serializers (``format_findings`` / ``findings_to_dicts``) are
+            unaffected; it is an internal handoff, not part of the JSON/text
+            rendering. Example: ``check_orphan_claims`` stores the full orphan
+            claim sentence under ``{"claim_sentence": ...}`` so downstream code
+            reads it directly instead of re-deriving it positionally.
     """
 
     check: str
@@ -22,6 +30,7 @@ class Finding:
     message: str
     location: Optional[str] = None
     source: str = ""
+    data: Optional[Dict[str, Any]] = field(default=None)
 
     def __post_init__(self):
         if self.severity not in ("ERROR", "WARN", "INFO"):

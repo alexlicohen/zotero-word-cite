@@ -9,6 +9,15 @@ load_retraction_db(csv_path) -> dict
     Load the Retraction Watch CSV (Crossref-distributed) into a normalised
     DOI → record mapping.
 
+load_retraction_map(*, allow_network=True, dest=None) -> dict
+    THE single DB-load entrypoint every consumer routes through.
+    ``allow_network=True`` auto-refreshes via ``ensure_retraction_db``;
+    ``allow_network=False`` loads the cached DB only (no network). Never raises.
+
+is_retraction(doi, db) -> bool
+    THE single per-DOI verdict: True iff the DOI's nature is a retraction
+    (mirrors ``check_retractions``'s ERROR predicate exactly).
+
 check_retractions(dois, db) -> list[Finding]
     Flag cited DOIs found in the retraction database.
 
@@ -42,15 +51,15 @@ from .zoterofield import scan_citations, _field_codes
 from .docxio import Docx, DOCUMENT
 
 _RW_SOURCE = "Retraction Watch (Crossref-distributed)"
-# Crossref Labs distributes the full Retraction Watch dataset as CSV; the
-# polite-pool endpoint takes a mailto. (Verified 2026-06; see
-# https://www.crossref.org/labs/retraction-watch/)
-# The contact email is owned by :mod:`zoterocite._http` (single source); this
-# default URL is built at import time, so with no env var set it is byte-
-# identical to the historical value.  ``refresh_retraction_db`` re-resolves the
-# email at CALL time (below) so a per-process override is still honoured.
+# Crossref distributes the full Retraction Watch dataset as a public CSV from a
+# GitLab repo (refreshed each working day; no auth, no polite-pool mailto). The
+# legacy Crossref Labs endpoint (api.labs.crossref.org/data/retractionwatch)
+# served the byte-identical 21-column schema as of 2026-06 but is on a
+# deprecation path — Crossref now points to GitLab. See
+# https://gitlab.com/crossref/retraction-watch-data and
+# https://www.crossref.org/documentation/retrieve-metadata/retraction-watch/
 RETRACTION_WATCH_URL = (
-    f"https://api.labs.crossref.org/data/retractionwatch?{_http.contact_email()}"
+    "https://gitlab.com/crossref/retraction-watch-data/-/raw/main/retraction_watch.csv"
 )
 
 # Severity ordering for the same DOI appearing multiple times with different
@@ -84,36 +93,6 @@ def _normalise_doi(doi: str) -> str:
 # ---------------------------------------------------------------------------
 # 1. reconcile_citations
 # ---------------------------------------------------------------------------
-
-def _bibl_keys_from_doc(path) -> Optional[Set[str]]:
-    """Extract item keys from the ZOTERO_BIBL field, or None if absent."""
-    root = Docx(path).read_tree(DOCUMENT)
-    from .zoterofield import _field_codes, _key_from_uri
-    import re as _re
-
-    for code in _field_codes(root):
-        c = code.strip()
-        if "ZOTERO_BIBL" not in c:
-            continue
-        # The ZOTERO_BIBL field code looks like:
-        #   ADDIN ZOTERO_BIBL {"uncited":[],"omitted":[],"custom":[]} CSL_BIBLIOGRAPHY
-        # The embedded JSON does NOT contain the item keys; those are only
-        # visible after Zotero renders the bibliography. However, Zotero stores
-        # the rendered bibliography runs as field *result* XML — which we can't
-        # easily mine for keys after-the-fact.
-        #
-        # The reliable offline approach: the bibliography keys are exactly the
-        # union of all item keys found in citation fields — that's how Zotero
-        # builds the bib. But we need to signal that a BIBL field *exists* so
-        # that the caller can distinguish "bib absent" from "bib present but
-        # no keys parseable".
-        #
-        # We return an empty set (bib present) so the caller can detect absence
-        # vs. presence, and fill the keys from the cited set if needed.
-        return set()
-
-    return None
-
 
 def reconcile_citations(path) -> dict:
     """Reconcile in-text cited keys against the bibliography.
@@ -420,29 +399,90 @@ def check_retractions(
     return findings
 
 
+def load_retraction_map(*, allow_network: bool = True,
+                        dest: Optional[Union[str, Path]] = None) -> Dict[str, dict]:
+    """Single DB-load entrypoint: return the normalised ``{doi: record}`` map.
+
+    This is THE owner of "load the Retraction Watch DB"; every consumer
+    (litsearch, endnote, unify, biocheck, biotailor) routes its DB load through
+    here instead of re-wrapping :func:`ensure_retraction_db` +
+    :func:`load_retraction_db`.
+
+    Network-refresh policy is the caller's to choose:
+
+    * ``allow_network=True``  (default) — go through :func:`ensure_retraction_db`,
+      which auto-refreshes a missing/stale cache when online and degrades to the
+      cached (possibly stale) copy on failure. This is the cite-check / endnote /
+      unify policy.
+    * ``allow_network=False`` — load the cached DB only, with NO network refresh
+      (the biocheck policy): use :func:`default_rw_path` directly and skip
+      :func:`ensure_retraction_db` entirely, so a missing/stale cache is used
+      as-is and the network is never touched.
+
+    Returns the same map shape :func:`load_retraction_db` produces. Never raises:
+    on any failure (no cache, network down, unreadable CSV) it degrades to ``{}``
+    so a caller's screen falls back to "not retracted" rather than crashing —
+    matching the prior per-module behaviour.
+
+    ``dest`` overrides the CSV path (used by tests / non-default caches).
+    """
+    try:
+        if allow_network:
+            # Auto-refresh-with-stale-fallback. ``ensure_retraction_db`` is
+            # referenced as a module global so a monkeypatch on
+            # ``citecheck.ensure_retraction_db`` is honoured (unify/endnote tests).
+            # We do NOT re-check ``rw_path.exists()`` here: ``ensure_retraction_db``
+            # already returns ``None`` when there is no usable cache, and the
+            # prior unify/endnote loaders trusted the returned path (an extra
+            # exists() gate would diverge from that and break the path-trusting
+            # seam their tests pin).
+            rw_path, _note = ensure_retraction_db(dest=dest)
+            if rw_path is None:
+                return {}
+        else:
+            # No-refresh: cached DB only, never touch the network (biocheck
+            # policy). A missing cache yields {} without a network call.
+            rw_path = Path(dest) if dest else default_rw_path()
+            if not rw_path.exists():
+                return {}
+        return load_retraction_db(rw_path) or {}
+    except Exception:  # noqa: BLE001 — offline/unreadable degrades to no screen
+        return {}
+
+
+def is_retraction(doi: str, db: Dict[str, dict]) -> bool:
+    """Single per-DOI verdict: ``True`` iff ``doi``'s record is a *retraction*.
+
+    Normalises ``doi`` via :func:`_normalise_doi` and applies EXACTLY the
+    predicate :func:`check_retractions` uses to assign ERROR severity —
+    ``nature.strip().lower() == 'retraction'`` — so a mere Expression of Concern
+    or Correction is NOT a retraction here (it stays advisory, never excluded).
+    Returns ``False`` for an empty/unknown DOI or an empty DB. Never raises.
+    """
+    norm = _normalise_doi(doi or "")
+    if not norm or not db:
+        return False
+    record = db.get(norm)
+    if not record:
+        return False
+    return (record.get("nature") or "").strip().lower() == "retraction"
+
+
 def refresh_retraction_db(dest: Optional[Union[str, Path]] = None, *,
                           url: Optional[str] = None) -> Path:
     """Download the Retraction Watch CSV from ``url`` and save to ``dest``.
 
-    Defaults to the Crossref Labs polite-pool endpoint — built at CALL time from
-    :func:`zoterocite._http.contact_email` so a per-process contact-email
-    override (``ZOTERO_WORD_CITE_CONTACT_EMAIL`` / ``NCBI_EMAIL``) is reflected in the
-    polite-pool mailto.  Passing ``url=None`` (the default) resolves that
-    endpoint; passing an explicit empty ``url`` is still rejected; if Crossref
-    moves the distribution, pass an explicit non-empty ``url`` (see
-    https://www.crossref.org/labs/retraction-watch/).
+    Defaults to :data:`RETRACTION_WATCH_URL` (the public GitLab raw CSV — no auth
+    or polite-pool mailto needed). Passing ``url=None`` (the default) uses that;
+    passing an explicit empty ``url`` is still rejected; if Crossref moves the
+    distribution, pass an explicit non-empty ``url`` (see
+    https://gitlab.com/crossref/retraction-watch-data).
 
     ``dest`` defaults to ``default_rw_path()``; its parent directory is
     created if absent. Raises RuntimeError on download failure.
     """
     if url is None:
-        # Resolve the polite-pool endpoint now, honouring any call-time env
-        # override of the contact email (RETRACTION_WATCH_URL is frozen at
-        # import; this re-derives it).
-        url = (
-            "https://api.labs.crossref.org/data/retractionwatch?"
-            f"{_http.contact_email()}"
-        )
+        url = RETRACTION_WATCH_URL
     if not url:
         raise ValueError(
             "url must be supplied — check "

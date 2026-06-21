@@ -574,6 +574,106 @@ class TestConvert:
         assert "<w:ins " in body and "<w:del " in body
         assert validate(res["out"]).ok
 
+    def test_tracked_conversion_word_builtin_del_is_wellformed(self, tmp_path, fake_zotero):
+        """Regression: tracking the deletion of a Word built-in (``<w:sdt>``)
+        citation must convert the field text/code NESTED under ``<w:sdtContent>``
+        to their tracked-deletion variants. The old ``_wrap_runs_as_del`` used
+        ``findall`` on the sdt's DIRECT children (which has no ``<w:t>``/
+        ``<w:instrText>``), leaving a LIVE ``<w:instrText> CITATION …>`` field and
+        LIVE original ``<w:t>`` text inside the ``<w:del>`` — a malformed deletion
+        (a live field surviving inside a deletion region).
+        """
+        path = build_mixed_doc(tmp_path, with_manual=False, with_zotero=False)
+        out = tmp_path / "tw.docx"
+        res = convert_to_zotero(path, out=out, managers=("word",), track=True)
+        assert any(c["manager"] == "word" for c in res["converted"])
+        assert validate(res["out"]).ok
+
+        root = Docx(res["out"]).tree(DOCUMENT)
+        dels = root.findall(".//" + qn("w:del"))
+        assert dels, "expected a tracked deletion for the converted Word field"
+
+        # (1) NO live <w:instrText> carrying a CITATION/ADDIN field code survives
+        #     inside any <w:del> — it must have become <w:delInstrText>.
+        for d in dels:
+            for itx in d.iter(qn("w:instrText")):
+                code = itx.text or ""
+                assert "CITATION" not in code and "ADDIN" not in code, (
+                    f"live <w:instrText> field code survived inside <w:del>: {code!r}"
+                )
+            # (2) NO live <w:t> original-citation text survives inside <w:del>;
+            #     the struck display text must be <w:delText>.
+            assert d.find(".//" + qn("w:t")) is None, (
+                "live <w:t> original citation text survived inside <w:del>"
+            )
+            # The struck field code/text DID convert to their deletion variants.
+            assert d.find(".//" + qn("w:delInstrText")) is not None
+            assert d.find(".//" + qn("w:delText")) is not None
+
+    def _word_only_doc(self, tmp_path: Path) -> Path:
+        """A doc with ONLY a Word built-in (sdt) citation — so accept/reject views
+        contain no other (untouched) foreign fields to confuse parsed-tree checks."""
+        src = tmp_path / "wsrc.docx"
+        new_doc(src, ["WordBuiltin sentence delta goes here."])
+        doc = Docx(src)
+        root = doc.tree(DOCUMENT)
+        _append_word_sdt(_find_para(root, "sentence delta"), WORD_INSTR)
+        _add_word_sources(doc)
+        out = tmp_path / "wonly.docx"
+        doc.save(out)
+        return out
+
+    def test_tracked_conversion_word_builtin_accept_reject_roundtrip(self, tmp_path, fake_zotero):
+        """Accept and reject of the tracked Word-builtin conversion are each
+        internally consistent: accepting drops the original content control and
+        keeps the new Zotero field; rejecting restores the original citation text
+        and removes the inserted Zotero field, with no orphaned/duplicated field.
+
+        Checks operate on the PARSED tree (element presence), not raw-string
+        substrings, so unrelated escaped XML text can't yield false matches.
+        """
+        from zoterocite.revisions import accept_all, reject_all
+
+        def _has(root, tag):
+            return root.find(".//" + qn(tag)) is not None
+
+        def _instr_codes(root):
+            return [(itx.text or "") for itx in root.iter(qn("w:instrText"))]
+
+        # ACCEPT: original sdt (its <w:citation/> control + the Word CITATION field
+        # code) is gone; the inserted live Zotero field remains.
+        a_out = tmp_path / "wa.docx"
+        convert_to_zotero(self._word_only_doc(tmp_path), out=a_out,
+                          managers=("word",), track=True)
+        da = Docx(a_out)
+        accept_all(da)
+        acc = tmp_path / "accepted.docx"
+        da.save(acc)
+        assert validate(acc).ok
+        aroot = Docx(acc).tree(DOCUMENT)
+        assert not _has(aroot, "w:del") and not _has(aroot, "w:ins")   # changes resolved
+        assert not _has(aroot, "w:citation")                            # control gone
+        assert all("CITATION Smith2020" not in c for c in _instr_codes(aroot))  # field code gone
+        assert any("ZOTERO_ITEM" in c for c in _instr_codes(aroot))     # new field present
+
+        # REJECT: inserted Zotero field gone; original citation's DISPLAY text and
+        # its content control are restored; no leftover tracked-change wrappers.
+        r_out = tmp_path / "wr.docx"
+        convert_to_zotero(self._word_only_doc(tmp_path), out=r_out,
+                          managers=("word",), track=True)
+        dr = Docx(r_out)
+        reject_all(dr)
+        rej = tmp_path / "rejected.docx"
+        dr.save(rej)
+        assert validate(rej).ok
+        rroot = Docx(rej).tree(DOCUMENT)
+        assert not _has(rroot, "w:del") and not _has(rroot, "w:ins")   # changes resolved
+        assert all("ZOTERO_ITEM" not in c for c in _instr_codes(rroot))  # inserted field gone
+        assert _has(rroot, "w:citation")                                # control restored
+        # original display text "(Smith, 2020)" is restored in a live <w:t>
+        texts = "".join(t.text or "" for t in rroot.iter(qn("w:t")))
+        assert "(Smith, 2020)" in texts
+
     def test_classification_in_result(self, tmp_path, fake_zotero):
         path = build_mixed_doc(tmp_path)
         out = tmp_path / "o.docx"
@@ -661,3 +761,106 @@ class TestZoteroClassificationByPrefix:
             "schema": "...",
         })
         assert _classify(instr) == "mendeley"
+
+
+class TestIterFieldsIndexContract:
+    """``_iter_fields`` assigns ``index`` by CARRIER GROUP (all sdt citations,
+    then fldSimple, then complex), NOT document position. The only contract is
+    that ``index`` is a UNIQUE per-field handle. This locks that behaviour so the
+    (corrected) docstring stays honest and no caller starts assuming doc order."""
+
+    def _body_with_complex_then_sdt(self):
+        # Document order: a complex field FIRST, an sdt citation SECOND.
+        body = etree.Element(qn("w:body"))
+        p = etree.SubElement(body, qn("w:p"))
+        r1 = etree.SubElement(p, qn("w:r"))
+        etree.SubElement(r1, qn("w:fldChar")).set(qn("w:fldCharType"), "begin")
+        r2 = etree.SubElement(p, qn("w:r"))
+        etree.SubElement(r2, qn("w:instrText")).text = " ADDIN EN.CITE complexfield "
+        r3 = etree.SubElement(p, qn("w:r"))
+        etree.SubElement(r3, qn("w:fldChar")).set(qn("w:fldCharType"), "end")
+        sdt = etree.SubElement(p, qn("w:sdt"))
+        sdtpr = etree.SubElement(sdt, qn("w:sdtPr"))
+        etree.SubElement(sdtpr, qn("w:citation"))
+        etree.SubElement(sdt, qn("w:sdtContent"))
+        return body
+
+    def test_index_is_unique_per_field(self):
+        body = self._body_with_complex_then_sdt()
+        fields = cc._iter_fields(body)
+        idxs = [f["index"] for f in fields]
+        assert len(idxs) == len(set(idxs)), "each field needs a unique index handle"
+
+    def test_index_is_carrier_grouped_not_document_order(self):
+        # The sdt comes SECOND in the document but gets the LOWER index, because
+        # sdt citations are emitted before complex fields. This is the documented
+        # (carrier-grouped) behaviour; the index is not a document-position handle.
+        body = self._body_with_complex_then_sdt()
+        by_carrier = {f["carrier"]: f["index"] for f in cc._iter_fields(body)}
+        assert by_carrier["sdt"] < by_carrier["complex"]
+
+
+class TestGroupedCitationRendering:
+    """A converted GROUPED multi-item foreign cite becomes ONE Zotero field. Its
+    stored formattedCitation/plainCitation must NOT be the per-item markers joined
+    with "; " (e.g. "(MENKEY1); (ZKEY)") — Zotero renders a single grouped field
+    as one marker ("(1,2)"), and that spurious "; " corrupts both the pre-refresh
+    display and the existing_renderings dedup guard. A single placeholder is the
+    least-wrong, refresh-stable value when the true grouped marker is not
+    obtainable from the per-item Zotero render API."""
+
+    def _converted_field_props(self, tmp_path, fake_zotero):
+        # Grouped Mendeley cite of TWO works that both resolve fresh in the fake
+        # library (MENKEY1 via widgets DOI, ZKEY via the "already" DOI). Because
+        # neither is cited via Zotero elsewhere, n_fresh > 0 and the whole field
+        # converts to one grouped ZOTERO_ITEM field.
+        src = tmp_path / "g.docx"
+        new_doc(src, ["A grouped claim citing two works here."])
+        doc = Docx(src)
+        root = doc.tree(DOCUMENT)
+        grouped = " ADDIN CSL_CITATION " + json.dumps({
+            "citationItems": [
+                {"id": "A", "itemData": {"title": "Work A",
+                                         "DOI": "10.1000/widgets.2001",
+                                         "issued": {"date-parts": [["2019"]]}},
+                 "uris": ["http://mendeley.com/a"]},
+                {"id": "B", "itemData": {"title": "Work B",
+                                         "DOI": "10.5555/already",
+                                         "issued": {"date-parts": [["2020"]]}},
+                 "uris": ["http://mendeley.com/b"]},
+            ],
+            "mendeley": {"plainTextFormattedCitation": "(a,b)"},
+            "schema": "https://github.com/citation-style-language/schema/raw/master/csl-citation.json",
+        }) + " "
+        _append_complex_field(_find_para(root, "grouped claim"), grouped)
+        p = tmp_path / "p.docx"; doc.save(p)
+
+        out = tmp_path / "o.docx"
+        res = convert_to_zotero(p, out=out, managers=("mendeley",))
+        # Pull the ZOTERO_ITEM field's JSON properties out of the output doc.
+        body = Docx(res["out"]).raw(DOCUMENT).decode()
+        marker = "ADDIN ZOTERO_ITEM CSL_CITATION "
+        assert marker in body, "grouped cite must convert to a Zotero field"
+        start = body.index(marker) + len(marker)
+        depth, i = 0, start
+        while i < len(body):
+            if body[i] == "{":
+                depth += 1
+            elif body[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    i += 1
+                    break
+            i += 1
+        import json as _json
+        data = _json.loads(body[start:i])
+        return data["properties"]
+
+    def test_grouped_render_has_no_spurious_semicolon_join(self, tmp_path, fake_zotero):
+        props = self._converted_field_props(tmp_path, fake_zotero)
+        for k in ("formattedCitation", "plainCitation"):
+            v = props.get(k, "")
+            # The bug stored "(MENKEY1); (ZKEY)" — per-item markers joined with "; ".
+            # A single grouped Zotero field never renders two parenthetical markers
+            # joined by "; "; that separator is the fingerprint of the defect.
+            assert "); (" not in v, f"{k} carries a fabricated '; ' group join: {v!r}"

@@ -35,7 +35,10 @@ from typing import Optional
 from . import _http
 
 # E-utilities / ID-Converter / ESearch endpoints.
-_IDCONV_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
+# _IDCONV_URL is the single canonical PMC ID-Converter base (newer host).
+# Both pmcids_to_pmids (PMCID→PMID) and doi_or_pmid_to_pmcid (DOI/PMID→PMCID)
+# use this constant — oapdf imports it rather than hard-coding its own copy.
+_IDCONV_URL = "https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/"
 _EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 _ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 
@@ -356,6 +359,52 @@ def pmcids_to_pmids_status(pmcids: list[str]) -> tuple[dict[str, str], dict]:
             _sleep_between_batches()
     return out, {"degraded": n_failed > 0, "n_failed_batches": n_failed,
                  "n_batches": n_batches}
+
+
+# ---------------------------------------------------------------------------
+# DOI / PMID  →  PMCID  (NCBI PMC ID Converter, forward direction)
+# ---------------------------------------------------------------------------
+
+def doi_or_pmid_to_pmcid(ids: str, *, timeout: float = _TIMEOUT) -> Optional[str]:
+    """Look up a single DOI or PMID and return its PMCID, or ``None``.
+
+    This is the **forward** direction of the ID-Converter (DOI/PMID → PMCID),
+    the complement of :func:`pmcids_to_pmids` (PMCID → PMID).  It is the
+    shared helper used by :mod:`zoterocite.oapdf` to find a PMC OA PDF for a
+    known DOI or PMID — callers should not re-implement this lookup.
+
+    ``ids`` is a single identifier string (DOI, PMID, or PMCID); the converter
+    accepts any of these.  Returns the first ``pmcid`` in ``records``, or
+    ``None`` if the record has no ``pmcid`` or the request fails.
+
+    The api_key (when configured) is appended via :func:`_build_url` so it is
+    never logged or surfaced in an exception.  Never raises.
+    """
+    if not ids:
+        return None
+    url = _build_url(
+        _IDCONV_URL,
+        {
+            "ids": ids,
+            "format": "json",
+            "tool": _TOOL,
+            "email": _email(),
+        },
+    )
+    body = _http_get(url, timeout=timeout)
+    if body is None:
+        return None
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, dict):
+        return None
+    records = data.get("records") or []
+    if not records or not isinstance(records[0], dict):
+        return None
+    pmcid = records[0].get("pmcid")
+    return str(pmcid) if pmcid else None
 
 
 # ---------------------------------------------------------------------------

@@ -220,9 +220,6 @@ _MAX_CITE_NUM = 999
 # ---------------------------------------------------------------------------
 # Placeholder detection
 # ---------------------------------------------------------------------------
-_PLACEHOLDER_CONTENT_RE = re.compile(
-    r"(?i)(cite|ref|citation|TODO|\?|et\s+al|10\.\d{4,}/)",  # citation-ish content
-)
 _PLACEHOLDER_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 _PLACEHOLDER_BRACKET_RE = re.compile(r"\[([^\]]{1,80})\]")
 

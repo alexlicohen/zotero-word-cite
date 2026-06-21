@@ -62,6 +62,7 @@ from ipaddress import ip_address
 from typing import Optional
 
 from . import _http
+from . import entrez as _entrez
 
 # Default per-request timeout for the cascade's metadata GETs and the PDF fetch.
 _DEFAULT_TIMEOUT = 15.0
@@ -322,28 +323,15 @@ def _try_semantic_scholar(doi: str, *, timeout: float) -> Optional[str]:
 def _try_pmc(doi: Optional[str], pmid: Optional[str], *, timeout: float) -> Optional[str]:
     """Try PubMed Central for a free PDF via DOI/PMID → PMCID conversion.
 
-    Uses the NCBI PMC ID Converter with OUR tool name + contact email.  A DOI is
-    tried first (it is the more precise key); a bare PMID is the fallback.
+    Delegates to :func:`zoterocite.entrez.doi_or_pmid_to_pmcid` — the single
+    canonical DOI/PMID→PMCID helper — which uses the shared endpoint constant
+    and api_key wiring from :mod:`zoterocite.entrez`.  A DOI is tried first (it
+    is the more precise key); a bare PMID is the fallback.
     """
     for ids in (doi, pmid):
         if not ids:
             continue
-        params = urllib.parse.urlencode({
-            "ids": ids,
-            "format": "json",
-            "tool": "zotero-word-cite",
-            "email": _http.contact_email(),
-        })
-        url = (
-            "https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/?" + params
-        )
-        data = _get_json(url, timeout=timeout)
-        if not data:
-            continue
-        records = data.get("records") or []
-        if not records or not isinstance(records[0], dict):
-            continue
-        pmcid = records[0].get("pmcid")
+        pmcid = _entrez.doi_or_pmid_to_pmcid(ids, timeout=timeout)
         if pmcid:
             return f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/"
     return None
