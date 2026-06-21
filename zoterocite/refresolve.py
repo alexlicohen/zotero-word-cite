@@ -579,55 +579,54 @@ def _author_family_compare(cited: list, actual: list) -> dict:
     details: list[str] = []
     mismatch = False
 
-    n = min(len(cited), len(actual))
-    for i in range(n):
-        c = cited[i] if isinstance(cited[i], dict) else {}
-        a = actual[i] if isinstance(actual[i], dict) else {}
-        c_fam = (c.get("family") or "").strip()
-        a_fam = (a.get("family") or "").strip()
-        # Skip organisational authors on either side — comparing a collective
-        # name to a person's surname would be a guaranteed false mismatch.
-        if _is_corporate_author(c_fam, c.get("given") or "") or \
-                _is_corporate_author(a_fam, a.get("given") or ""):
-            continue
+    # Build PERSON-ONLY views of each list FIRST (collectives dropped), carrying
+    # each person's ORIGINAL 1-based position for human-readable messages.
+    # Comparing person-by-person — rather than by raw index with collectives
+    # skipped in place — is what makes the alignment correct when one side carries
+    # a collective the other omits: a cited "[Consortium, Murray]" vs an
+    # authoritative "[Murray]" must NOT report Murray as an extra/fabricated author
+    # (the old raw-index walk did, because the leading collective shifted every
+    # later position by one and pushed the last real author "beyond" the list).
+    def _persons(lst: list) -> list:
+        out = []
+        for i, e in enumerate(lst):
+            if not isinstance(e, dict):
+                continue
+            fam = (e.get("family") or "").strip()
+            if _is_corporate_author(fam, e.get("given") or ""):
+                continue
+            out.append((i + 1, fam))      # (original 1-based position, surname)
+        return out
+
+    cited_p = _persons(cited)
+    actual_p = _persons(actual)
+
+    n = min(len(cited_p), len(actual_p))
+    for k in range(n):
+        pos, c_fam = cited_p[k]
+        _, a_fam = actual_p[k]
         if _normalize_surname(c_fam) != _normalize_surname(a_fam):
             mismatch = True
             details.append(
-                f"author #{i + 1} family {c_fam!r}(cited) != {a_fam!r}(source)"
+                f"author #{pos} family {c_fam!r}(cited) != {a_fam!r}(source)"
             )
 
-    # Cited authors beyond the authoritative list length: a real author list
+    # Cited PERSONS beyond the authoritative person count: a real author list
     # cannot be SHORTER than what was cited, so these cannot be et-al truncation
-    # — they are fabricated / mis-pasted names.  Skip corporate entries.
-    for i in range(len(actual), len(cited)):
-        c = cited[i] if isinstance(cited[i], dict) else {}
-        c_fam = (c.get("family") or "").strip()
-        if _is_corporate_author(c_fam, c.get("given") or ""):
-            continue
+    # — they are fabricated / mis-pasted names.
+    for k in range(len(actual_p), len(cited_p)):
+        pos, c_fam = cited_p[k]
         mismatch = True
         details.append(
-            f"author #{i + 1} {c_fam!r}(cited) has no counterpart in the "
+            f"author #{pos} {c_fam!r}(cited) has no counterpart in the "
             f"source author list (cannot be et-al truncation)"
         )
-
-    # Personal-author counts (collectives excluded) for the message.
-    def _persons(lst: list) -> int:
-        out = 0
-        for e in lst:
-            if not isinstance(e, dict):
-                continue
-            if _is_corporate_author(
-                (e.get("family") or "").strip(), e.get("given") or ""
-            ):
-                continue
-            out += 1
-        return out
 
     return {
         "mismatch": mismatch,
         "details": details,
-        "cited_count": _persons(cited),
-        "actual_count": _persons(actual),
+        "cited_count": len(cited_p),
+        "actual_count": len(actual_p),
         "cited_total": len(cited),
         "actual_total": len(actual),
     }
