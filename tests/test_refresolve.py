@@ -760,6 +760,49 @@ class TestCheckPreprintStatus:
         assert result["is_preprint"] is True
         assert result["published_doi"] == published
 
+    def test_has_version_to_another_preprint_is_not_published(self, monkeypatch):
+        """L2 regression: has-version can point at a LATER PREPRINT version, not
+        the published article. A preprint is never the published version, so
+        published_doi must be None (not the other preprint's DOI)."""
+        preprint_doi = "10.1101/2020.01.01.123456"
+        other_preprint = "10.1101/2020.06.01.999999"  # bioRxiv v2 — still a preprint
+        item = {
+            "DOI": preprint_doi,
+            "title": ["A preprint title"],
+            "type": "posted-content",
+            "relation": {
+                "has-version": [
+                    {"id": other_preprint, "id-type": "doi", "asserted-by": "publisher"},
+                ]
+            },
+        }
+        _patch_urlopen(monkeypatch, _crossref_single_response(item))
+        result = rr.check_preprint_status(preprint_doi)
+        assert result["is_preprint"] is True
+        assert result["published_doi"] is None
+
+    def test_has_version_preprint_skipped_real_published_taken(self, monkeypatch):
+        """The preprint-skip must not suppress a genuine published DOI that
+        follows a preprint entry in the same relation list (scan order kept)."""
+        preprint_doi = "10.1101/2020.01.01.123456"
+        other_preprint = "10.1101/2020.06.01.999999"
+        published = "10.1212/WNL.0000000000014567"
+        item = {
+            "DOI": preprint_doi,
+            "title": ["A preprint title"],
+            "type": "posted-content",
+            "relation": {
+                "has-version": [
+                    {"id": other_preprint, "id-type": "doi", "asserted-by": "publisher"},
+                    {"id": published, "id-type": "doi", "asserted-by": "publisher"},
+                ]
+            },
+        }
+        _patch_urlopen(monkeypatch, _crossref_single_response(item))
+        result = rr.check_preprint_status(preprint_doi)
+        assert result["is_preprint"] is True
+        assert result["published_doi"] == published
+
 
 # ---------------------------------------------------------------------------
 # 6. preprint flag on parsed Crossref items

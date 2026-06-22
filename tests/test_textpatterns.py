@@ -429,9 +429,9 @@ class TestJaccard:
 class TestJaccardDelegation:
     """Verify the refresolve _title_overlap wrapper delegates to textpatterns.jaccard.
 
-    (grant-forge also has a consistency._title_overlap wrapper covered by the same
-    delegation test there; consistency is a grant-only module, not part of the
-    public citation engine, so only the refresolve wrapper is exercised here.)
+    (A consistency-checking module exists upstream with its own _title_overlap
+    wrapper, but it is not part of this public citation engine, so only the
+    refresolve wrapper is exercised here.)
     """
 
     def test_refresolve_title_overlap_delegates(self, monkeypatch):

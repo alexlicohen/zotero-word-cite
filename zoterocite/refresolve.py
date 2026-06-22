@@ -275,6 +275,12 @@ def check_preprint_status(doi: str, *, fetch: bool = True) -> dict:
             if entry.get("id-type") == "doi":
                 candidate = (entry.get("id") or "").strip() or None
                 if candidate:
+                    # A preprint is NEVER the published version. ``has-version``
+                    # (and occasionally the other relations) can point at a LATER
+                    # PREPRINT revision rather than the published article — skip
+                    # any candidate that is itself a preprint.
+                    if is_preprint(candidate):
+                        continue
                     published_doi = candidate
                     break
         if published_doi:

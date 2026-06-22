@@ -486,7 +486,7 @@ def refresh_retraction_db(dest: Optional[Union[str, Path]] = None, *,
     if not url:
         raise ValueError(
             "url must be supplied — check "
-            "https://www.crossref.org/labs/retraction-watch/ for the current link."
+            "https://gitlab.com/crossref/retraction-watch-data for the current link."
         )
     dest_path = Path(dest) if dest else default_rw_path()
     dest_path.parent.mkdir(parents=True, exist_ok=True)

@@ -645,8 +645,13 @@ def test_refresh_has_default_url_but_rejects_empty():
     from zoterocite.citecheck import refresh_retraction_db, RETRACTION_WATCH_URL
     assert RETRACTION_WATCH_URL.startswith(
         "https://gitlab.com/crossref/retraction-watch-data/-/raw/main/")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as ei:
         refresh_retraction_db(url="")
+    # L3: the empty-url message must point at the live GitLab distribution, not
+    # the deprecated Crossref Labs endpoint (removed in the #8 GitLab migration).
+    msg = str(ei.value)
+    assert "gitlab.com/crossref/retraction-watch-data" in msg
+    assert "crossref.org/labs/retraction-watch" not in msg
 
 
 # ---------------------------------------------------------------------------
@@ -1686,9 +1691,9 @@ class TestRetractionNetworkPolicyPreserved:
     must keep: endnote/unify ALWAYS allow a network refresh.  Spy on
     ensure_retraction_db at the citecheck seam.
 
-    (grant-forge also pins the biocheck "cached-only, no auto-refresh" divergence
-    here; biocheck is a grant-only biosketch module absent from the public
-    citation engine, so only the shared endnote/unify consumers are exercised.)"""
+    (A biosketch "cached-only, no auto-refresh" consumer exists upstream but is
+    not part of this public citation engine, so only the shared endnote/unify
+    network-refresh consumers are exercised here.)"""
 
     def test_endnote_allows_refresh(self, monkeypatch):
         import zoterocite.citecheck as cc
