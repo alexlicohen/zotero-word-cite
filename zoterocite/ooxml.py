@@ -31,20 +31,11 @@ NS = {
 }
 
 # Content-type + relationship-type constants for the comment parts.
-#
-# ``commentsExtended``/``commentsIds`` carry Word's native comment-threading data
-# (parent links + durable ids). We create those parts only when a threaded reply
-# is added (see comments.add_comment_reply); plain top-level comments still ship
-# comments.xml alone, so flat-comment output is unchanged.
 CT = {
     "comments": "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml",
-    "commentsExtended": "application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtended+xml",
-    "commentsIds": "application/vnd.openxmlformats-officedocument.wordprocessingml.commentsIds+xml",
 }
 REL = {
     "comments": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments",
-    "commentsExtended": "http://schemas.microsoft.com/office/2011/relationships/commentsExtended",
-    "commentsIds": "http://schemas.microsoft.com/office/2016/09/relationships/commentsIds",
 }
 
 
