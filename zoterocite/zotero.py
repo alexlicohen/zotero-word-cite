@@ -397,6 +397,14 @@ _DOI_INDEX_CACHE = Path(__file__).parent.parent / "data" / "zotero_doi_index.jso
 # Module-level in-memory cache: (index_dict, fetched_at_unix_seconds)
 _doi_index_mem: Optional[tuple[dict, float]] = None
 
+# Combined (doi+pmid+title) index cache — independent of the legacy DOI-only
+# cache above so library_doi_index keeps its exact on-disk format/back-compat.
+_LIB_INDEX_CACHE = Path(__file__).parent.parent / "data" / "zotero_library_index.json"
+
+# Module-level in-memory cache: (index_dict, fetched_at_unix_seconds), where
+# index_dict is {"doi": {...}, "pmid": {...}, "title": {...}}.
+_lib_index_mem: Optional[tuple[dict, float]] = None
+
 
 def _extract_doi_from_item(item: dict) -> Optional[str]:
     """Pull a DOI from a Zotero item's ``data`` block (checks ``DOI`` then ``extra``)."""
@@ -410,6 +418,32 @@ def _extract_doi_from_item(item: dict) -> Optional[str]:
         m = re.match(r"^\s*DOI:\s*(.+)", line, re.IGNORECASE)
         if m:
             return m.group(1).strip()
+    return None
+
+
+# A PMID is a bare integer (Zotero has no native PMID field, so it lives in
+# ``extra`` as "PMID: NNN" — or occasionally a ``PMID``/``pmid`` data key).
+_PMID_EXTRA_RE = re.compile(r"^\s*PMID:\s*(\d+)", re.IGNORECASE)
+
+
+def _extract_pmid_from_item(item: dict) -> Optional[str]:
+    """Pull a PMID from a Zotero item's ``data`` block.
+
+    Checks a ``PMID``/``pmid`` data key first (rare; some imports set one), then
+    parses the ``extra`` field for a ``PMID: NNN`` line (the canonical Zotero
+    home for a PMID). Returns the bare digits or ``None``.
+    """
+    data = item.get("data", {}) if isinstance(item, dict) else {}
+    raw = (str(data.get("PMID") or data.get("pmid") or "")).strip()
+    if raw:
+        m = re.search(r"\d+", raw)
+        if m:
+            return m.group(0)
+    extra = (data.get("extra") or "").strip()
+    for line in extra.splitlines():
+        m = _PMID_EXTRA_RE.match(line)
+        if m:
+            return m.group(1)
     return None
 
 
@@ -510,6 +544,127 @@ def library_doi_index(*, refresh: bool = False, max_age_hours: float = 24.0) -> 
         raise LibraryUnavailableError(
             "Could not load the Zotero library DOI index (read failed and no "
             "usable cache). Refusing to treat this as an empty library."
+        ) from exc
+
+
+def _build_indexes_from_items(items: list[dict]) -> dict[str, dict[str, str]]:
+    """Build {"doi","pmid","title"} maps from a single list of library items.
+
+    One pass over the items the caller already fetched: DOI via
+    :func:`_extract_doi_from_item`, PMID via :func:`_extract_pmid_from_item`,
+    title via :func:`_normalize_title` of ``data.title``. Each maps the
+    identifier/normalized-title to the item key.
+    """
+    doi_idx: dict[str, str] = {}
+    pmid_idx: dict[str, str] = {}
+    title_idx: dict[str, str] = {}
+    for item in items:
+        key = (item.get("key") or (item.get("data") or {}).get("key") or "").strip()
+        if not key:
+            continue
+        doi_raw = _extract_doi_from_item(item)
+        if doi_raw:
+            norm = citecheck._normalise_doi(doi_raw)
+            if norm:
+                doi_idx[norm] = key
+        pmid = _extract_pmid_from_item(item)
+        if pmid:
+            pmid_idx[pmid] = key
+        data = item.get("data", {}) if isinstance(item, dict) else {}
+        nt = _normalize_title(data.get("title") or "")
+        if nt:
+            # First write wins so a present ref maps to a stable key; collisions
+            # across duplicate titles are unlikely and either key is "present".
+            title_idx.setdefault(nt, key)
+    return {"doi": doi_idx, "pmid": pmid_idx, "title": title_idx}
+
+
+def library_index(
+    *, refresh: bool = False, max_age_hours: float = 24.0
+) -> dict[str, dict[str, str]]:
+    """Return ``{"doi": {...}, "pmid": {...}, "title": {...}}`` for the whole library.
+
+    A single :func:`fetch_all` pass builds all three identifier indexes
+    (normalised-DOI→key, PMID→key, normalised-title→key) so a caller can decide
+    presence by DOI → PMID → title without three separate fetches.
+
+    Caching and failure semantics mirror :func:`library_doi_index` exactly — a
+    two-layer cache (in-memory tuple + the gitignored disk file
+    ``data/zotero_library_index.json``), ``refresh=True`` bypasses both, an empty
+    library returns three empty maps, and a *read failure* with no usable cache
+    raises :class:`LibraryUnavailableError` (never a silent empty library) so
+    write paths fail closed. It uses a SEPARATE cache from ``library_doi_index``
+    so that function's on-disk format and tests stay byte-compatible.
+
+    The API key is never written to the cache file or any log.
+    """
+    global _lib_index_mem
+
+    now = time.time()
+    ttl_seconds = max_age_hours * 3600.0
+
+    # ---- in-memory cache check ----
+    if not refresh and _lib_index_mem is not None:
+        idx, fetched_at = _lib_index_mem
+        if now - fetched_at < ttl_seconds:
+            return idx
+
+    # ---- disk cache check ----
+    if not refresh and _LIB_INDEX_CACHE.exists():
+        try:
+            with _LIB_INDEX_CACHE.open("r", encoding="utf-8") as fh:
+                cached = json.load(fh)
+            fetched_at = float(cached.get("fetched_at", 0))
+            if now - fetched_at < ttl_seconds:
+                idx = cached.get("index", {})
+                if isinstance(idx, dict) and "doi" in idx:
+                    idx = {
+                        "doi": idx.get("doi") or {},
+                        "pmid": idx.get("pmid") or {},
+                        "title": idx.get("title") or {},
+                    }
+                    _lib_index_mem = (idx, fetched_at)
+                    return idx
+        except Exception:  # noqa: BLE001 — corrupt cache; fall through to fetch
+            pass
+
+    # ---- fetch from Zotero ----
+    try:
+        items = fetch_all()
+        idx = _build_indexes_from_items(items)
+
+        fetched_at = now
+        _lib_index_mem = (idx, fetched_at)
+
+        # Write disk cache (best-effort; never raise)
+        try:
+            _LIB_INDEX_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            with _LIB_INDEX_CACHE.open("w", encoding="utf-8") as fh:
+                json.dump({"fetched_at": fetched_at, "index": idx}, fh)
+        except Exception:  # noqa: BLE001
+            pass
+
+        return idx
+
+    except Exception as exc:  # noqa: BLE001 — network error or missing credentials
+        # Fall back to a usable disk cache if one is present; otherwise this is a
+        # DEGRADED READ, not an empty library — raise so write paths fail closed.
+        if _LIB_INDEX_CACHE.exists():
+            try:
+                with _LIB_INDEX_CACHE.open("r", encoding="utf-8") as fh:
+                    cached = json.load(fh)
+                idx = cached.get("index")
+                if isinstance(idx, dict) and "doi" in idx:
+                    return {
+                        "doi": idx.get("doi") or {},
+                        "pmid": idx.get("pmid") or {},
+                        "title": idx.get("title") or {},
+                    }
+            except Exception:  # noqa: BLE001 — corrupt/unreadable cache: no fallback
+                pass
+        raise LibraryUnavailableError(
+            "Could not load the Zotero library index (read failed and no usable "
+            "cache). Refusing to treat this as an empty library."
         ) from exc
 
 
@@ -1040,6 +1195,7 @@ def create_items(
     tags: Optional[list[str]] = None,
     dedup: bool = True,
     doi_index: Optional[dict[str, str]] = None,
+    pmid_index: Optional[dict[str, str]] = None,
     attach_pdfs: bool = False,
 ) -> dict:
     """Batch-create Zotero items from CSL-JSON-ish metadata dicts.
@@ -1063,6 +1219,13 @@ def create_items(
         per item — passed straight to :func:`get_item_by_doi`. Callers that
         already built the index (e.g. ``unify.apply_unification``) SHOULD thread
         it in to avoid the O(N·M) re-scan (F3).
+    pmid_index:
+        Optional pre-built ``{pmid: item_key}`` map (from
+        :func:`library_index`). Defense-in-depth dedup: when a meta carries a
+        ``pmid`` that is present in this map, the item is recorded
+        ``skipped_existing`` even if its DOI/title did not match — so a ref that
+        was false-flagged "missing" upstream (present only by PMID) is never
+        duplicated into the shared group.
     attach_pdfs:
         When ``True`` (OPT-IN; default ``False`` — existing behaviour unchanged),
         after the items are created, try to discover an open-access PDF for each
@@ -1089,6 +1252,14 @@ def create_items(
     """
     result: dict[str, list] = {"created": [], "skipped_existing": [], "failed": []}
 
+    if not metas:
+        return result
+
+    # Drop None / non-dict entries: a None metadata can't become an item, so skip
+    # it rather than crash on ``meta.get(...)`` downstream (a refresolve miss can
+    # leave a None in the list). Defensive — never abort the whole batch over one
+    # bad entry.
+    metas = [m for m in metas if isinstance(m, dict)]
     if not metas:
         return result
 
@@ -1127,6 +1298,7 @@ def create_items(
     for meta in metas:
         title = (meta.get("title") or "").strip()
         doi = (meta.get("doi") or "").strip()
+        pmid = str(meta.get("pmid") or "").strip()
 
         # The dedup lookups (get_item_by_doi / _title_exists_in_library) hit the
         # network. Wrap them in the SAME per-item guard as the conversion below
@@ -1143,6 +1315,11 @@ def create_items(
                     existing = get_item_by_doi(doi, doi_index=doi_index)
                     if existing:
                         existing_key = existing.get("key")
+                # Defense-in-depth: a PMID hit in the pre-built index means the
+                # item IS present even if its DOI/title did not match — catches a
+                # ref upstream false-flagged "missing" (present only by PMID).
+                if existing_key is None and pmid and pmid_index:
+                    existing_key = pmid_index.get(pmid)
                 if existing_key is None:
                     existing_key = _title_exists_in_library(title)
 

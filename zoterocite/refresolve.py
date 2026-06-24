@@ -696,7 +696,8 @@ def _pubmed_fetch(pmid: str) -> Optional[dict]:
     if rec is None:
         return None
     return {
-        "doi": None,
+        "doi": rec.get("doi") or None,
+        "pmid": str(pmid),
         "title": rec.get("title"),
         "authors": rec.get("authors") or [],
         "year": rec.get("year"),
@@ -771,9 +772,14 @@ def resolve_reference(text: str, *, fetch: bool = True) -> dict:
     if identifiers["doi"]:
         item = _crossref_doi_fetch(identifiers["doi"])
         if item:
+            _meta = _metadata_from_candidate(item)
+            # Carry the PMID forward when the input string also bore one, so
+            # downstream dedup (unify/create_items) can match present-by-PMID.
+            if identifiers.get("pmid"):
+                _meta.setdefault("pmid", identifiers["pmid"])
             return {
                 "input": text,
-                "metadata": _metadata_from_candidate(item),
+                "metadata": _meta,
                 "confidence": "high",
                 "source": "doi",
                 "candidates": [item],

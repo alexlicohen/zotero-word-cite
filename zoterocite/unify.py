@@ -320,9 +320,11 @@ def plan_unification(
     # do for any other unavailable read.  Either way: zero network calls.
     try:
         _doi_kw = {"max_age_hours": float("inf")} if offline else {}
-        doi_index = zotero.library_doi_index(**_doi_kw)
+        lib_index = zotero.library_index(**_doi_kw)
     except zotero.LibraryUnavailableError:
-        doi_index = {}
+        lib_index = {"doi": {}, "pmid": {}, "title": {}}
+    # Back-compat alias: existing code below reads ``doi_index`` for DOI lookups.
+    doi_index = lib_index.get("doi") or {}
 
     # ---- resolve each reflist entry ---------------------------------------
     references: List[dict] = []
@@ -338,14 +340,19 @@ def plan_unification(
         tier = _TIER_BY_CONFIDENCE.get(confidence, "low")
         doi = (meta or {}).get("doi") if meta else None
 
-        in_library = False
-        existing_key: Optional[str] = None
-        if doi:
-            norm = citecheck._normalise_doi(doi)
-            key = doi_index.get(norm)
-            if key:
-                in_library = True
-                existing_key = key
+        # Decide presence by DOI → PMID → normalized-title. A real shared library
+        # has many items WITHOUT a DOI in their index entry, so a DOI-only test
+        # false-flags present refs as "missing" — and a confident --apply would
+        # then mass-duplicate the group. The PMID source falls back to the
+        # resolver's ``identifiers`` (always populated when the input bore a PMID,
+        # even if the metadata dict doesn't carry one).
+        existing_key = _lookup_in_library(
+            lib_index,
+            doi=doi,
+            pmid=_meta_pmid(meta) or (resolved.get("identifiers") or {}).get("pmid"),
+            title=_meta_title(meta),
+        )
+        in_library = existing_key is not None
 
         retracted = _retracted(doi)
         divergent = _candidates_divergent(resolved)
@@ -484,6 +491,55 @@ def _meta_title(meta: Optional[dict]) -> str:
     if not meta:
         return ""
     return (meta.get("title") or "").strip()
+
+
+def _meta_pmid(meta: Optional[dict]) -> Optional[str]:
+    if not meta:
+        return None
+    pmid = str(meta.get("pmid") or "").strip()
+    return pmid or None
+
+
+def _lookup_in_library(
+    lib_index: Optional[dict],
+    *,
+    doi: Optional[str],
+    pmid: Optional[str],
+    title: Optional[str],
+) -> Optional[str]:
+    """Return an existing library item key for a ref, or ``None`` if absent.
+
+    Decides presence by DOI → PMID → normalized-title against the three maps in
+    ``lib_index`` (from :func:`zotero.library_index`). The DOI-only test that
+    this replaces false-flagged present-but-DOI-less refs as missing — which,
+    under a confident ``--apply``, mass-duplicated the shared group library. A
+    match on ANY of the three keys means the ref is already present.
+
+    ``lib_index`` may be ``None`` or partial (a degraded read degrades to empty
+    maps); a missing sub-map simply yields no match for that identifier.
+    """
+    if not lib_index:
+        return None
+    doi_idx = lib_index.get("doi") or {}
+    pmid_idx = lib_index.get("pmid") or {}
+    title_idx = lib_index.get("title") or {}
+
+    if doi:
+        norm = citecheck._normalise_doi(doi)
+        key = doi_idx.get(norm)
+        if key:
+            return key
+    if pmid:
+        key = pmid_idx.get(str(pmid).strip())
+        if key:
+            return key
+    if title:
+        nt = zotero._normalize_title(title)
+        if nt:
+            key = title_idx.get(nt)
+            if key:
+                return key
+    return None
 
 
 def _strip_score(meta: Optional[dict]) -> Optional[dict]:
@@ -640,15 +696,19 @@ def apply_unification(
     references = plan.get("references", [])
     plan_placeholders = plan.get("placeholders", [])
 
-    # Fetch library DOI index ONCE for all placeholder DOI lookups in this function.
-    # A DEGRADED READ (LibraryUnavailableError) is NOT an empty library: if we
-    # proceeded with an empty index every accepted work would look "missing" and
-    # we would create DUPLICATES in the shared group. Fail closed — keep
-    # ``doi_index = None`` as a sentinel and refuse to create below (step 4).
+    # Fetch the library index ONCE (DOI+PMID+title) for all presence lookups in
+    # this function. A DEGRADED READ (LibraryUnavailableError) is NOT an empty
+    # library: if we proceeded with empty maps every accepted work would look
+    # "missing" and we would create DUPLICATES in the shared group. Fail closed —
+    # keep ``lib_index = None`` as a sentinel and refuse to create below (step 4).
     try:
-        doi_index = zotero.library_doi_index()
+        lib_index = zotero.library_index()
     except zotero.LibraryUnavailableError:
-        doi_index = None
+        lib_index = None
+    # Back-compat: step 4 / create_items take a flat DOI→key map. ``None`` is the
+    # fail-closed sentinel and MUST propagate as ``None`` (not {}) so creation is
+    # refused on a degraded read.
+    doi_index = None if lib_index is None else (lib_index.get("doi") or {})
 
     report: dict = {
         "out": None,
@@ -745,12 +805,19 @@ def apply_unification(
             "title": _meta_title(meta) or ph["text"][:80],
             "ref_index": None,
         }
-        # A placeholder's metadata might already be in the library (by DOI).
+        # A confirmed placeholder's metadata might already be in the library —
+        # by DOI, PMID, or title. Use the same DOI→PMID→title fallback as the
+        # plan so a present-but-DOI-less item isn't re-created. ``lib_index is
+        # None`` is the degraded-read sentinel: skip the lookup (no match) and
+        # let step 4's fail-closed guard refuse creation.
         existing_key = None
-        doi = _meta_doi(meta)
-        if doi and doi_index is not None:
-            norm = citecheck._normalise_doi(doi)
-            existing_key = doi_index.get(norm) or None
+        if lib_index is not None:
+            existing_key = _lookup_in_library(
+                lib_index,
+                doi=_meta_doi(meta),
+                pmid=_meta_pmid(meta),
+                title=_meta_title(meta),
+            )
         if existing_key:
             placement["key"] = existing_key
             report["matched"].append({"title": placement["title"], "key": existing_key})
@@ -808,6 +875,7 @@ def apply_unification(
                 tags=[ADDED_TAG, source_label],
                 dedup=True,
                 doi_index=doi_index,
+                pmid_index=(lib_index.get("pmid") if lib_index else None),
                 attach_pdfs=attach_pdfs,
             )
             # Map created/skipped results back to placements by DOI then title.

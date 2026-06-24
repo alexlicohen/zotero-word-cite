@@ -45,12 +45,16 @@ CANNED_ITEMS = [
 
 @pytest.fixture(autouse=True)
 def reset_doi_index_cache(tmp_path, monkeypatch):
-    """Clear in-memory cache and redirect the disk cache to a temp dir."""
+    """Clear in-memory caches and redirect both disk caches to a temp dir."""
     zotero_mod._doi_index_mem = None
+    zotero_mod._lib_index_mem = None
     fake_cache = tmp_path / "zotero_doi_index.json"
+    fake_lib_cache = tmp_path / "zotero_library_index.json"
     monkeypatch.setattr(zotero_mod, "_DOI_INDEX_CACHE", fake_cache)
+    monkeypatch.setattr(zotero_mod, "_LIB_INDEX_CACHE", fake_lib_cache)
     yield
     zotero_mod._doi_index_mem = None
+    zotero_mod._lib_index_mem = None
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +202,130 @@ class TestLibraryDoiIndex:
 
 
 # ---------------------------------------------------------------------------
+# Tests for library_index — the combined {"doi","pmid","title"} index (Bug 1)
+# ---------------------------------------------------------------------------
+
+def _make_item_full(key, *, doi=None, pmid_extra=None, pmid_field=None, title=None):
+    data: dict[str, Any] = {"key": key, "title": title or f"Title for {key}"}
+    if doi:
+        data["DOI"] = doi
+    extra_lines = []
+    if pmid_extra:
+        extra_lines.append(f"PMID: {pmid_extra}")
+    if extra_lines:
+        data["extra"] = "\n".join(extra_lines)
+    if pmid_field:
+        data["PMID"] = pmid_field
+    return {"key": key, "data": data}
+
+
+LIB_ITEMS = [
+    _make_item_full("DK", doi="10.1234/alpha", title="Alpha Paper"),
+    _make_item_full("PK", pmid_extra="31234567", title="PMID-only Paper"),  # PMID in extra, no DOI
+    _make_item_full("PF", pmid_field="40000001", title="PMID-field Paper"),  # PMID data key
+    _make_item_full("TK", title="A Title Only Paper"),                       # title only
+]
+
+
+class TestLibraryIndex:
+    def test_builds_all_three_in_one_fetch(self, monkeypatch):
+        """One fetch_all builds DOI, PMID, and title maps."""
+        fetch_calls = {"n": 0}
+
+        def counting_fetch(**kw):
+            fetch_calls["n"] += 1
+            return LIB_ITEMS
+
+        monkeypatch.setattr(zotero_mod, "fetch_all", counting_fetch)
+
+        idx = zotero_mod.library_index()
+
+        assert fetch_calls["n"] == 1, "library_index must fetch the library exactly once"
+        assert idx["doi"].get("10.1234/alpha") == "DK"
+        assert idx["pmid"].get("31234567") == "PK"      # parsed from extra "PMID: N"
+        assert idx["pmid"].get("40000001") == "PF"      # from PMID data key
+        assert idx["title"].get(zotero_mod._normalize_title("A Title Only Paper")) == "TK"
+        # The DOI item is also title-indexed (every item with a title is).
+        assert idx["title"].get(zotero_mod._normalize_title("Alpha Paper")) == "DK"
+
+    def test_cache_prevents_second_fetch(self, monkeypatch):
+        calls = {"n": 0}
+
+        def counting(**kw):
+            calls["n"] += 1
+            return LIB_ITEMS
+
+        monkeypatch.setattr(zotero_mod, "fetch_all", counting)
+        zotero_mod.library_index()
+        zotero_mod.library_index()
+        assert calls["n"] == 1, "second call within TTL must reuse the cache"
+
+    def test_refresh_forces_refetch(self, monkeypatch):
+        calls = {"n": 0}
+
+        def counting(**kw):
+            calls["n"] += 1
+            return LIB_ITEMS
+
+        monkeypatch.setattr(zotero_mod, "fetch_all", counting)
+        zotero_mod.library_index()
+        zotero_mod.library_index(refresh=True)
+        assert calls["n"] == 2
+
+    def test_disk_cache_written_and_reused(self, monkeypatch):
+        monkeypatch.setattr(zotero_mod, "fetch_all", lambda **kw: LIB_ITEMS)
+        idx1 = zotero_mod.library_index()
+
+        zotero_mod._lib_index_mem = None  # simulate fresh process
+
+        def should_not_fetch(**kw):
+            raise AssertionError("disk cache should serve; fetch_all must not run")
+
+        monkeypatch.setattr(zotero_mod, "fetch_all", should_not_fetch)
+        idx2 = zotero_mod.library_index()
+        assert idx1 == idx2
+
+    def test_empty_library_returns_three_empty_maps(self, monkeypatch):
+        monkeypatch.setattr(zotero_mod, "fetch_all", lambda **kw: [])
+        idx = zotero_mod.library_index()
+        assert idx == {"doi": {}, "pmid": {}, "title": {}}
+
+    def test_fetch_failure_no_cache_raises_unavailable(self, monkeypatch):
+        """A degraded read with no usable cache RAISES (never a silent empty
+        library) so the write path fails closed and cannot mass-duplicate."""
+        def boom(**kw):
+            raise RuntimeError("network is down")
+
+        monkeypatch.setattr(zotero_mod, "fetch_all", boom)
+        with pytest.raises(zotero_mod.LibraryUnavailableError):
+            zotero_mod.library_index()
+
+    def test_fetch_failure_falls_back_to_disk_cache(self, monkeypatch):
+        stale = {"doi": {"10.9/stale": "SK"}, "pmid": {"1": "SK"}, "title": {"t": "SK"}}
+        fetched_at = time.time() - 3600
+        cache_path = zotero_mod._LIB_INDEX_CACHE
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps({"fetched_at": fetched_at, "index": stale}), encoding="utf-8"
+        )
+
+        def boom(**kw):
+            raise RuntimeError("network is down")
+
+        monkeypatch.setattr(zotero_mod, "fetch_all", boom)
+        result = zotero_mod.library_index()
+        assert result == stale
+
+    def test_pmid_extraction_helper(self):
+        """_extract_pmid_from_item reads the data key first, then extra."""
+        assert zotero_mod._extract_pmid_from_item(
+            {"data": {"extra": "PMID: 12345\nfoo"}}) == "12345"
+        assert zotero_mod._extract_pmid_from_item(
+            {"data": {"PMID": "67890"}}) == "67890"
+        assert zotero_mod._extract_pmid_from_item({"data": {}}) is None
+
+
+# ---------------------------------------------------------------------------
 # Tests for unify.py integration
 # ---------------------------------------------------------------------------
 
@@ -269,21 +397,21 @@ class TestUnifyUsesIndex:
         return p
 
     def test_plan_calls_library_doi_index_once(self, three_ref_doc, monkeypatch):
-        """plan_unification calls library_doi_index exactly once, regardless of N refs."""
+        """plan_unification calls library_index exactly once, regardless of N refs."""
         call_count = {"n": 0}
 
         def counting_index(**kw):
             call_count["n"] += 1
-            return dict(FAKE_DOI_INDEX)
+            return {"doi": dict(FAKE_DOI_INDEX), "pmid": {}, "title": {}}
 
-        monkeypatch.setattr(unify.zotero, "library_doi_index", counting_index)
+        monkeypatch.setattr(unify.zotero, "library_index", counting_index)
         monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve_many)
         monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: (None, None))
 
         plan = unify.plan_unification(three_ref_doc)
 
         assert call_count["n"] == 1, (
-            f"library_doi_index must be called exactly once; got {call_count['n']}"
+            f"library_index must be called exactly once; got {call_count['n']}"
         )
 
     def test_plan_get_item_by_doi_not_called(self, three_ref_doc, monkeypatch):
@@ -294,7 +422,8 @@ class TestUnifyUsesIndex:
             get_item_calls["n"] += 1
             return None
 
-        monkeypatch.setattr(unify.zotero, "library_doi_index", lambda **kw: dict(FAKE_DOI_INDEX))
+        monkeypatch.setattr(unify.zotero, "library_index",
+                            lambda **kw: {"doi": dict(FAKE_DOI_INDEX), "pmid": {}, "title": {}})
         monkeypatch.setattr(unify.zotero, "get_item_by_doi", should_not_call)
         monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve_many)
         monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: (None, None))
@@ -302,12 +431,13 @@ class TestUnifyUsesIndex:
         unify.plan_unification(three_ref_doc)
 
         assert get_item_calls["n"] == 0, (
-            "get_item_by_doi must not be called per-reference; use library_doi_index"
+            "get_item_by_doi must not be called per-reference; use library_index"
         )
 
     def test_plan_doi_match_via_index(self, three_ref_doc, monkeypatch):
         """Work A (in index) is flagged in_library=True; B and C are not."""
-        monkeypatch.setattr(unify.zotero, "library_doi_index", lambda **kw: dict(FAKE_DOI_INDEX))
+        monkeypatch.setattr(unify.zotero, "library_index",
+                            lambda **kw: {"doi": dict(FAKE_DOI_INDEX), "pmid": {}, "title": {}})
         monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve_many)
         monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: (None, None))
 
@@ -323,14 +453,14 @@ class TestUnifyUsesIndex:
         assert in_lib.get("10.5/ccc") is False
 
     def test_apply_calls_library_doi_index_once(self, three_ref_doc, monkeypatch):
-        """apply_unification calls library_doi_index exactly once for placeholder lookups."""
+        """apply_unification calls library_index exactly once for placeholder lookups."""
         call_count = {"n": 0}
 
         def counting_index(**kw):
             call_count["n"] += 1
-            return dict(FAKE_DOI_INDEX)
+            return {"doi": dict(FAKE_DOI_INDEX), "pmid": {}, "title": {}}
 
-        monkeypatch.setattr(unify.zotero, "library_doi_index", counting_index)
+        monkeypatch.setattr(unify.zotero, "library_index", counting_index)
         monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve_many)
         monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: (None, None))
 
@@ -350,5 +480,5 @@ class TestUnifyUsesIndex:
         unify.apply_unification(three_ref_doc, plan, {"accept": [0, 1, 2]}, out=out)
 
         assert call_count["n"] == 1, (
-            f"apply_unification must call library_doi_index exactly once; got {call_count['n']}"
+            f"apply_unification must call library_index exactly once; got {call_count['n']}"
         )

@@ -111,10 +111,11 @@ def patched_network(monkeypatch):
     """
     monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve)
 
-    # library_doi_index replaces get_item_by_doi — return a small DOI→key map.
+    # library_index replaces per-ref get_item_by_doi — return a small
+    # {"doi","pmid","title"} index. Smith is present by DOI (key SMITHKEY).
     monkeypatch.setattr(
-        unify.zotero, "library_doi_index",
-        lambda **kw: {"10.1/smith2020": "SMITHKEY"},
+        unify.zotero, "library_index",
+        lambda **kw: {"doi": {"10.1/smith2020": "SMITHKEY"}, "pmid": {}, "title": {}},
     )
     # No retraction DB by default → nothing retracted.
     monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: (None, None))
@@ -170,7 +171,7 @@ class TestPlan:
     def test_no_writes_during_plan(self, draft, monkeypatch):
         """plan_unification must never call create_items / key_can_write."""
         monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve)
-        monkeypatch.setattr(unify.zotero, "library_doi_index", lambda **kw: {})
+        monkeypatch.setattr(unify.zotero, "library_index", lambda **kw: {"doi": {}, "pmid": {}, "title": {}})
         monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: (None, None))
 
         def _boom(*a, **k):  # pragma: no cover - must not be hit
@@ -195,7 +196,7 @@ class TestPlan:
         def _raise(**kw):
             raise unify.zotero.LibraryUnavailableError("read failed")
 
-        monkeypatch.setattr(unify.zotero, "library_doi_index", _raise)
+        monkeypatch.setattr(unify.zotero, "library_index", _raise)
 
         # Must NOT raise.
         plan = unify.plan_unification(draft)
@@ -226,8 +227,8 @@ class TestPlan:
         """A resolved DOI present in the retraction DB → retracted=True + count."""
         monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve)
         monkeypatch.setattr(
-            unify.zotero, "library_doi_index",
-            lambda **kw: {"10.1/smith2020": "SMITHKEY"},
+            unify.zotero, "library_index",
+            lambda **kw: {"doi": {"10.1/smith2020": "SMITHKEY"}, "pmid": {}, "title": {}},
         )
         # Pretend the DB is loadable and Smith's DOI is retracted.
         monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: ("/fake/rw.csv", None))
@@ -243,6 +244,271 @@ class TestPlan:
 
 
 # ===========================================================================
+# Coverage: in_library must fall back DOI → PMID → normalized-title (Bug 1).
+#
+# A real shared library has many items WITHOUT a DOI in their index entry. A
+# DOI-only presence test false-flags those present refs as "missing", and a
+# confident --apply would then MASS-DUPLICATE the shared group library.
+# ===========================================================================
+
+# A PMID-only metadata (no DOI) — the resolver carries the PMID forward.
+PMID_META = {
+    "doi": None,
+    "pmid": "31234567",
+    "title": "A PMID-only present paper",
+    "authors": [{"family": "Pino", "given": "M"}],
+    "year": "2018",
+    "journal": "J",
+    "type": "article-journal",
+}
+
+# A title-only metadata (no DOI, no PMID).
+TITLE_META = {
+    "doi": None,
+    "pmid": None,
+    "title": "A title-only present paper",
+    "authors": [{"family": "Tito", "given": "T"}],
+    "year": "2017",
+    "journal": "J",
+    "type": "article-journal",
+}
+
+
+def _fake_resolve_idfallback(text, *, fetch=True):
+    """Resolve four works by substring: a DOI ref (Smith), a PMID-only ref, a
+    title-only ref, and a genuinely-absent ref (Ghost)."""
+    t = text.lower()
+    if "smith" in t and "2020" in t:
+        return {
+            "input": text, "metadata": dict(SMITH), "confidence": "high",
+            "source": "doi",
+            "candidates": [{**SMITH, "score": 90.0}],
+            "identifiers": {"doi": "10.1/smith2020", "pmid": None, "arxiv": None, "isbn": None},
+        }
+    if "pmid-only" in t:
+        return {
+            "input": text, "metadata": dict(PMID_META), "confidence": "high",
+            "source": "pmid",
+            "candidates": [{**PMID_META, "score": 90.0}],
+            # identifiers also carries the pmid (input string bore one)
+            "identifiers": {"doi": None, "pmid": "31234567", "arxiv": None, "isbn": None},
+        }
+    if "title-only" in t:
+        return {
+            "input": text, "metadata": dict(TITLE_META), "confidence": "high",
+            "source": "crossref",
+            "candidates": [{**TITLE_META, "score": 90.0}],
+            "identifiers": {"doi": None, "pmid": None, "arxiv": None, "isbn": None},
+        }
+    # Ghost: resolvable metadata but NOT in the library by any key → missing.
+    return {
+        "input": text, "metadata": _meta("10.9/ghost", "An absent ghost paper", "Ghost", "2099"),
+        "confidence": "high", "source": "doi",
+        "candidates": [],
+        "identifiers": {"doi": "10.9/ghost", "pmid": None, "arxiv": None, "isbn": None},
+    }
+
+
+class TestCoverageFallback:
+    @pytest.fixture()
+    def four_ref_doc(self, tmp_path: Path) -> Path:
+        p = tmp_path / "fourref.docx"
+        new_doc(p, [
+            "Sentence A [1].",
+            "Sentence B [2].",
+            "Sentence C [3].",
+            "Sentence D [4].",
+            "References",
+            "1. Smith J. Tuberous sclerosis and autism. J Neurol. 2020;10:1-5.",
+            "2. A pmid-only present paper. J. 2018.",
+            "3. A title-only present paper. J. 2017.",
+            "4. An absent ghost paper. J. 2099.",
+        ])
+        return p
+
+    def _patch(self, monkeypatch, lib_index):
+        monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve_idfallback)
+        monkeypatch.setattr(unify.zotero, "library_index", lambda **kw: lib_index)
+        monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: (None, None))
+
+    def test_pmid_match_reads_in_library(self, four_ref_doc, monkeypatch):
+        """A ref with a PMID but no DOI, present in the library by PMID, reads
+        in_library=True and is NOT counted missing."""
+        lib_index = {"doi": {}, "pmid": {"31234567": "PMIDKEY"}, "title": {}}
+        self._patch(monkeypatch, lib_index)
+        plan = unify.plan_unification(four_ref_doc)
+        by_title = {r["metadata"]["title"]: r for r in plan["references"] if r.get("metadata")}
+        pino = by_title["A PMID-only present paper"]
+        assert pino["in_library"] is True
+        assert pino["existing_key"] == "PMIDKEY"
+
+    def test_title_match_reads_in_library(self, four_ref_doc, monkeypatch):
+        """A ref with neither DOI nor PMID matches by normalized title."""
+        nt = unify.zotero._normalize_title("A title-only present paper")
+        lib_index = {"doi": {}, "pmid": {}, "title": {nt: "TITLEKEY"}}
+        self._patch(monkeypatch, lib_index)
+        plan = unify.plan_unification(four_ref_doc)
+        by_title = {r["metadata"]["title"]: r for r in plan["references"] if r.get("metadata")}
+        tito = by_title["A title-only present paper"]
+        assert tito["in_library"] is True
+        assert tito["existing_key"] == "TITLEKEY"
+
+    def test_doi_match_still_works(self, four_ref_doc, monkeypatch):
+        """DOI match (the original path) is unbroken."""
+        lib_index = {"doi": {"10.1/smith2020": "SMITHKEY"}, "pmid": {}, "title": {}}
+        self._patch(monkeypatch, lib_index)
+        plan = unify.plan_unification(four_ref_doc)
+        by_title = {r["metadata"]["title"]: r for r in plan["references"] if r.get("metadata")}
+        smith = by_title["Tuberous sclerosis and autism"]
+        assert smith["in_library"] is True
+        assert smith["existing_key"] == "SMITHKEY"
+
+    def test_genuinely_absent_ref_counted_missing(self, four_ref_doc, monkeypatch):
+        """A ref absent by DOI, PMID, and title is still flagged missing."""
+        lib_index = {"doi": {}, "pmid": {}, "title": {}}
+        self._patch(monkeypatch, lib_index)
+        plan = unify.plan_unification(four_ref_doc)
+        by_title = {r["metadata"]["title"]: r for r in plan["references"] if r.get("metadata")}
+        ghost = by_title["An absent ghost paper"]
+        assert ghost["in_library"] is False
+        assert ghost["existing_key"] is None
+
+    def test_dangerous_path_teeth_zero_missing_no_create(self, tmp_path, monkeypatch):
+        """TEETH: 5 present refs that LACK DOIs but match by PMID/title → plan
+        reports 0 missing (a DOI-only test would report 5), and the apply path
+        creates 0 items. Mutation-confirm: reverting the fallback flags them
+        missing again (asserted by test_mutation_doi_only_flags_all_missing)."""
+        refs = [
+            ("A pmid-only present paper", "31234567"),   # by PMID
+            ("Second pmid present", "31000002"),         # by PMID
+            ("A title-only present paper", None),         # by title
+            ("Second title present", None),              # by title
+            ("Third title present", None),              # by title
+        ]
+        # Build a doc whose reflist names all five (one per line).
+        lines = ["Body text [1][2][3][4][5].", "References"] + [
+            f"{i+1}. {name}. J. 2019." for i, (name, _) in enumerate(refs)
+        ]
+        p = tmp_path / "fivepresent.docx"
+        new_doc(p, lines)
+
+        # Resolver: each named ref → metadata with NO doi (pmid set when given).
+        def _resolve(text, *, fetch=True):
+            t = text.lower()
+            for name, pmid in refs:
+                if name.lower() in t:
+                    meta = {
+                        "doi": None, "pmid": pmid, "title": name,
+                        "authors": [{"family": "X", "given": "Y"}],
+                        "year": "2019", "journal": "J", "type": "article-journal",
+                    }
+                    return {
+                        "input": text, "metadata": meta, "confidence": "high",
+                        "source": "pmid" if pmid else "crossref", "candidates": [],
+                        "identifiers": {"doi": None, "pmid": pmid, "arxiv": None, "isbn": None},
+                    }
+            return {
+                "input": text, "metadata": None, "confidence": "none",
+                "source": None, "candidates": [],
+                "identifiers": {"doi": None, "pmid": None, "arxiv": None, "isbn": None},
+            }
+
+        # Library: all five present — two by PMID, three by normalized title.
+        lib_index = {
+            "doi": {},
+            "pmid": {"31234567": "PK1", "31000002": "PK2"},
+            "title": {
+                unify.zotero._normalize_title("A title-only present paper"): "TK1",
+                unify.zotero._normalize_title("Second title present"): "TK2",
+                unify.zotero._normalize_title("Third title present"): "TK3",
+            },
+        }
+        monkeypatch.setattr(unify.refresolve, "resolve_reference", _resolve)
+        monkeypatch.setattr(unify.zotero, "library_index", lambda **kw: lib_index)
+        monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: (None, None))
+
+        plan = unify.plan_unification(p)
+        assert plan["summary"]["n_missing"] == 0, (
+            "all five present-but-DOI-less refs must read in_library; "
+            f"got n_missing={plan['summary']['n_missing']}"
+        )
+        assert plan["summary"]["n_in_library"] == 5
+
+        # Apply: create_items must be asked to create 0 of them (every accepted
+        # ref already has an existing_key). Record any create call.
+        creates = []
+        monkeypatch.setattr(
+            unify.zotero, "create_items",
+            lambda metas, **k: creates.append(metas) or {
+                "created": [], "skipped_existing": [], "failed": []},
+        )
+        monkeypatch.setattr(unify.zotero, "key_can_write_status", lambda: True)
+        monkeypatch.setattr(unify.zotero, "key_can_write", lambda: True)
+        monkeypatch.setattr(unify.zotero, "item_uri", lambda key: "http://x/" + key)
+        monkeypatch.setattr(unify.zoterofield, "replace_text_with_zotero_field",
+                            lambda doc, *a, **k: doc)
+
+        out = tmp_path / "out.docx"
+        unify.apply_unification(
+            p, plan, {"accept": [0, 1, 2, 3, 4], "add_missing": True}, out=out, track=True,
+        )
+        flat_created = [m for batch in creates for m in batch]
+        assert flat_created == [], (
+            f"apply must create 0 items (all present); attempted: {flat_created}"
+        )
+
+    def test_mutation_doi_only_flags_all_missing(self, tmp_path, monkeypatch):
+        """MUTATION GUARD: emulate the OLD DOI-only test by feeding a lib_index
+        whose pmid/title maps are EMPTY (so only the DOI path can match). The
+        five present-but-DOI-less refs are then ALL flagged missing — proving the
+        teeth test above fails without the PMID/title fallback."""
+        refs = [
+            ("A pmid-only present paper", "31234567"),
+            ("Second pmid present", "31000002"),
+            ("A title-only present paper", None),
+            ("Second title present", None),
+            ("Third title present", None),
+        ]
+        lines = ["Body text [1][2][3][4][5].", "References"] + [
+            f"{i+1}. {name}. J. 2019." for i, (name, _) in enumerate(refs)
+        ]
+        p = tmp_path / "fivepresent.docx"
+        new_doc(p, lines)
+
+        def _resolve(text, *, fetch=True):
+            t = text.lower()
+            for name, pmid in refs:
+                if name.lower() in t:
+                    meta = {
+                        "doi": None, "pmid": pmid, "title": name,
+                        "authors": [{"family": "X", "given": "Y"}],
+                        "year": "2019", "journal": "J", "type": "article-journal",
+                    }
+                    return {
+                        "input": text, "metadata": meta, "confidence": "high",
+                        "source": "pmid" if pmid else "crossref", "candidates": [],
+                        "identifiers": {"doi": None, "pmid": pmid, "arxiv": None, "isbn": None},
+                    }
+            return {
+                "input": text, "metadata": None, "confidence": "none",
+                "source": None, "candidates": [],
+                "identifiers": {"doi": None, "pmid": None, "arxiv": None, "isbn": None},
+            }
+
+        # The bug surface: DOI-only knowledge of the library (pmid/title empty).
+        lib_index_doi_only = {"doi": {}, "pmid": {}, "title": {}}
+        monkeypatch.setattr(unify.refresolve, "resolve_reference", _resolve)
+        monkeypatch.setattr(unify.zotero, "library_index", lambda **kw: lib_index_doi_only)
+        monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: (None, None))
+
+        plan = unify.plan_unification(p)
+        assert plan["summary"]["n_missing"] == 5, (
+            "with no PMID/title knowledge the five present refs SHOULD all be "
+            "flagged missing — this is the duplication-risk surface the fallback fixes"
+        )
+
+
+# ===========================================================================
 # apply_unification
 # ===========================================================================
 
@@ -253,7 +519,7 @@ def apply_patches(patched_network, monkeypatch):
     replace_text_with_zotero_field."""
     calls = {"create": [], "insert": []}
 
-    def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, attach_pdfs=False):
+    def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, pmid_index=None, attach_pdfs=False):
         calls["create"].append({"metas": metas, "collection": collection, "tags": tags,
                                 "dedup": dedup, "doi_index": doi_index})
         created = []
@@ -382,8 +648,8 @@ class TestApply:
         """A retracted high/auto ref is flagged and NOT created (auto≠explicit)."""
         monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve)
         monkeypatch.setattr(
-            unify.zotero, "library_doi_index",
-            lambda **kw: {},  # Smith NOT in library so it would otherwise be created
+            unify.zotero, "library_index",
+            lambda **kw: {"doi": {}, "pmid": {}, "title": {}},  # Smith NOT in library so it would otherwise be created
         )
         monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: ("/fake/rw.csv", None))
         monkeypatch.setattr(
@@ -418,7 +684,7 @@ class TestApply:
         def _raise(**kw):
             raise unify.zotero.LibraryUnavailableError("read failed")
 
-        monkeypatch.setattr(unify.zotero, "library_doi_index", _raise)
+        monkeypatch.setattr(unify.zotero, "library_index", _raise)
 
         # create_items / key_can_write must NEVER be reached.
         write_attempts = []
@@ -460,7 +726,7 @@ class TestApply:
         the apply path proceeds to create normally — empty ≠ unavailable."""
         # Empty index: nothing matches, everything missing — but this is a real
         # (readable) empty library, so creation SHOULD proceed.
-        monkeypatch.setattr(unify.zotero, "library_doi_index", lambda **kw: {})
+        monkeypatch.setattr(unify.zotero, "library_index", lambda **kw: {"doi": {}, "pmid": {}, "title": {}})
 
         creates = []
         monkeypatch.setattr(
@@ -494,7 +760,7 @@ class TestApply:
 class TestEmptyDoc:
     def test_empty_plan_and_apply_noop(self, tmp_path, monkeypatch):
         monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve)
-        monkeypatch.setattr(unify.zotero, "library_doi_index", lambda **kw: {})
+        monkeypatch.setattr(unify.zotero, "library_index", lambda **kw: {"doi": {}, "pmid": {}, "title": {}})
         monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: (None, None))
 
         def _no_create(*a, **k):  # pragma: no cover - must not be hit
@@ -572,7 +838,7 @@ class TestOfflineKillSwitch:
                 "offline test: no cache and no network"
             )
 
-        monkeypatch.setattr(unify.zotero, "library_doi_index", _no_network_index)
+        monkeypatch.setattr(unify.zotero, "library_index", _no_network_index)
         monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: (None, None))
 
         # Must not raise.
@@ -596,10 +862,10 @@ class TestOfflineKillSwitch:
             # Fail if it looks like a live-fetch attempt (refresh=True).
             if kw.get("refresh"):
                 raise AssertionError(
-                    "library_doi_index called with refresh=True in offline mode"
+                    "library_index called with refresh=True in offline mode"
                 )
             network_calls.append(kw)
-            return {"10.1/smith2020": "SMITHKEY"}
+            return {"doi": {"10.1/smith2020": "SMITHKEY"}, "pmid": {}, "title": {}}
 
         def _offline_resolve(text, *, fetch=True):
             if fetch:
@@ -609,15 +875,15 @@ class TestOfflineKillSwitch:
             return _fake_resolve(text, fetch=False)
 
         monkeypatch.setattr(unify.refresolve, "resolve_reference", _offline_resolve)
-        monkeypatch.setattr(unify.zotero, "library_doi_index", _cached_doi_index)
+        monkeypatch.setattr(unify.zotero, "library_index", _cached_doi_index)
         monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: (None, None))
 
         plan = unify.plan_unification(draft, offline=True)
 
-        # library_doi_index was called with max_age_hours=inf (cache-only intent).
-        assert network_calls, "expected library_doi_index to be called once"
+        # library_index was called with max_age_hours=inf (cache-only intent).
+        assert network_calls, "expected library_index to be called once"
         assert network_calls[0].get("max_age_hours") == float("inf"), (
-            "offline=True must pass max_age_hours=inf to library_doi_index"
+            "offline=True must pass max_age_hours=inf to library_index"
         )
         # Smith is found in the cache-served DOI index.
         refs = {r["ref_index"]: r for r in plan["references"]}
@@ -645,8 +911,8 @@ class TestOfflineKillSwitch:
 
         monkeypatch.setattr(unify.refresolve, "resolve_reference", _recording_resolve)
         monkeypatch.setattr(
-            unify.zotero, "library_doi_index",
-            lambda **kw: {},
+            unify.zotero, "library_index",
+            lambda **kw: {"doi": {}, "pmid": {}, "title": {}},
         )
         monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: (None, None))
 
@@ -766,8 +1032,8 @@ class TestF7Integration:
 
         monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve)
         monkeypatch.setattr(
-            unify.zotero, "library_doi_index",
-            lambda **kw: {"10.1/smith2020": "SMITHKEY"})
+            unify.zotero, "library_index",
+            lambda **kw: {"doi": {"10.1/smith2020": "SMITHKEY"}, "pmid": {}, "title": {}})
         monkeypatch.setattr(unify.citecheck, "ensure_retraction_db",
                             lambda **kw: (None, None))
         monkeypatch.setattr(unify.zotero, "key_can_write_status", lambda: True)
@@ -865,8 +1131,8 @@ class TestLiveFieldGuard:
         # Standard network + write patches (reuse the module-level helpers).
         monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve)
         monkeypatch.setattr(
-            unify.zotero, "library_doi_index",
-            lambda **kw: {"10.1/smith2020": "SMITHKEY"},
+            unify.zotero, "library_index",
+            lambda **kw: {"doi": {"10.1/smith2020": "SMITHKEY"}, "pmid": {}, "title": {}},
         )
         monkeypatch.setattr(unify.citecheck, "ensure_retraction_db",
                             lambda **kw: (None, None))

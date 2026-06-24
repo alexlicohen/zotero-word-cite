@@ -725,6 +725,157 @@ class TestCreateItemsDoiIndex:
         assert "Transient Failure Item" not in posted_titles
         assert sorted(posted_titles) == ["Another Good Item", "Good Item"]
 
+    def test_none_metadata_skipped_not_crashed(self, monkeypatch):
+        """Bug 2: a None entry in ``metas`` must be skipped (not crash on
+        ``meta.get``); valid metas are still processed. A None metadata can't
+        become an item — skip it, don't AttributeError."""
+        monkeypatch.setenv("ZOTERO_API_KEY", "testkey")
+        monkeypatch.setenv("ZOTERO_GROUP_ID", "2504198")
+
+        # No network for dedup: empty index + stubbed title search (None = absent).
+        monkeypatch.setattr(zotero, "_title_exists_in_library", lambda title: None)
+        monkeypatch.setattr(
+            zotero, "fetch_all",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("no fetch_all")),
+        )
+
+        posted_titles = []
+
+        def side_effect(req, timeout=30.0):
+            method = getattr(req, "method", "GET")
+            url = req.full_url
+            if "/keys/" in url:
+                return _fake_response({"access": {"groups": {"all": {"write": True}}}})
+            if "/items" in url and method == "POST":
+                body = json.loads(req.data.decode("utf-8"))
+                for b in body:
+                    posted_titles.append(b.get("title"))
+                successful = {str(i): {"key": f"NEW{i}", "data": b} for i, b in enumerate(body)}
+                return _fake_response({"successful": successful, "unchanged": {}, "failed": {}})
+            return _fake_response([], headers={"Total-Results": "0"})
+
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            # None entry is interleaved with a valid one — must NOT crash.
+            result = zotero.create_items([None, META_NEW], dedup=True, doi_index={})
+
+        # The None was silently dropped; the valid meta was created.
+        assert len(result["created"]) == 1
+        assert result["created"][0]["title"] == "Brand New Article"
+        assert result["failed"] == []
+        assert posted_titles == ["Brand New Article"]
+
+    def test_all_none_metadata_returns_empty_no_write(self, monkeypatch):
+        """A metas list of only None entries returns the empty result WITHOUT a
+        write-permission probe or any POST (degenerate after the None-skip)."""
+        monkeypatch.setenv("ZOTERO_API_KEY", "testkey")
+        monkeypatch.setenv("ZOTERO_GROUP_ID", "2504198")
+
+        def boom(req, timeout=30.0):
+            raise AssertionError("no network for an all-None metas list")
+
+        with patch("urllib.request.urlopen", side_effect=boom):
+            result = zotero.create_items([None, None], dedup=True)
+
+        assert result == {"created": [], "skipped_existing": [], "failed": []}
+
+    def test_pmid_index_dedups_present_by_pmid(self, monkeypatch):
+        """Bug 2 defense-in-depth: a meta carrying a PMID present in ``pmid_index``
+        is recorded ``skipped_existing`` (never created) even when its DOI/title
+        do NOT match — catches a ref upstream false-flagged 'missing'."""
+        monkeypatch.setenv("ZOTERO_API_KEY", "testkey")
+        monkeypatch.setenv("ZOTERO_GROUP_ID", "2504198")
+
+        # The PMID-present meta has NO doi and a title the library does not know,
+        # so ONLY the PMID path can catch it.
+        meta_pmid_present = {
+            "doi": "",
+            "pmid": "31234567",
+            "title": "A Paper Present Only By PMID",
+            "authors": [{"family": "Pino", "given": "M"}],
+            "year": "2018",
+            "journal": "J",
+            "type": "article-journal",
+        }
+
+        # Title search must say "absent" (proves the PMID path, not title, deduped).
+        title_calls = []
+        monkeypatch.setattr(
+            zotero, "_title_exists_in_library",
+            lambda title: title_calls.append(title) or None,
+        )
+        monkeypatch.setattr(
+            zotero, "fetch_all",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("no fetch_all")),
+        )
+
+        posts = []
+
+        def side_effect(req, timeout=30.0):
+            method = getattr(req, "method", "GET")
+            url = req.full_url
+            if "/keys/" in url:
+                return _fake_response({"access": {"groups": {"all": {"write": True}}}})
+            if "/items" in url and method == "POST":
+                body = json.loads(req.data.decode("utf-8"))
+                posts.append(body)
+                successful = {str(i): {"key": f"NEW{i}", "data": b} for i, b in enumerate(body)}
+                return _fake_response({"successful": successful, "unchanged": {}, "failed": {}})
+            return _fake_response([], headers={"Total-Results": "0"})
+
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            result = zotero.create_items(
+                [meta_pmid_present],
+                dedup=True,
+                doi_index={},
+                pmid_index={"31234567": "PMIDKEY"},
+            )
+
+        # Recorded as existing via the PMID index — NOT created, NEVER posted.
+        assert result["created"] == []
+        assert len(result["skipped_existing"]) == 1
+        assert result["skipped_existing"][0]["existing_key"] == "PMIDKEY"
+        assert posts == [], "a present-by-PMID item must never be POSTed (no duplicate)"
+
+    def test_genuinely_new_meta_created_despite_pmid_index(self, monkeypatch):
+        """Control: a meta whose PMID is NOT in ``pmid_index`` (and absent by DOI
+        and title) is still created — the PMID dedup doesn't over-block."""
+        monkeypatch.setenv("ZOTERO_API_KEY", "testkey")
+        monkeypatch.setenv("ZOTERO_GROUP_ID", "2504198")
+
+        meta_new_pmid = {**META_NEW, "pmid": "99999999"}
+
+        monkeypatch.setattr(zotero, "_title_exists_in_library", lambda title: None)
+        monkeypatch.setattr(
+            zotero, "fetch_all",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("no fetch_all")),
+        )
+
+        posted = []
+
+        def side_effect(req, timeout=30.0):
+            method = getattr(req, "method", "GET")
+            url = req.full_url
+            if "/keys/" in url:
+                return _fake_response({"access": {"groups": {"all": {"write": True}}}})
+            if "/items" in url and method == "POST":
+                body = json.loads(req.data.decode("utf-8"))
+                posted.extend(b.get("title") for b in body)
+                successful = {str(i): {"key": f"NEW{i}", "data": b} for i, b in enumerate(body)}
+                return _fake_response({"successful": successful, "unchanged": {}, "failed": {}})
+            return _fake_response([], headers={"Total-Results": "0"})
+
+        with patch("urllib.request.urlopen", side_effect=side_effect):
+            result = zotero.create_items(
+                [meta_new_pmid],
+                dedup=True,
+                doi_index={},
+                pmid_index={"31234567": "OTHERKEY"},  # different PMID
+            )
+
+        assert len(result["created"]) == 1
+        assert result["created"][0]["title"] == "Brand New Article"
+        assert posted == ["Brand New Article"]
+
 
 # ---------------------------------------------------------------------------
 # F8 — transient-failure retry in the zotero GET/POST primitives.
