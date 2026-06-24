@@ -35,6 +35,13 @@ from typing import List, Optional
 from lxml import etree
 
 from . import textpatterns
+from .textpatterns import (
+    ALLCAPS_TOKEN,
+    AUTHOR_INITIALS,
+    AUTHOR_PARTICLE,
+    CAP_WORD,
+    REF_SECTION_LABEL,
+)
 from .citeconvert import classify_citation_sources
 from .docxio import DOCUMENT, Docx
 from .ooxml import NS, qn
@@ -119,19 +126,32 @@ _YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
 # (recall-superset of the old local copy; verified behaviour-preserving here).
 _ENUM_RE = textpatterns.NUMBERED_REF_RE
 
-# A surname token: a capital-initial word, optionally preceded by a lowercase
-# nobiliary particle (van / von / de / der / del / di / da / la / le / dos /
-# bin / al / mac / mc ...), e.g. "van der Berg", "de la Cruz".  Used as the
-# leading-author building block for both the multi-author list pattern and the
-# single-author bibliographic-entry pattern.
-_PARTICLE = r"(?:(?:van|von|de|der|den|del|della|di|da|das|dos|du|la|le|lo|el|al|bin|ibn|mac|mc|st|ter|ten|ten)\s+){0,3}"
-_SURNAME = r"[A-Z][A-Za-z'\-]+"
-_INITIALS = r"[A-Z](?:\.?\s*[A-Z]){0,3}\.?"  # "JA" / "J.A." / "J A" / "J"
+# Author-byline building blocks.  The genuinely-identical fragments
+# (``AUTHOR_PARTICLE`` / ``AUTHOR_INITIALS`` / ``REF_SECTION_LABEL`` / ``CAP_WORD``
+# / ``ALLCAPS_TOKEN``) now live in the shared ``textpatterns`` module as the
+# single owner; ``sections`` imports the same fragments so the two author-start
+# recognisers cannot drift.  The COMPILED head patterns stay LOCAL because their
+# shapes differ deliberately (here: initials OPTIONAL, leading ``\s*``).
+#
+# ``_PARTICLE``: a capital-initial surname optionally preceded by up to three
+# lowercase nobiliary particles (van / von / de / der / del / di / da / la / le /
+# dos / bin / al / mac / mc ...), e.g. "van der Berg", "de la Cruz".  (The shared
+# fragment de-duplicates the historical ``ten|ten`` — inert, behaviour-preserving.)
+#
+# ``_SURNAME`` is kept LOCAL (not shared): unlike ``sections._SURNAME`` it does
+# NOT include the curly apostrophe ``’``.  That one character is NOT inert — it
+# would flip ``_is_reference_shaped("O’Brien AL. … 2022.")`` from False to True —
+# so the surname class is deliberately divergent and stays module-local.
+_PARTICLE = AUTHOR_PARTICLE
+_SURNAME = r"[A-Z][A-Za-z'\-]+"  # local: does NOT include curly apostrophe ’ (see above)
+_INITIALS = AUTHOR_INITIALS  # "JA" / "J.A." / "J A" / "J"
 
 # Author-year list pattern: starts with "Surname AB," or "Surname AB and"
 # Captures multi-author formats like "Smith AB, Jones CD, ..." / "Smith A, Jones
 # B." / "van der Berg H, ...".  Lowercase nobiliary particles are now permitted
-# in the leading surname so "van der Berg H, ..." is recognised.
+# in the leading surname so "van der Berg H, ..." is recognised.  Shape: initials
+# OPTIONAL, leading ``\s*`` allowed (contrast ``sections._AUTHOR_HEAD_RE``, which
+# REQUIRES initials and anchors ``^`` with no leading ``\s*``).
 _AUTHOR_LIST_START_RE = re.compile(
     rf"^\s*{_PARTICLE}{_SURNAME}(?:\s+{_INITIALS})?(?:\s*,|\s+and\b|\s+&)"
 )
@@ -142,18 +162,9 @@ _AUTHOR_LIST_START_RE = re.compile(
 # in 2022 ...").  The old organizational branch matched any "Capitalized words."
 # lead-in, so such prose was wrongly classed as reference-shaped whenever a year
 # happened to appear later in the line.  This negative-lookahead set excludes the
-# common labels so they can never satisfy the organizational author shape.
-_SECTION_LABEL_RE = (
-    r"(?:Methods|Results|Background|Conclusions?|Discussion|Funding|Introduction"
-    r"|Materials|Acknowledge?ments?|Data\s+Availability|Abstract"
-    r"|Significance|Summary|Limitations?|Objectives?|Aims?|Hypothes[ei]s"
-    # Post-reference sections that frequently open with a 'Label.' lead-in in
-    # author manuscripts / PDF→docx and must never read as an author field.
-    r"|Disclosures?|Author\s+Information|Author\s+Contributions?"
-    r"|Additional\s+Information|Supporting\s+Information"
-    r"|Competing\s+(?:Financial\s+)?Interests?|Conflicts?\s+of\s+Interest"
-    r"|Online\s+Methods|Extended\s+Data|Correspondence|Footnotes?|Endnotes?)"
-)
+# common labels so they can never satisfy the organizational author shape.  Now
+# the shared ``REF_SECTION_LABEL`` (single owner; sections imports it too).
+_SECTION_LABEL_RE = REF_SECTION_LABEL
 
 # Single-author / organizational bibliographic-entry start — the broader bar for
 # heading-less reflists that have NO comma/and/& after the first surname:
@@ -172,8 +183,8 @@ _SECTION_LABEL_RE = (
 #       least TWO capitalized words ('World Health Organization', 'International
 #       League Against Epilepsy') — a lone 'Capitalizedword.' (sentence-case
 #       prose like 'Background.' / 'Patients.') no longer qualifies.
-_CAP_WORD = r"[A-Z][A-Za-z&'\-]*"      # a capitalized word
-_ALLCAPS_TOKEN = r"[A-Z][A-Z&'\-]+"    # an acronym / ALLCAPS token (≥2 chars)
+_CAP_WORD = CAP_WORD          # a capitalized word
+_ALLCAPS_TOKEN = ALLCAPS_TOKEN  # an acronym / ALLCAPS token (≥2 chars)
 _REF_AUTHOR_START_RE = re.compile(
     rf"^\s*(?:"
     rf"{_PARTICLE}{_SURNAME}\s+{_INITIALS}\."          # Smith JA.  /  van der Berg H.
@@ -627,9 +638,11 @@ def extract_references(path) -> dict:
         # Skip the heading paragraph and the reflist region
         if pi in reflist_para_indices:
             continue
-        # Skip paragraphs already classified as manual references (they are in fields)
-        if pi in manual_para_indices:
-            continue
+        # NOTE: manual_para_indices (body-level hand-typed inline citations) are
+        # NOT skipped here. Prior to the GF-5 fix, _detect_manual_refs only found
+        # bibliography entries (which legitimately don't need intext scanning). Now
+        # it finds body-level parenthetical cites, which ARE intext signals we want
+        # to report. Skipping them here was wrong and is removed.
 
         txt = _para_accepted_text(p)
         if not txt.strip():

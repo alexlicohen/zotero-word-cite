@@ -30,6 +30,24 @@ def _has_ancestor(node: etree._Element, localname: str, root: etree._Element) ->
     return False
 
 
+def _in_fallback(node: etree._Element, root: etree._Element) -> bool:
+    """True if *node* sits inside an ``mc:Fallback`` subtree.
+
+    An ``mc:AlternateContent`` block stores the same content twice (a modern
+    ``mc:Choice`` and a legacy ``mc:Fallback`` — e.g. a DrawingML textbox plus its
+    VML fallback). Markup-compatibility says a consumer uses the Choice and IGNORES
+    the Fallback, never both, so text under ``mc:Fallback`` must be dropped from
+    every view — otherwise such textbox text (and its word count) is doubled.
+    """
+    target = qn("mc:Fallback")
+    p = node.getparent()
+    while p is not None and p is not root:
+        if p.tag == target:
+            return True
+        p = p.getparent()
+    return False
+
+
 def _extract(root: etree._Element, mode: str) -> str:
     out = []
     t_tag, del_tag = "{%s}t" % W, "{%s}delText" % W
@@ -38,6 +56,8 @@ def _extract(root: etree._Element, mode: str) -> str:
     for node in root.iter():
         tag = node.tag
         if tag == t_tag:
+            if _in_fallback(node, root):
+                continue
             if mode == "accepted" and _has_ancestor(node, "del", root):
                 continue
             if mode == "rejected" and _has_ancestor(node, "ins", root):
@@ -53,6 +73,8 @@ def _extract(root: etree._Element, mode: str) -> str:
         elif tag == del_tag:
             if mode == "accepted":
                 continue
+            if _in_fallback(node, root):
+                continue
             # Insert-then-deleted text (<w:ins><w:del><w:delText>): rejecting all
             # changes removes the insertion entirely, so it must not appear in the
             # rejected view. (raw still shows it.)
@@ -60,10 +82,18 @@ def _extract(root: etree._Element, mode: str) -> str:
                 continue
             out.append(node.text or "")
         elif tag == tab_tag:
+            if _in_fallback(node, root):
+                continue
             out.append("\t")
         elif tag in br_tags:
+            if _in_fallback(node, root):
+                continue
             out.append("\n")
         elif tag == p_tag:
+            # An mc:Fallback's inner <w:p> (a VML textbox paragraph) duplicates a
+            # Choice paragraph already emitted, so it must not add another newline.
+            if _in_fallback(node, root):
+                continue
             out.append("\n")
     return "".join(out)
 

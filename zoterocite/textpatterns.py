@@ -401,6 +401,66 @@ def extract_pmids(text: str) -> list[str]:
 PMCID_RE = re.compile(r"PMC\d+", re.IGNORECASE)
 
 
+# ---------------------------------------------------------------------------
+# Author-byline building blocks (shared by sections.py and refextract.py)
+# ---------------------------------------------------------------------------
+# These are the genuinely-identical *fragments* of the author-head recognisers
+# that ``sections.py`` (the body/reference *boundary* predicate
+# ``is_citation_line``) and ``refextract.py`` (the reference *extractor*
+# ``_is_reference_shaped``) each previously open-coded.  They are exported as
+# RAW STRING fragments — NOT compiled regexes — because each consumer assembles
+# them into its own compiled head pattern with a DELIBERATELY different shape
+# (initials-required vs -optional, leading ``\s*`` vs anchored ``^``).  Sharing
+# the compiled heads would erase those tuned differences; sharing the fragments
+# removes the duplication while keeping each head's distinct behaviour local.
+#
+# NOTE on what is NOT shared here: the leading-surname class differs between the
+# two modules by ONE character — ``sections`` includes the curly apostrophe
+# ``’`` ("O’Brien"), ``refextract`` does not.  That curly apostrophe is NOT
+# inert: it flips ``is_citation_line("O’Brien AL. … 2022.")`` (True) versus
+# ``refextract._is_reference_shaped`` (False, surname fails so the single-author
+# branch never fires and the org branch rejects it).  Because canonicalising the
+# surname class WOULD change a match decision, each module keeps its own
+# ``_SURNAME`` local; only the behaviour-neutral fragments live here.
+
+# Optional nobiliary-particle prefix ("van der ", "de la ", "ten ") — up to 3
+# lowercase particles before the surname.  Canonical single-source: ``sections``
+# and ``refextract`` carried byte-identical copies except that refextract's had a
+# duplicated ``ten|ten`` alternative.  A duplicate alternative in an alternation
+# is inert (it cannot change the matched language), so the de-duplicated form
+# below is behaviour-preserving for BOTH consumers (verified: every probe yields
+# the identical match decision with one ``ten`` vs two).
+AUTHOR_PARTICLE = (
+    r"(?:(?:van|von|de|der|den|del|della|di|da|das|dos|du|la|le|lo|el|al"
+    r"|bin|ibn|mac|mc|st|ter|ten)\s+){0,3}"
+)
+
+# Author initials field: "JA" / "J.A." / "J A" / "J" (1-4 initials, optional
+# dots/spaces, optional trailing dot).  Byte-identical in both modules.
+AUTHOR_INITIALS = r"[A-Z](?:\.?\s*[A-Z]){0,3}\.?"
+
+# Sentence-case section labels that are prose lead-ins, NOT author fields.  Used
+# as a negative-lookahead in the organisation/consortium author branch of both
+# modules' single-author head, so a "Methods." / "Data Availability." lead-in
+# can never satisfy the organisation-author shape just because two capitalised
+# words and a year appear on the line.  Byte-identical in both modules.
+REF_SECTION_LABEL = (
+    r"(?:Methods|Results|Background|Conclusions?|Discussion|Funding|Introduction"
+    r"|Materials|Acknowledge?ments?|Data\s+Availability|Abstract"
+    r"|Significance|Summary|Limitations?|Objectives?|Aims?|Hypothes[ei]s"
+    r"|Disclosures?|Author\s+Information|Author\s+Contributions?"
+    r"|Additional\s+Information|Supporting\s+Information"
+    r"|Competing\s+(?:Financial\s+)?Interests?|Conflicts?\s+of\s+Interest"
+    r"|Online\s+Methods|Extended\s+Data|Correspondence|Footnotes?|Endnotes?)"
+)
+
+# A capitalised word, and an ALLCAPS / acronym token (>=2 chars) — building
+# blocks of the organisation/consortium author branch ("ENIGMA Consortium.",
+# "World Health Organization.").  Byte-identical in both modules.
+CAP_WORD = r"[A-Z][A-Za-z&'\-]*"      # a capitalised word
+ALLCAPS_TOKEN = r"[A-Z][A-Z&'\-]+"    # an acronym / ALLCAPS token (>=2 chars)
+
+
 def jaccard(a: set, b: set) -> float:
     """Jaccard similarity |A ∩ B| / |A ∪ B| with empty-set guard.
 

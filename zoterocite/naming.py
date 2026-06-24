@@ -27,9 +27,19 @@ def convention_name(
 
 
 def rename_to_convention(path: str | Path, *, apply: bool = False, **fields) -> Path:
+    """Return the convention-name destination path; rename on disk when *apply* is True.
+
+    Raises :exc:`FileExistsError` if the destination exists and is not the same
+    file as the source (same guard as ``cmd_rename`` — no silent overwrites).
+    """
     path = Path(path)
     fields.setdefault("ext", path.suffix or ".docx")
     new = path.with_name(convention_name(**fields))
     if apply and new != path:
+        if new.exists() and new.resolve() != path.resolve():
+            raise FileExistsError(
+                f"refusing to rename: target {new.name!r} already exists and "
+                "renaming would overwrite it — move or remove it first"
+            )
         path.rename(new)
     return new

@@ -28,6 +28,12 @@ NS = {
     "ct": "http://schemas.openxmlformats.org/package/2006/content-types",
     "pr": "http://schemas.openxmlformats.org/package/2006/relationships",
     "xml": "http://www.w3.org/XML/1998/namespace",
+    # Markup Compatibility & Extensibility. An mc:AlternateContent block holds a
+    # modern mc:Choice and a legacy mc:Fallback that encode the SAME content (e.g. a
+    # DrawingML textbox + its VML fallback). A consumer that understands the Choice
+    # uses it and IGNORES the Fallback — never both — so text iteration must drop the
+    # mc:Fallback subtree or every such textbox's text is read twice.
+    "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
 }
 
 # Content-type + relationship-type constants for the comment parts.

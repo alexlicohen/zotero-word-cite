@@ -453,3 +453,112 @@ class TestJaccardDelegation:
         )
         assert calls, "refresolve._title_overlap did not call textpatterns.jaccard"
         assert 0.0 < result < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Author-byline building blocks — the shared FRAGMENTS consolidated from
+# sections.py and refextract.py.  These are raw string fragments (not compiled
+# regexes); each consumer assembles its own head pattern from them.  The tests
+# below assert (a) the fragments compile, (b) they match their canonical author
+# forms, and (c) sections / refextract actually import and reuse them (single
+# owner — no silent re-divergence).
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+from zoterocite.textpatterns import (
+    ALLCAPS_TOKEN,
+    AUTHOR_INITIALS,
+    AUTHOR_PARTICLE,
+    CAP_WORD,
+    REF_SECTION_LABEL,
+)
+
+
+class TestAuthorBylineFragments:
+    def test_fragments_compile(self):
+        # Each fragment must be a valid sub-pattern on its own / in an anchor.
+        for frag in (
+            AUTHOR_PARTICLE,
+            AUTHOR_INITIALS,
+            REF_SECTION_LABEL,
+            CAP_WORD,
+            ALLCAPS_TOKEN,
+        ):
+            _re.compile(frag)
+            # also usable when anchored / concatenated
+            _re.compile(r"^" + frag)
+
+    def test_author_initials_canonical_forms(self):
+        rx = _re.compile(r"^" + AUTHOR_INITIALS + r"$")
+        for ini in ("JA", "J.A.", "J A", "J", "ABC", "A.B.C."):
+            assert rx.match(ini), ini
+        # lowercase is not an initials field
+        assert not rx.match("ja")
+
+    def test_author_particle_optional_and_chained(self):
+        # AUTHOR_PARTICLE is OPTIONAL (zero particles allowed) and chains up to 3.
+        sur = r"[A-Z][A-Za-z'\-]+"
+        rx = _re.compile(r"^" + AUTHOR_PARTICLE + sur + r"\b")
+        assert rx.match("Berg")            # zero particles
+        assert rx.match("van der Berg")    # two particles
+        assert rx.match("de la Cruz")      # two particles
+        assert rx.match("ten Berg")        # single 'ten'
+
+    def test_author_particle_dedupes_ten(self):
+        # The de-duplicated 'ten' alternative is behaviour-neutral: a single 'ten'
+        # particle still matches, exactly as the historical 'ten|ten' did.
+        assert "ten|ten" not in AUTHOR_PARTICLE
+        sur = r"[A-Z][A-Za-z'\-]+"
+        rx = _re.compile(r"^" + AUTHOR_PARTICLE + sur + r"\b")
+        assert rx.match("ten Berg")
+        assert rx.match("ten ten Berg")
+
+    def test_ref_section_label_matches_prose_leadins(self):
+        rx = _re.compile(r"^" + REF_SECTION_LABEL + r"\.")
+        for lbl in (
+            "Methods.",
+            "Results.",
+            "Data Availability.",
+            "Author Contributions.",
+            "Conflicts of Interest.",
+            "Online Methods.",
+        ):
+            assert rx.match(lbl), lbl
+
+    def test_cap_word_and_allcaps_token(self):
+        cap = _re.compile(r"^" + CAP_WORD + r"$")
+        allcaps = _re.compile(r"^" + ALLCAPS_TOKEN + r"$")
+        assert cap.match("World")
+        assert cap.match("Health")
+        assert allcaps.match("ENIGMA")
+        assert allcaps.match("WHO")
+        # ALLCAPS_TOKEN requires >=2 chars and no lowercase
+        assert not allcaps.match("A")
+        assert not allcaps.match("Enigma")
+
+    def test_sections_and_refextract_reuse_shared_fragments(self):
+        # Single-owner guarantee: both modules import the SAME object for the
+        # genuinely-identical fragments (identity, not just equality).
+        from zoterocite import sections as S
+        from zoterocite import refextract as R
+
+        assert S._PARTICLE is AUTHOR_PARTICLE
+        assert R._PARTICLE is AUTHOR_PARTICLE
+        assert S._INITIALS is AUTHOR_INITIALS
+        assert R._INITIALS is AUTHOR_INITIALS
+        assert S._SECTION_LABEL_RE is REF_SECTION_LABEL
+        assert R._SECTION_LABEL_RE is REF_SECTION_LABEL
+        assert S._CAP_WORD is CAP_WORD and R._CAP_WORD is CAP_WORD
+        assert S._ALLCAPS_TOKEN is ALLCAPS_TOKEN and R._ALLCAPS_TOKEN is ALLCAPS_TOKEN
+
+    def test_surname_divergence_is_intentional(self):
+        # _SURNAME is deliberately NOT shared: sections includes the curly
+        # apostrophe, refextract does not.  Guard the divergence so a future
+        # "tidy-up" that unifies them is caught (it WOULD change a match decision).
+        from zoterocite import sections as S
+        from zoterocite import refextract as R
+
+        assert "’" in S._SURNAME
+        assert "’" not in R._SURNAME
+        assert S._SURNAME != R._SURNAME

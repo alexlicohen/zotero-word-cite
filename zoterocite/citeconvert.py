@@ -44,7 +44,7 @@ from .docxio import DOCUMENT, Docx
 from .findings import Finding
 from .ooxml import NS, qn
 from .paras import iter_paragraphs, paragraph_text
-from .sections import REFERENCES_HEADING_RE
+from .sections import REFERENCES_HEADING_RE, split_body_vs_references
 from .zoterofield import replace_field_with_zotero, _field_codes
 
 W = NS["w"]
@@ -63,7 +63,16 @@ _REF_HEADING_RE = REFERENCES_HEADING_RE
 # "(1)" and spaced-bracket forms; verified behaviour-preserving for the manual-
 # reference detector by the test suite).
 _NUMBERED_REF_RE = textpatterns.NUMBERED_REF_RE
-_AUTHOR_YEAR_REF_RE = re.compile(r"[A-Z][A-Za-z'’-]+,?\s+[A-Z].*\b(19|20)\d{2}\b")
+# Genuine INLINE citation shapes in body text — parenthetical author-year markers
+# such as "(Smith et al., 2020)" or "(Smith, 2020)".  Requires a parenthetical
+# opening so plain narrative sentences that merely contain a year (e.g. "The
+# trial began in 2015...") do NOT trigger.  A DOI/PMID in body text is caught
+# upstream via _DOI_RE in _detect_manual_refs.
+_INLINE_CITE_RE = re.compile(
+    r"\(\s*[A-Z][A-Za-z’\-]+(?:\s+et\s+al\.?)?(?:,\s*[A-Z][A-Za-z’\-]+)*"
+    r",?\s*(19|20)\d{2}\s*\)",
+    re.IGNORECASE,
+)
 
 MANAGERS = ("zotero", "mendeley", "endnote", "word", "manual")
 CONVERTIBLE = ("endnote", "mendeley", "word")
@@ -507,31 +516,43 @@ def _paragraphs_with_fields(root: etree._Element) -> List[etree._Element]:
 
 
 def _detect_manual_refs(root: etree._Element) -> List[dict]:
-    """Find suspected manual/unmanaged reference lines.
+    """Find suspected manual/unmanaged reference lines in the document BODY only.
 
-    Region heuristic: paragraphs AFTER a References/Bibliography/Works-Cited
-    heading. Line heuristic: numbered ("1. ", "[1] ") or author-year lines that
-    carry NO citation field. Returns descriptors with best-effort doi/title and
+    Problem B fix: uses split_body_vs_references to restrict the scan to body
+    paragraphs, preventing the document's own rendered bibliography from being
+    flagged as "unmanaged references — add to Zotero and re-cite."
+
+    Line heuristic (Problem A fix): a body paragraph is flagged only when it
+    carries a genuine citation shape with no citation field —
+      * a numbered-list entry matching _NUMBERED_REF_RE, OR
+      * a parenthetical inline author-year marker "(Author..., YEAR)" matching
+        _INLINE_CITE_RE (a DOI/PMID alone also counts, via _DOI_RE below).
+    A sentence that merely contains a 4-digit year ("The trial began in 2015")
+    does NOT trigger. Returns descriptors with best-effort doi/title and
     ``low_confidence=True``.
     """
-    paras = iter_paragraphs(root)
+    all_para_elems = list(iter_paragraphs(root))
+    all_para_texts = [paragraph_text(p).strip() for p in all_para_elems]
+
+    # Restrict to body (drop the rendered bibliography — it's output, not inline).
+    body_texts, _ = split_body_vs_references(all_para_texts)
+    body_limit = len(body_texts)  # first ref-section index (or len if no refs found)
+
     field_paras = _paragraphs_with_fields(root)
     out: List[dict] = []
-    in_ref_region = False
-    for pi, p in enumerate(paras):
-        txt = paragraph_text(p).strip()
+    for pi in range(body_limit):
+        p = all_para_elems[pi]
+        txt = all_para_texts[pi]
         if not txt:
-            continue
-        if _REF_HEADING_RE.match(txt):
-            in_ref_region = True
             continue
         has_field = any(p is fp for fp in field_paras)
         if has_field:
             continue
-        looks_like_ref = bool(_NUMBERED_REF_RE.match(txt)) or bool(_AUTHOR_YEAR_REF_RE.search(txt))
-        if not (in_ref_region or looks_like_ref):
-            continue
-        if in_ref_region and len(txt) < 8:
+        # A numbered entry OR a parenthetical inline author-year citation.
+        # A DOI/PMID in body text is detected below via _DOI_RE and also counts.
+        looks_like_inline = bool(_NUMBERED_REF_RE.match(txt)) or bool(_INLINE_CITE_RE.search(txt))
+        has_doi = bool(_DOI_RE.search(txt))
+        if not (looks_like_inline or has_doi):
             continue
         m = _DOI_RE.search(txt)
         doi = _extract_doi(m.group(0)) if m else None

@@ -6,7 +6,7 @@ EndNote / Mendeley / Word / manual references into the user's Zotero library
 (with dedup, completeness, resolution, and retraction checks), and reformat in
 any CSL style (default: ``vancouver-superscript`` = NIH numbered superscript).
 """
-from .docxio import Docx, DocxLoadError, text_of, DOCUMENT
+from .docxio import Docx, DocxLoadError, DOCUMENT
 from .views import read_views, counts
 from .naming import convention_name, rename_to_convention
 from .revisions import (
@@ -52,7 +52,7 @@ from .orcid_api import fetch_orcid_works, fetch_orcid_works_status
 from .icite import fetch_icite, fetch_icite_status
 
 __all__ = [
-    "Docx", "DocxLoadError", "text_of", "DOCUMENT",
+    "Docx", "DocxLoadError", "DOCUMENT",
     "read_views", "counts",
     "convention_name", "rename_to_convention",
     "tracked_insert", "tracked_replace_paragraph", "tracked_replace_paragraphs",

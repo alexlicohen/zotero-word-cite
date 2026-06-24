@@ -67,6 +67,14 @@ from typing import List, Optional, Pattern, Sequence, Union
 from .docxio import DOCUMENT, Docx
 from .ooxml import qn
 from .paras import iter_paragraphs, paragraph_text
+from .textpatterns import (
+    ALLCAPS_TOKEN,
+    AUTHOR_INITIALS,
+    AUTHOR_PARTICLE,
+    CAP_WORD,
+    NUMBERED_REF_RE,
+    REF_SECTION_LABEL,
+)
 from .views import read_views
 
 # Heading-prefix window: a cue appearing within this many chars of the
@@ -101,11 +109,143 @@ ABSTRACT_HEADING_RE: Pattern = re.compile(r"^\s*abstract\s*:?\s*$", re.IGNORECAS
 # Folding "citations" and "cited literature" in makes this a strict recall-
 # superset of all three (the multi-word synonyms keep ``\s+`` so a double-space
 # or tab variant — which the literal-space citeconvert/refextract copies missed —
-# also matches).  citeconvert and refextract import THIS shared pattern.
+# also matches).  "References Cited" is additionally folded in (the NIH
+# Research-Strategy reference-list heading; absent from all three legacy copies
+# yet unambiguously a reference heading) — purely additive recall.  citeconvert
+# and refextract import THIS shared pattern.
 REFERENCES_HEADING_RE: Pattern = re.compile(
-    r"^\s*(references|reference\s+list|bibliography|works\s+cited"
-    r"|literature\s+cited|citations|cited\s+literature)\s*:?\s*$",
+    r"^\s*(references|reference\s+list|references\s+cited|bibliography"
+    r"|works\s+cited|literature\s+cited|citations|cited\s+literature)\s*:?\s*$",
     re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# Citation-line predicate (consolidated from biosketch._is_citation_line)
+# ---------------------------------------------------------------------------
+# "Does this paragraph look like a bibliography citation rather than narrative?"
+# This was open-coded in ``biosketch`` (separating prose from citation lines in
+# OLD-format A/C blocks).  It is the shared heuristic that
+# :func:`references_idx` uses (alongside ``NUMBERED_REF_RE``) to recognise a
+# heading-less numbered reference list.  ``biosketch`` now imports it back as
+# ``_is_citation_line`` (mirroring how ``journalprofile`` re-exports
+# ``REFERENCES_HEADING_RE`` as ``_REFERENCES_HEADING_RE``); there is ONE copy.
+
+# A bibliography identifier — PMCID / PMID / DOI in any common surface form.
+_CIT_ID_RE: Pattern = re.compile(
+    r"PMC\d+|PMID:\s*\d+|doi\.org/|10\.\d{4,9}/", re.IGNORECASE
+)
+
+# --- Author-head building blocks (aligned with refextract.py) --------------
+# The genuinely-identical fragments (``AUTHOR_PARTICLE`` / ``AUTHOR_INITIALS`` /
+# ``REF_SECTION_LABEL`` / ``CAP_WORD`` / ``ALLCAPS_TOKEN``) now live in the shared
+# ``textpatterns`` module as the single owner; both ``sections`` and
+# ``refextract`` import them so the two author-start recognisers cannot drift.
+# refextract owns the richer reference *extraction*; ``sections`` owns the
+# body/reference *boundary* predicate.  The COMPILED head patterns stay LOCAL to
+# each module because their shapes differ deliberately (here: initials REQUIRED,
+# no leading ``\s*``, anchored ``^``).
+#
+# ``_SURNAME`` is kept LOCAL (not shared): ``sections`` includes the curly
+# apostrophe ``’`` ("O’Brien") whereas ``refextract`` does not, and that one
+# character is NOT inert — it changes the match decision for a curly-apostrophe
+# surname.  Sharing it would silently alter refextract's behaviour, so each
+# module keeps its own.  (If you change one, decide deliberately whether the
+# other should follow — they diverge on purpose.)
+_PARTICLE = AUTHOR_PARTICLE
+_SURNAME = r"[A-Z][A-Za-z'’\-]+"  # local: INCLUDES curly apostrophe ’ (see above)
+_INITIALS = AUTHOR_INITIALS  # "JA" / "J.A." / "J A" / "J"
+
+# A *multi-author* byline at line start: "Surname AB," / "Surname AB and" /
+# "Surname AB & ..." — initials followed by a comma / "and" / "&".  This is the
+# ORIGINAL, comma-requiring head; kept (broadened only to allow nobiliary
+# particles + "and"/"&") for the multi-author Vancouver/NIH form.  Shape: initials
+# REQUIRED, anchored ``^`` with NO leading ``\s*`` (contrast
+# ``refextract._AUTHOR_LIST_START_RE``, which makes initials optional and allows a
+# leading ``\s*``).
+_AUTHOR_HEAD_RE: Pattern = re.compile(
+    rf"^{_PARTICLE}{_SURNAME}\s+{_INITIALS}\s*(?:,|and\b|&)"
+)
+
+# A *single-author* / organisation byline at line start — the dominant single-
+# author Vancouver/NIH form "Surname Init. Title. Journal. Year." has NO comma:
+# the author field is terminated by a PERIOD after the initials.  Two shapes:
+#   * single author + initials + terminating period:  "Cohen AL." / "van der Berg H."
+#   * organisation / consortium author + period:      "ENIGMA Consortium." /
+#                                                      "World Health Organization."
+# Aligned with ``refextract._REF_AUTHOR_START_RE`` (single-author + org branches),
+# INCLUDING its section-label negative-lookahead: a sentence-case 'Label.' lead-in
+# common in author manuscripts / PDF->docx ("Methods.", "Data Availability.",
+# "Author Contributions.") must never satisfy the organisation-author shape just
+# because two capitalised words and a year happen to appear.  Mirrors
+# the shared ``REF_SECTION_LABEL`` (the single owner; refextract imports it too).
+# (The trailing 4-digit *year* requirement in :func:`is_citation_line`, the
+# length floor below, and the >=3-entry run requirement in
+# :func:`references_idx` add further precision on top.)
+_SECTION_LABEL_RE = REF_SECTION_LABEL
+_CAP_WORD = CAP_WORD          # a capitalised word
+_ALLCAPS_TOKEN = ALLCAPS_TOKEN  # an acronym / ALLCAPS token (>=2 chars)
+_AUTHOR_HEAD_SINGLE_RE: Pattern = re.compile(
+    rf"^(?:"
+    rf"{_PARTICLE}{_SURNAME}\s+{_INITIALS}\."           # Cohen AL.  /  van der Berg H.
+    rf"|(?!{_SECTION_LABEL_RE}[.\s])(?:"                # exclude section labels first
+    rf"(?:{_CAP_WORD}\s+){{0,5}}{_ALLCAPS_TOKEN}(?:\s+{_CAP_WORD}){{0,5}}\s*\."  # ENIGMA Consortium.
+    rf"|{_CAP_WORD}(?:\s+{_CAP_WORD}){{1,5}}\s*\."      # World Health Organization.
+    rf")"
+    rf")"
+)
+
+# A reference entry is bibliographic, not a stray short capitalised sentence:
+# require a minimum length for the comma-less single-author/org path so a short
+# prose lead-in ("Cohen AL. Yes.") cannot masquerade as a citation line.  Mirrors
+# refextract's ``len(stripped) > 40`` discipline.  (The multi-author and
+# identifier paths already carry strong enough structure to skip this floor.)
+_MIN_SINGLE_AUTHOR_CIT_LEN: int = 40
+
+# A 4-digit publication year.
+_YEAR_RE: Pattern = re.compile(r"\b(19|20)\d{2}\b")
+
+
+def is_citation_line(p: str) -> bool:
+    """True if a paragraph looks like a bibliography citation (not narrative).
+
+    Independent signals (any one is sufficient):
+
+    * it carries a citation identifier (PMCID / PMID / DOI), or
+    * it opens with a *multi-author* byline (``Surname AB, ...``) *and* contains a
+      4-digit year, or
+    * it opens with a *single-author* / organisation byline whose author field is
+      terminated by a period (``Cohen AL.`` / ``ENIGMA Consortium.``), is long
+      enough to be bibliographic, *and* contains a 4-digit year.
+
+    The author-byline tests are anchored at the start of ``p``: when classifying a
+    *numbered* reference entry, strip the leading enumerator first (see
+    :func:`references_idx`), so an entry like ``"1.\\tSmith J, Doe A. ... 2020"``
+    is tested against ``"Smith J, Doe A. ... 2020"``.
+
+    Precision: a narrative sentence ("Cohen et al. found that ...") is NOT a
+    citation line — "et al." is not an initials field, and a comma-less prose
+    sentence shorter than the length floor (or lacking a year) is rejected.
+    """
+    p = p.strip()
+    if _CIT_ID_RE.search(p):
+        return True
+    if not _YEAR_RE.search(p):
+        return False
+    if _AUTHOR_HEAD_RE.match(p):
+        return True
+    if len(p) >= _MIN_SINGLE_AUTHOR_CIT_LEN and _AUTHOR_HEAD_SINGLE_RE.match(p):
+        return True
+    return False
+
+
+# Strips a leading numbered enumerator ("1.", "1)", "[1]", "(1)") plus the
+# trailing whitespace (space or tab) before the entry body, so the anchored
+# author-byline test in :func:`is_citation_line` sees the citation proper.  Built
+# from the same alternation as the shared ``NUMBERED_REF_RE`` (minus its
+# trailing ``\S`` lookahead-of-body) to stay in lock-step with what counts as an
+# enumerator.
+_REF_ENUMERATOR_RE: Pattern = re.compile(
+    r"^\s*(?:\[\s*\d+\s*\]|\(\s*\d+\s*\)|\(?\d+\)?[.)]|\d+[.)])\s+"
 )
 
 # Manuscript (journal research-article) whole-line section cues.  Union of
@@ -116,26 +256,28 @@ REFERENCES_HEADING_RE: Pattern = re.compile(
 # section name or a common synonym / combined form.  A combined "Results and
 # Discussion" heading satisfies BOTH "results" and "discussion".
 MANUSCRIPT_SECTION_CUES: dict = {
-    # NOTE: structure's legacy abstract cue is whole-line *without* a trailing
-    # colon (``^\s*abstract\s*$``); journalprofile's ``ABSTRACT_HEADING_RE``
-    # tolerates a trailing colon.  These differ on "Abstract:" — to keep the
-    # structure-consumer migration behaviour-preserving, the manuscript dict
-    # keeps the structure form here.  The colon-tolerant variant remains exposed
-    # separately as ``ABSTRACT_HEADING_RE`` (journalprofile's cue).
-    "abstract": re.compile(r"^\s*abstract\s*$", re.IGNORECASE),
-    "introduction": re.compile(r"^\s*(introduction|background)\s*$", re.IGNORECASE),
+    # Each whole-line cue tolerates an OPTIONAL trailing colon (``\s*:?\s*$``):
+    # real accepted papers use colon-terminated headings ("Abstract:",
+    # "Introduction:", "Methods:") and a colon-terminated standalone heading is
+    # unambiguous, so this is a strict recall-widening.  This brings the
+    # manuscript cues in line with ``ABSTRACT_HEADING_RE`` (which already
+    # tolerated the colon) and ``REFERENCES_HEADING_RE`` (likewise).
+    "abstract": re.compile(r"^\s*abstract\s*:?\s*$", re.IGNORECASE),
+    "introduction": re.compile(
+        r"^\s*(introduction|background)\s*:?\s*$", re.IGNORECASE
+    ),
     "methods": re.compile(
         r"^\s*(methods"
         r"|materials\s+and\s+methods"
         r"|experimental\s+procedures"
-        r"|patients\s+and\s+methods)\s*$",
+        r"|patients\s+and\s+methods)\s*:?\s*$",
         re.IGNORECASE,
     ),
     "results": re.compile(
-        r"^\s*(results|results\s+and\s+discussion)\s*$", re.IGNORECASE
+        r"^\s*(results|results\s+and\s+discussion)\s*:?\s*$", re.IGNORECASE
     ),
     "discussion": re.compile(
-        r"^\s*(discussion|results\s+and\s+discussion)\s*$", re.IGNORECASE
+        r"^\s*(discussion|results\s+and\s+discussion)\s*:?\s*$", re.IGNORECASE
     ),
     "references": REFERENCES_HEADING_RE,
 }
@@ -462,20 +604,27 @@ def section_text(
 # Unified paragraph accessors
 # ---------------------------------------------------------------------------
 #
-# IMPORTANT: two distinct accepted-text pipelines are centralised here.  They
-# are NOT interchangeable today and choosing a single winner is a deferred,
-# verification-gated migration decision — this module exposes BOTH, clearly
+# IMPORTANT: two distinct accepted-text pipelines are centralised here.  Since
+# the ``iter_paragraphs`` fix (commit 331cdb6) they agree on accepted-text
+# *content* — both exclude tracked deletions, keep insertions, and render
+# ``<w:br>``/``<w:cr>`` as a newline and ``<w:tab>`` as a tab.  They differ ONLY
+# in **granularity** (per-``<w:p>`` vs render-then-split-on-newline), so they are
+# still not freely interchangeable; choosing a single winner is a deferred,
+# verification-gated migration decision.  This module exposes BOTH, clearly
 # named, and does not pick:
 #
 #   * get_paragraphs_ooxml / get_paragraph_elements  — raw OOXML path.  Parses
 #     word/document.xml directly and uses paragraph_text() (which excludes
 #     tracked deletions).  Matches structure._get_paragraphs /
-#     _get_paragraph_elements byte-for-byte.
+#     _get_paragraph_elements byte-for-byte.  One entry per ``<w:p>`` — the only
+#     path that stays index-aligned with get_paragraph_elements.
 #
 #   * get_paragraphs_accepted — the read_views() accepted-view path.  Matches
-#     journalprofile._paragraphs (splits the accepted view on newlines, never
-#     raises).  This view differs from the raw-OOXML path in how it segments and
-#     renders the accepted text, so the two can yield different paragraph lists.
+#     journalprofile._paragraphs (renders the accepted view, then splits on
+#     newlines; never raises).  Same content as the raw-OOXML path, but a block
+#     pasted as one ``<w:p>`` with embedded line breaks splits into its
+#     constituent lines here — a finer granularity that a render-then-split
+#     cannot keep index-aligned with the per-``<w:p>`` element list.
 
 def get_paragraphs_ooxml(path: Union[str, Path]) -> List[str]:
     """Paragraph texts via the raw-OOXML path (== ``structure._get_paragraphs``).
@@ -527,3 +676,114 @@ def get_paragraphs_accepted(path: Union[str, Path]) -> List[str]:
     except Exception:
         return []
     return [ln for ln in accepted.split("\n")]
+
+
+# ---------------------------------------------------------------------------
+# Body / reference-list boundary
+# ---------------------------------------------------------------------------
+
+# Minimum length of a sustained numbered-citation run that, in the ABSENCE of an
+# explicit References heading, marks the start of the reference list.  A run of
+# fewer than this many consecutive numbered citation-like paragraphs is treated
+# as body text (e.g. a short numbered procedure list "1) First  2) Second"),
+# NOT as the bibliography.  Three is the smallest run that reliably excludes
+# such short in-body enumerations while still catching real (always longer)
+# reference lists.
+MIN_HEADINGLESS_REF_RUN: int = 3
+
+
+def _looks_like_numbered_citation(p: str) -> bool:
+    """A paragraph that is a numbered enumerator AND a citation entry.
+
+    Requires BOTH (a) a leading numbered enumerator (shared ``NUMBERED_REF_RE``,
+    which already tolerates the ``"1.\\tAuthor"`` tab form) AND (b) citation-like
+    content once the enumerator is stripped (shared :func:`is_citation_line`).
+    The strip is essential: ``is_citation_line``'s author-byline test is anchored
+    at the start of the string, so it must see ``"Smith J, ... 2020"`` rather
+    than ``"1.\\tSmith J, ... 2020"``.
+    """
+    if not NUMBERED_REF_RE.match(p):
+        return False
+    body = _REF_ENUMERATOR_RE.sub("", p, count=1)
+    return is_citation_line(body)
+
+
+def _looks_like_reference_entry(p: str) -> bool:
+    """A paragraph that looks like a heading-less reference-list entry.
+
+    Either form qualifies:
+
+    * a *numbered* citation entry (:func:`_looks_like_numbered_citation`), or
+    * a *bare* (unnumbered) citation line (:func:`is_citation_line`) — the common
+      NIH/Vancouver single-author or organisation form
+      ``"Cohen AL. Title. Journal. Year"`` that carries no enumerator and no
+      inline PMID/DOI.
+
+    The per-line signal is intentionally permissive; the precision that keeps a
+    short in-body enumeration (or a stray reference-shaped sentence) from being
+    read as the bibliography comes from the >= :data:`MIN_HEADINGLESS_REF_RUN`
+    *consecutive* run requirement in :func:`references_idx` (a body list of
+    "1) First step / 2) Second step" is neither numbered-citation nor bare-citation
+    shaped, and prose rarely produces three reference-shaped lines in a row).
+    """
+    return _looks_like_numbered_citation(p) or is_citation_line(p)
+
+
+def references_idx(paras: Sequence[str]) -> Optional[int]:
+    """Index of the first paragraph belonging to the reference list, or None.
+
+    Two-stage detection (see the module/task contract):
+
+    1. **Explicit heading** — a standalone References / Bibliography / Literature
+       Cited / Works Cited heading (shared :data:`REFERENCES_HEADING_RE` via
+       :func:`find_section_idx`, ``mode="strict"``, exactly as
+       ``journalprofile._references_idx`` does).  The reference section begins at
+       that heading's index.
+    2. **Heading-less reference list** — the start of a SUSTAINED run of
+       >= :data:`MIN_HEADINGLESS_REF_RUN` consecutive paragraphs that each look
+       like a reference entry (:func:`_looks_like_reference_entry`).  This covers
+       BOTH the numbered NIH Research-Strategy list
+       (``"1.\\tAuthor, Title. Journal. Year"``) AND a bare, *un*numbered
+       single-author / organisation Vancouver list
+       (``"Cohen AL. Title. Journal. Year"``) that carries no enumerator and no
+       inline PMID/DOI.  The reference section begins at the first paragraph of
+       that run.  The run requirement prevents a short in-body list
+       ("1) First step 2) Second step 3) Third") — whose entries are not
+       reference-shaped — from being misread as the bibliography.
+
+    The explicit heading wins when both are present.
+    """
+    # 1. Explicit heading.
+    idx = find_section_idx(paras, REFERENCES_HEADING_RE, mode="strict")
+    if idx is not None:
+        return idx
+
+    # 2. Heading-less sustained reference run (numbered OR bare entries).
+    run_start: Optional[int] = None
+    run_len = 0
+    for i, p in enumerate(paras):
+        if _looks_like_reference_entry(p):
+            if run_start is None:
+                run_start = i
+            run_len += 1
+            if run_len >= MIN_HEADINGLESS_REF_RUN:
+                return run_start
+        else:
+            run_start = None
+            run_len = 0
+    return None
+
+
+def split_body_vs_references(
+    paras: Sequence[str],
+) -> tuple[list[str], list[str]]:
+    """Split paragraphs into ``(body, references)``.
+
+    ``references`` is the empty list when no reference section is detected, in
+    which case ``body`` is every input paragraph.  Detection uses
+    :func:`references_idx`.
+    """
+    idx = references_idx(paras)
+    if idx is None:
+        return list(paras), []
+    return list(paras[:idx]), list(paras[idx:])

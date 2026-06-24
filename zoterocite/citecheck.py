@@ -41,6 +41,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Union
@@ -490,6 +491,11 @@ def refresh_retraction_db(dest: Optional[Union[str, Path]] = None, *,
         )
     dest_path = Path(dest) if dest else default_rw_path()
     dest_path.parent.mkdir(parents=True, exist_ok=True)
+    scheme = urllib.parse.urlparse(url).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(
+            f"refresh_retraction_db: only http/https URLs are allowed, got scheme {scheme!r}"
+        )
     req = urllib.request.Request(
         url,
         headers={"User-Agent": _http.user_agent()},

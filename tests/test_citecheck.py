@@ -1717,3 +1717,46 @@ class TestRetractionNetworkPolicyPreserved:
         # inside plan_unification; exercise that path directly through the owner.
         cc.load_retraction_map(allow_network=True)
         assert calls["ensure"] == 1
+
+
+# ---------------------------------------------------------------------------
+# sec-rw-scheme-1: refresh_retraction_db must reject non-http(s) URLs
+# ---------------------------------------------------------------------------
+
+class TestRefreshRetractionDbSchemeCheck:
+    """Regression for sec-rw-scheme-1: refresh_retraction_db passed its url
+    arg straight to urllib.urlopen with no scheme check, allowing local-file
+    reads via file:// URLs."""
+
+    def test_file_scheme_raises_value_error(self, tmp_path):
+        """refresh_retraction_db(url='file:///etc/passwd') must raise ValueError,
+        not open the local file."""
+        from zoterocite.citecheck import refresh_retraction_db
+
+        with pytest.raises(ValueError, match="http"):
+            refresh_retraction_db(dest=tmp_path / "rw.csv",
+                                  url="file:///etc/passwd")
+
+    def test_ftp_scheme_raises_value_error(self, tmp_path):
+        """Non-http(s) schemes other than file:// must also be rejected."""
+        from zoterocite.citecheck import refresh_retraction_db
+
+        with pytest.raises(ValueError):
+            refresh_retraction_db(dest=tmp_path / "rw.csv",
+                                  url="ftp://example.com/retraction.csv")
+
+    def test_https_scheme_does_not_raise_on_scheme_check(self, monkeypatch, tmp_path):
+        """An https URL must pass the scheme check (network call may fail, but
+        not with a ValueError about the scheme)."""
+        import urllib.request
+        from zoterocite.citecheck import refresh_retraction_db
+
+        # Patch urlopen to avoid a real network call; raise a controlled error
+        # that is NOT ValueError so we can confirm the scheme check passed.
+        def _fake_urlopen(*a, **k):
+            raise RuntimeError("stubbed-network")
+
+        monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+        with pytest.raises(RuntimeError, match="stubbed-network"):
+            refresh_retraction_db(dest=tmp_path / "rw.csv",
+                                  url="https://example.com/retraction.csv")

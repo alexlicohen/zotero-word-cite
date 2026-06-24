@@ -161,7 +161,13 @@ def build_mixed_doc(tmp_path: Path, *, with_dup=False, with_zotero=True,
         paras.append("ZoteroManaged sentence epsilon goes here.")
     if with_manual:
         paras += [
+            # A hand-typed inline citation in the body (no citation field) — this
+            # is the real detection target: an author-year marker the user forgot
+            # to manage via Zotero.  Placed BEFORE the reference heading so it
+            # remains in the body after the Problem B split.
+            "Prior work (Doe et al., 2018) demonstrated this finding. doi:10.9999/manual.2018",
             "References",
+            # The rendered bibliography — should NOT be flagged after the GF-5 fix.
             "1. Doe J, Roe R. A manual unmanaged reference about cortex. Journal of Things. 2018;5(2):10-20. doi:10.9999/manual.2018",
         ]
     src = tmp_path / "src.docx"
@@ -864,3 +870,143 @@ class TestGroupedCitationRendering:
             # A single grouped Zotero field never renders two parenthetical markers
             # joined by "; "; that separator is the fingerprint of the defect.
             assert "); (" not in v, f"{k} carries a fabricated '; ' group join: {v!r}"
+
+
+# ===========================================================================
+# GF-5 — _detect_manual_refs false-positive fixes
+#
+# Problem A: prose sentences that merely contain a 4-digit year must NOT be
+#   flagged as suspected manual references.
+# Problem B: the document's own rendered bibliography must NOT be flagged as
+#   "add to Zotero and re-cite" — only the body is scanned.
+# ===========================================================================
+
+def _build_manual_ref_doc(tmp_path: Path, paras: list) -> Path:
+    """Helper: create a minimal .docx with the given paragraph strings."""
+    src = tmp_path / "src.docx"
+    new_doc(src, paras)
+    return src
+
+
+class TestDetectManualRefsGF5:
+    """Synthetic fixture tests for GF-5 — no real grant text / PHI."""
+
+    # -----------------------------------------------------------------------
+    # (i) Prose with years only -> NOT flagged
+    # -----------------------------------------------------------------------
+
+    def test_prose_year_only_not_flagged(self, tmp_path):
+        """Body sentences that only contain a 4-digit year are NOT manual refs.
+
+        Before the fix, _AUTHOR_YEAR_REF_RE matched sentences where an
+        uppercase-starting word appeared before a year — e.g. "The RDCRN-DSC
+        cohort began recruitment in 2015" and "The PREVeNT trial was completed
+        in 2023" — causing false positives on plain narrative.
+        """
+        paras = [
+            "The RDCRN-DSC cohort began recruitment in 2015 with an aim to include a wider age range.",
+            "The PREVeNT trial was completed in 2023 and was designed as a phase IIb study.",
+        ]
+        path = _build_manual_ref_doc(tmp_path, paras)
+        res = classify_citation_sources(path)
+        manual = [it for it in res["items"] if it["manager"] == "manual"]
+        assert manual == [], (
+            f"Expected no manual refs from prose-with-year sentences, got: "
+            f"{[m['instruction_excerpt'] for m in manual]}"
+        )
+        findings = classification_findings(res)
+        assert not any(f.check == "CITE-MANUAL" for f in findings), (
+            "CITE-MANUAL should not fire on prose-only-year sentences"
+        )
+
+    # -----------------------------------------------------------------------
+    # (ii) Genuine inline citation in body -> STILL flagged (teeth check)
+    # -----------------------------------------------------------------------
+
+    def test_genuine_inline_citation_still_flagged(self, tmp_path):
+        """A parenthetical author-year inline citation without a field is flagged.
+
+        This is the real signal: a hand-typed "(Smith et al., 2020)" that lacks
+        a Zotero/EndNote/Mendeley field and should be re-cited via Zotero.
+        """
+        paras = [
+            "Prior work (Smith et al., 2020) showed that X leads to Y.",
+        ]
+        path = _build_manual_ref_doc(tmp_path, paras)
+        res = classify_citation_sources(path)
+        manual = [it for it in res["items"] if it["manager"] == "manual"]
+        assert len(manual) >= 1, (
+            "A genuine inline parenthetical citation must still be flagged as manual"
+        )
+        findings = classification_findings(res)
+        assert any(f.check == "CITE-MANUAL" for f in findings), (
+            "CITE-MANUAL must fire on a hand-typed inline citation"
+        )
+
+    # -----------------------------------------------------------------------
+    # (iii) Trailing numbered reference list -> NOT flagged (Problem B)
+    # -----------------------------------------------------------------------
+
+    def test_bibliography_not_flagged_as_manual(self, tmp_path):
+        """The document's own rendered bibliography is NOT re-flagged.
+
+        Before the fix, every bibliography entry ("2. Peters JM...") was flagged
+        as a "suspected manual/unmanaged reference — add to Zotero and re-cite."
+        This was wrong: the bibliography is rendered output, not an inline citation
+        that needs Zotero re-management.
+        """
+        paras = [
+            # body
+            "This study builds on prior work in the field.",
+            "References",
+            # >= 3 fake citation lines to trigger the bibliography boundary
+            "1.\tDoe J, Smith A. A fake paper about things. J Fake Sci. 2020;1(1):1-10. doi:10.9999/fake.2020",
+            "2.\tPeters JM, Roe R. Another fake paper. Neurology. 2019;5(2):20-30. PMID:12345678",
+            "3.\tChou IJ, Wang X. Yet another fake reference. Brain. 2021;10(3):300. doi:10.9999/chou.2021",
+        ]
+        path = _build_manual_ref_doc(tmp_path, paras)
+        res = classify_citation_sources(path)
+        manual = [it for it in res["items"] if it["manager"] == "manual"]
+        assert manual == [], (
+            f"Bibliography entries must NOT be flagged as manual refs, got: "
+            f"{[m['instruction_excerpt'] for m in manual]}"
+        )
+        findings = classification_findings(res)
+        assert not any(f.check == "CITE-MANUAL" for f in findings), (
+            "CITE-MANUAL must not fire on the document's own rendered bibliography"
+        )
+
+    # -----------------------------------------------------------------------
+    # Teeth verification: confirm each assertion would fail under the OLD code
+    # -----------------------------------------------------------------------
+
+    def test_old_broad_regex_would_fail_prose_check(self):
+        """Proof-of-teeth: the OLD _AUTHOR_YEAR_REF_RE matched prose-year sentences.
+
+        The old pattern required two consecutive upper-case-starting tokens followed
+        by a year, so "The RDCRN-DSC cohort began recruitment in 2015" matches
+        (RDCRN-DSC is capitalised and cohort follows it before the year).
+        """
+        import re
+        old_re = re.compile(r"[A-Z][A-Za-z''-]+,?\s+[A-Z].*\b(19|20)\d{2}\b")
+        prose = "The RDCRN-DSC cohort began recruitment in 2015."
+        assert old_re.search(prose) is not None, (
+            "Sanity check: old regex DOES match prose-year sentences (this test "
+            "confirms test (i) has teeth against the old code)"
+        )
+
+    def test_new_regex_does_not_match_prose_year(self):
+        """After fix: the new _INLINE_CITE_RE does NOT match prose-year sentences."""
+        from zoterocite.citeconvert import _INLINE_CITE_RE
+        prose = "The trial began recruitment in 2015 and was completed in 2023."
+        assert _INLINE_CITE_RE.search(prose) is None, (
+            "_INLINE_CITE_RE must not match prose-only-year sentences"
+        )
+
+    def test_new_regex_matches_genuine_inline_cite(self):
+        """After fix: _INLINE_CITE_RE matches a genuine parenthetical citation."""
+        from zoterocite.citeconvert import _INLINE_CITE_RE
+        inline = "Prior work (Smith et al., 2020) showed X."
+        assert _INLINE_CITE_RE.search(inline) is not None, (
+            "_INLINE_CITE_RE must match a genuine inline parenthetical citation"
+        )
