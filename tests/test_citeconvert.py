@@ -1010,3 +1010,135 @@ class TestDetectManualRefsGF5:
         assert _INLINE_CITE_RE.search(inline) is not None, (
             "_INLINE_CITE_RE must match a genuine inline parenthetical citation"
         )
+
+
+# ===========================================================================
+# PART N — offline / fail-closed matching for unify-refs --apply
+#
+# Bug: convert_to_zotero -> _match_in_library -> zotero.get_item_by_doi /
+# search_items -> build_request raised RuntimeError ("Zotero credentials not
+# configured") with NO try/except, so `unify-refs --apply` CRASHED when Zotero
+# was unreachable. Fix: match offline via the resilient cached library_index
+# first; live search only as a reachable, crash-proof fallback; fail-closed
+# (never create on a degraded read).
+# ===========================================================================
+
+def _unavailable_search(*_a, **_k):
+    """Stand-in for a Zotero search when creds are missing / network down —
+    exactly what zotero.build_request raises in that situation."""
+    raise RuntimeError("Zotero credentials not configured; set env var(s): ZOTERO_API_KEY")
+
+
+class TestOfflineMatchFailClosed:
+    def _mendeley_only_doc(self, tmp_path):
+        # EndNote(alpha) + Mendeley(beta); we process only the Mendeley field.
+        return build_mixed_doc(tmp_path, with_word=False, with_zotero=False,
+                               with_manual=False)
+
+    # (a) Zotero unavailable (creds unset / network down) MUST NOT crash.
+    def test_unavailable_zotero_does_not_raise(self, tmp_path, monkeypatch):
+        from zoterocite import zotero
+        # No offline index, and every live entrypoint raises like missing creds.
+        monkeypatch.setattr(zotero, "library_index",
+                            lambda **k: {"doi": {}, "pmid": {}, "title": {}})
+        monkeypatch.setattr(zotero, "get_item_by_doi", _unavailable_search)
+        monkeypatch.setattr(zotero, "search_items", _unavailable_search)
+        monkeypatch.setattr(zotero, "csljson", _unavailable_search)
+        monkeypatch.setattr(zotero, "item_uri", _unavailable_search)
+        monkeypatch.setattr(zotero, "formatted_citations", _unavailable_search)
+
+        out = tmp_path / "offline.docx"
+        # Must complete without a RuntimeError traceback.
+        res = convert_to_zotero(self._mendeley_only_doc(tmp_path), out=out,
+                                managers=("mendeley",))
+        # The Mendeley ref could not be matched (no index, search unreachable) →
+        # left unconverted (fail-closed), and recorded.
+        assert res["converted"] == []
+        assert any(u["manager"] == "mendeley" for u in res["unmatched"])
+        # A file was still written (the unchanged doc), and it validates.
+        assert validate(res["out"]).ok
+
+    # (b) A ref whose DOI is in a mocked cached library_index → matched OFFLINE,
+    # field written, WITHOUT any live search call.
+    def test_doi_in_cached_index_matches_offline(self, tmp_path, monkeypatch):
+        from zoterocite import zotero
+        live_calls = []
+        monkeypatch.setattr(zotero, "library_index", lambda **k: {
+            "doi": {"10.1000/widgets.2001": "CACHEKEY1"}, "pmid": {}, "title": {},
+        })
+        # If the offline path is correct, NEITHER of these is ever reached.
+        monkeypatch.setattr(zotero, "get_item_by_doi",
+                            lambda *a, **k: (live_calls.append("doi"), None)[1])
+        monkeypatch.setattr(zotero, "search_items",
+                            lambda *a, **k: (live_calls.append("title"), [])[1])
+        # csljson/item_uri/formatted_citations are degrade-safe; make them
+        # unreachable to prove a matched ref still writes its field offline.
+        monkeypatch.setattr(zotero, "csljson", _unavailable_search)
+        monkeypatch.setattr(zotero, "item_uri", _unavailable_search)
+        monkeypatch.setattr(zotero, "formatted_citations", _unavailable_search)
+
+        out = tmp_path / "matched.docx"
+        res = convert_to_zotero(self._mendeley_only_doc(tmp_path), out=out,
+                                managers=("mendeley",))
+
+        assert live_calls == [], (
+            "offline index hit must NOT trigger any live get_item_by_doi/"
+            f"search_items call; saw {live_calls}"
+        )
+        keys = {it["key"] for cit in scan_citations(res["out"]) for it in cit["items"]}
+        assert "CACHEKEY1" in keys, "matched-in-cache ref must get a live Zotero field"
+        assert validate(res["out"]).ok
+
+    # (c) Ref NOT in the index + Zotero unreachable → left unconverted, no crash.
+    def test_index_miss_unreachable_left_unconverted(self, tmp_path, monkeypatch):
+        from zoterocite import zotero
+        monkeypatch.setattr(zotero, "library_index",
+                            lambda **k: {"doi": {}, "pmid": {}, "title": {}})
+        monkeypatch.setattr(zotero, "get_item_by_doi", _unavailable_search)
+        monkeypatch.setattr(zotero, "search_items", _unavailable_search)
+
+        out = tmp_path / "miss.docx"
+        res = convert_to_zotero(self._mendeley_only_doc(tmp_path), out=out,
+                                managers=("mendeley",))
+        assert res["converted"] == []
+        assert any(u["manager"] == "mendeley" for u in res["unmatched"])
+        # No live field was written.
+        keys = {it["key"] for cit in scan_citations(res["out"]) for it in cit["items"]}
+        assert "MENKEY1" not in keys
+
+    # (d) FAIL-CLOSED: a degraded read NEVER creates a library item.
+    # Mutation-confirm: this guard has teeth because create_items is wired to
+    # FAIL the test if it is ever invoked from the conversion path.
+    def test_fail_closed_no_item_creation_on_degraded_read(self, tmp_path, monkeypatch):
+        from zoterocite import zotero
+        monkeypatch.setattr(zotero, "library_index",
+                            lambda **k: {"doi": {}, "pmid": {}, "title": {}})
+        monkeypatch.setattr(zotero, "get_item_by_doi", _unavailable_search)
+        monkeypatch.setattr(zotero, "search_items", _unavailable_search)
+
+        def _boom_create(*_a, **_k):
+            raise AssertionError("convert_to_zotero must NEVER create a Zotero "
+                                 "item on a degraded read (fail-closed)")
+        monkeypatch.setattr(zotero, "create_items", _boom_create)
+
+        out = tmp_path / "noadd.docx"
+        # add_missing is a documented no-op in convert_to_zotero; assert it stays
+        # one even on a degraded read (belt-and-suspenders).
+        res = convert_to_zotero(self._mendeley_only_doc(tmp_path), out=out,
+                                managers=("mendeley",), add_missing=True)
+        assert res["converted"] == []
+        assert any(u["manager"] == "mendeley" for u in res["unmatched"])
+
+    # Regression guard: lookup_index_key is the single owner — DOI -> PMID -> title.
+    def test_lookup_index_key_precedence_offline(self):
+        from zoterocite import zotero
+        idx = {
+            "doi": {"10.1/a": "DKEY"},
+            "pmid": {"123456": "PKEY"},
+            "title": {"a study of widgets": "TKEY"},
+        }
+        assert zotero.lookup_index_key(idx, doi="10.1/A") == "DKEY"
+        assert zotero.lookup_index_key(idx, pmid="123456") == "PKEY"
+        assert zotero.lookup_index_key(idx, title="A Study Of Widgets") == "TKEY"
+        assert zotero.lookup_index_key(idx, doi="10.9/none") is None
+        assert zotero.lookup_index_key(None, doi="10.1/a") is None

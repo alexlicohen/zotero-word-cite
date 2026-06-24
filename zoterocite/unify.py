@@ -526,37 +526,18 @@ def _lookup_in_library(
 ) -> Optional[str]:
     """Return an existing library item key for a ref, or ``None`` if absent.
 
-    Decides presence by DOI → PMID → normalized-title against the three maps in
-    ``lib_index`` (from :func:`zotero.library_index`). The DOI-only test that
-    this replaces false-flagged present-but-DOI-less refs as missing — which,
-    under a confident ``--apply``, mass-duplicated the shared group library. A
-    match on ANY of the three keys means the ref is already present.
+    Thin re-export of :func:`zotero.lookup_index_key` — the SINGLE owner of the
+    DOI → PMID → normalized-title presence decision (consolidated there so
+    :mod:`citeconvert`, which cannot import :mod:`unify` without a cycle, shares
+    the exact same precedence). The owning rationale: the DOI-only test this
+    replaced false-flagged present-but-DOI-less refs as missing, which under a
+    confident ``--apply`` mass-duplicated the shared group library; a match on
+    ANY of the three identifiers means the ref is already present.
 
     ``lib_index`` may be ``None`` or partial (a degraded read degrades to empty
     maps); a missing sub-map simply yields no match for that identifier.
     """
-    if not lib_index:
-        return None
-    doi_idx = lib_index.get("doi") or {}
-    pmid_idx = lib_index.get("pmid") or {}
-    title_idx = lib_index.get("title") or {}
-
-    if doi:
-        norm = citecheck._normalise_doi(doi)
-        key = doi_idx.get(norm)
-        if key:
-            return key
-    if pmid:
-        key = pmid_idx.get(str(pmid).strip())
-        if key:
-            return key
-    if title:
-        nt = zotero._normalize_title(title)
-        if nt:
-            key = title_idx.get(nt)
-            if key:
-                return key
-    return None
+    return zotero.lookup_index_key(lib_index, doi=doi, pmid=pmid, title=title)
 
 
 def _strip_score(meta: Optional[dict]) -> Optional[dict]:

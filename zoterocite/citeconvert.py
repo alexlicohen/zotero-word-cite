@@ -766,22 +766,60 @@ _normalize_title = normalize_title
 _normalize_doi = normalize_doi
 
 
-def _match_in_library(meta: dict, zotero, *, title_cache: dict) -> Optional[dict]:
-    """Match extracted metadata to a Zotero item: DOI first, then normalized
-    title (+year/first-author tie-break). Returns the Zotero item dict or None."""
+def _match_in_library(
+    meta: dict, zotero, *, title_cache: dict, lib_index: Optional[dict] = None
+) -> Optional[dict]:
+    """Match extracted metadata to a Zotero item; return the item dict or None.
+
+    OFFLINE-FIRST and FAIL-CLOSED. Resolution order:
+
+    1. **Resilient cached index (offline, no network).** If ``lib_index`` (the
+       ``{"doi","pmid","title"}`` map from :func:`zotero.library_index`, which
+       degrades to the DOI cache) is supplied, decide presence via
+       :func:`zotero.lookup_index_key` (DOI → PMID → title; the single owner of
+       that precedence). A hit returns a minimal ``{"key": ...}`` stub — all the
+       caller needs to write the field — without ANY per-item live search. This
+       is what lets ``unify-refs --apply`` run with no credentials/network.
+    2. **Live search ONLY as a reachable fallback, NEVER a crash.** On an index
+       miss, attempt a live ``get_item_by_doi`` / ``search_items`` so the normal
+       (Zotero-available) path still resolves works absent from a stale cache.
+       Any failure — ``RuntimeError`` (missing creds, raised by
+       ``zotero.build_request``), a network error, or
+       :class:`zotero.LibraryUnavailableError` — is CAUGHT and treated as "no
+       match" (returns ``None``). An unmatched ref is left unconverted upstream;
+       NOTHING is ever created here. The matching is read-only either way.
+    """
     doi = _normalize_doi(meta.get("doi", ""))
+    title = meta.get("title", "")
+
+    # (1) Offline match against the resilient cached index first.
+    if lib_index:
+        key = zotero.lookup_index_key(
+            lib_index, doi=doi or None, pmid=meta.get("pmid"), title=title or None
+        )
+        if key:
+            return {"key": key, "data": {"key": key}}
+
+    # (2) Live fallback — only when reachable, and never allowed to crash.
     if doi:
-        item = zotero.get_item_by_doi(doi)
+        try:
+            item = zotero.get_item_by_doi(doi)
+        except (RuntimeError, OSError):
+            # RuntimeError covers missing creds (build_request) AND
+            # LibraryUnavailableError; OSError covers urllib network failures.
+            item = None
         if item:
             return item
-    title = meta.get("title", "")
     if not title:
         return None
     ntitle = _normalize_title(title)
     if not ntitle:
         return None
     if ntitle not in title_cache:
-        title_cache[ntitle] = zotero.search_items(title)
+        try:
+            title_cache[ntitle] = zotero.search_items(title)
+        except (RuntimeError, OSError):
+            title_cache[ntitle] = []
     candidates = title_cache[ntitle]
     year = str(meta.get("year") or "").strip()
     first_author = ""
@@ -818,6 +856,21 @@ def _item_key(item: dict) -> str:
     if not isinstance(item, dict):
         return ""
     return item.get("key") or item.get("data", {}).get("key", "")
+
+
+def _item_uri_offline_safe(zotero, key: str) -> str:
+    """Canonical Zotero item URI for ``key``, NEVER raising on a degraded read.
+
+    ``zotero.item_uri`` only needs the library id/type (no network) but RAISES
+    when credentials are entirely unset. On a DEGRADED read (offline match, creds
+    missing) we cannot form the canonical URI — return ``""`` rather than crash.
+    The written field still carries the matched item KEY, so Word/Zotero rebind
+    the full URI/itemData on the first Refresh.
+    """
+    try:
+        return zotero.item_uri(key)
+    except (RuntimeError, OSError):
+        return ""
 
 
 def convert_to_zotero(
@@ -880,6 +933,17 @@ def convert_to_zotero(
     match_cache: Dict[str, object] = {}
     title_cache: Dict[str, list] = {}
     already_zotero: set = set()
+
+    # Resilient cached library index (DOI→PMID→title), loaded ONCE per run for
+    # OFFLINE matching. ``strict=False`` degrades a failed read to the DOI cache
+    # rather than raising; wrap defensively so even a hard
+    # LibraryUnavailableError (neither cache loadable) cannot crash the rewrite —
+    # we simply fall through to the per-item live fallback (also crash-proof) and,
+    # if that is unreachable too, leave refs unconverted (fail-closed).
+    try:
+        lib_index = zotero.library_index(strict=False)
+    except Exception:  # noqa: BLE001 — degrade to no offline index, never crash
+        lib_index = None
 
     for f_instr in _field_codes(root):
         if f_instr.strip().lower().startswith("addin zotero_item"):
@@ -956,7 +1020,9 @@ def convert_to_zotero(
                 continue
 
             # (c) fresh library lookup.
-            item = _match_in_library(meta, zotero, title_cache=title_cache)
+            item = _match_in_library(
+                meta, zotero, title_cache=title_cache, lib_index=lib_index
+            )
             if item is None:
                 if cache_key:
                     match_cache[cache_key] = _MISS
@@ -973,9 +1039,20 @@ def convert_to_zotero(
                 })
                 continue
             key = _item_key(item)
-            idata_list = zotero.csljson([key]) if key else []
-            idata = idata_list[0] if idata_list else {}
-            uri = zotero.item_uri(key) if key else ""
+            # csljson/item_uri network or require creds; on a DEGRADED read
+            # (matched offline against the cache, Zotero unreachable) they must
+            # not crash. The field is still writable: it carries the matched KEY
+            # and (best-effort) URI, so Word/Zotero rebind the full itemData on
+            # the first Refresh. idata is a pre-refresh display nicety → {} is
+            # fine; the URI is recovered offline from the cached config below.
+            idata = {}
+            if key:
+                try:
+                    idata_list = zotero.csljson([key])
+                    idata = idata_list[0] if idata_list else {}
+                except (RuntimeError, OSError):
+                    idata = {}
+            uri = _item_uri_offline_safe(zotero, key) if key else ""
             hit = {"key": key, "uri": uri, "itemdata": idata}
             if cache_key:
                 match_cache[cache_key] = hit
@@ -1004,12 +1081,18 @@ def convert_to_zotero(
         # placeholder (the live field carries the real citationItems and Word/
         # Zotero regenerate the true grouped marker on refresh).
         if len(resolved_keys) == 1:
-            rendered = (
-                "".join(
-                    zotero.formatted_citations(resolved_keys, style=style, kind="citation")
+            try:
+                rendered = (
+                    "".join(
+                        zotero.formatted_citations(resolved_keys, style=style, kind="citation")
+                    )
+                    or "(citation)"
                 )
-                or "(citation)"
-            )
+            except (RuntimeError, OSError):
+                # Degraded read: the live marker is unavailable. The placeholder
+                # is a pre-refresh display value only; Word/Zotero regenerate the
+                # real marker on Refresh from the field's citationItems.
+                rendered = "(citation)"
         else:
             rendered = "(citation)"
 

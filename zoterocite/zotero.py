@@ -763,6 +763,54 @@ def library_index_status(
     return idx, dict(_last_index_status)
 
 
+def lookup_index_key(
+    lib_index: Optional[dict],
+    *,
+    doi: Optional[str] = None,
+    pmid: Optional[str] = None,
+    title: Optional[str] = None,
+) -> Optional[str]:
+    """Return an existing library item *key* for a ref, or ``None`` if absent.
+
+    THE single owner of "is this ref already in the library, and under what
+    key?" — decides presence by DOI → PMID → normalized-title against the three
+    maps of a ``{"doi","pmid","title"}`` index built by :func:`library_index`.
+    A match on ANY of the three identifiers wins (a DOI-less but title-present
+    ref is still PRESENT — the DOI-only test this consolidates false-flagged such
+    refs as missing, which under a confident ``--apply`` mass-duplicated the
+    shared group library).
+
+    Pure and OFFLINE: it only reads the in-memory ``lib_index`` — no network, no
+    ``build_request``, no credential requirement. ``lib_index`` may be ``None``
+    or partial (a degraded read degrades to empty/absent sub-maps); a missing
+    sub-map simply yields no match for that identifier. Callers
+    (:mod:`unify`, :mod:`citeconvert`) MUST route presence checks through here
+    rather than re-deciding so the DOI→PMID→title precedence stays single-sourced.
+    """
+    if not lib_index:
+        return None
+    doi_idx = lib_index.get("doi") or {}
+    pmid_idx = lib_index.get("pmid") or {}
+    title_idx = lib_index.get("title") or {}
+
+    if doi:
+        norm = citecheck._normalise_doi(doi)
+        key = doi_idx.get(norm)
+        if key:
+            return key
+    if pmid:
+        key = pmid_idx.get(str(pmid).strip())
+        if key:
+            return key
+    if title:
+        nt = _normalize_title(title)
+        if nt:
+            key = title_idx.get(nt)
+            if key:
+                return key
+    return None
+
+
 def _item_key_of(item: Any) -> Optional[str]:
     """Best-effort recover the Zotero *itemKey* from an item the API returned.
 
