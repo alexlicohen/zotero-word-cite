@@ -957,6 +957,21 @@ def item_uri(key: str) -> str:
     return f"http://zotero.org/{prefix}/{cfg['library_id']}/items/{key}"
 
 
+def item_uri_offline_safe(key: str) -> str:
+    """Canonical item URI for ``key``, NEVER raising on a degraded read.
+
+    ``item_uri`` needs only the library id/type (no network) but RAISES when
+    credentials are entirely unset. On a DEGRADED read (offline match, creds
+    missing) we cannot form the canonical URI — return ``""`` rather than crash.
+    The written field still carries the matched item KEY, so Word/Zotero rebind
+    the full URI/itemData on the first Refresh. SINGLE OWNER of this fallback —
+    citeconvert + unify call here instead of each re-deciding (avoids drift)."""
+    try:
+        return item_uri(key)
+    except (RuntimeError, OSError):
+        return ""
+
+
 def csljson(item_keys: list[str]) -> list[dict]:
     """CSL-JSON metadata for ``item_keys`` (Zotero ``format=csljson``).
 

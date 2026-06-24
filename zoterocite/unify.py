@@ -986,7 +986,10 @@ def apply_unification(
             continue
         key = pl["key"]
         idata = _itemdata_from_meta(pl["meta"], key)
-        uri = zotero.item_uri(key)
+        # Degrade-safe: a matched-key placement under a DEGRADED read (offline /
+        # creds missing) must still write the field (carries the KEY; Word rebinds
+        # the URI on Refresh) rather than crash on item_uri. See zotero single owner.
+        uri = zotero.item_uri_offline_safe(key)
         # F7: resolve each linked marker against the inventory of the MUTATED file
         # (rewrite_src). Prefer the plan-carried marker text (index-shift-proof);
         # fall back to the raw plan index only for old/serialized plans that lack
@@ -1026,7 +1029,7 @@ def apply_unification(
         ph = pl["ph"]
         anchor = ph["text"]
         idata = _itemdata_from_meta(pl["meta"], key)
-        uri = zotero.item_uri(key)
+        uri = zotero.item_uri_offline_safe(key)  # degrade-safe (see above / zotero owner)
         if ph.get("kind") == "comment" or not _anchor_is_unique(anchor):
             # Comment-embedded placeholders have no in-body text anchor; and a
             # non-unique bracket can't be safely targeted. Surface for input.

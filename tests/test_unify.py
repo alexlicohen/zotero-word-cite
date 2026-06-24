@@ -1104,11 +1104,55 @@ class TestF7Integration:
 
 
 # ===========================================================================
-# Regression: apply_unification must NOT re-cite an in-text marker whose text
-# already matches a live Zotero field's rendered text (the unify-refs guard,
-# commit b666cd5).  ``existing_renderings`` snapshots live fields before any
-# insertion and the apply loop skips matching anchors.
+# Regression: apply_unification must not CRASH on a DEGRADED read (creds unset)
+# when it has a matched in-library key to link. zotero.item_uri RAISES without
+# credentials; the apply loop must route through zotero.item_uri_offline_safe so
+# it degrades to an empty URI (field still carries the KEY; Word rebinds on
+# Refresh) and creates NOTHING. Found by the real-doc apply test (two grant docs
+# crashed at unify.py item_uri); the citeconvert fix covered only its own path.
 # ===========================================================================
+
+class TestApplyDegradedItemUri:
+    def test_apply_links_matched_key_without_creds_no_crash(self, draft, monkeypatch):
+        # Smith is in-library; item_uri raises (no creds). Apply must NOT crash,
+        # must still write Smith's field, must pass an EMPTY uri, create nothing.
+        monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve)
+        monkeypatch.setattr(
+            unify.zotero, "library_index",
+            lambda **kw: {"doi": {"10.1/smith2020": "SMITHKEY"}, "pmid": {}, "title": {}})
+        monkeypatch.setattr(unify.citecheck, "ensure_retraction_db",
+                            lambda **kw: (None, None))
+
+        def _no_creds(_key):
+            raise RuntimeError("Zotero credentials not configured; set env var(s): "
+                               "ZOTERO_API_KEY, ZOTERO_GROUP_ID or ZOTERO_USER_ID")
+        # Patch the underlying primitive to raise. The real item_uri_offline_safe
+        # (same module namespace) must catch it — that is the behavior under test.
+        monkeypatch.setattr(unify.zotero, "item_uri", _no_creds)
+        # Belt-and-suspenders: creation must never be reachable on this path.
+        def _boom_create(*a, **k):  # pragma: no cover - asserts it is never called
+            raise AssertionError("apply created an item on a degraded/no-creds read")
+        monkeypatch.setattr(unify.zotero, "create_items", _boom_create)
+
+        inserts = []
+        monkeypatch.setattr(
+            unify.zoterofield, "replace_text_with_zotero_field",
+            lambda doc, anchor, keys, **kw: inserts.append(
+                (anchor, list(keys), list(kw.get("uris", [])))) or doc)
+
+        out = draft.parent / "out.docx"
+        # add_missing=False (the --no-add-missing constraint): never create.
+        report = unify.apply_unification(draft, plan=unify.plan_unification(draft),
+                                         decisions={"accept": []}, out=out,
+                                         add_missing=False, track=True)
+
+        smith = [(a, keys, uris) for a, keys, uris in inserts if keys == ["SMITHKEY"]]
+        assert smith, "Smith's in-library key was not linked (apply degraded too far or crashed)"
+        # The degraded URI is empty — the field still carries the KEY.
+        assert all(uris == [""] for _a, _keys, uris in smith), \
+            f"expected empty URI on a degraded read, got {smith}"
+        assert report["added"] == [], "nothing must be created on a degraded read"
+
 
 class TestLiveFieldGuard:
     """End-to-end: a doc with an existing live ZOTERO_ITEM field rendering

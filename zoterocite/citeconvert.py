@@ -865,12 +865,10 @@ def _item_uri_offline_safe(zotero, key: str) -> str:
     when credentials are entirely unset. On a DEGRADED read (offline match, creds
     missing) we cannot form the canonical URI — return ``""`` rather than crash.
     The written field still carries the matched item KEY, so Word/Zotero rebind
-    the full URI/itemData on the first Refresh.
+    the full URI/itemData on the first Refresh. Delegates to the single owner
+    ``zotero.item_uri_offline_safe`` so the degrade rule lives in one place.
     """
-    try:
-        return zotero.item_uri(key)
-    except (RuntimeError, OSError):
-        return ""
+    return zotero.item_uri_offline_safe(key)
 
 
 def convert_to_zotero(
