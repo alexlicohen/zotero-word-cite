@@ -325,6 +325,92 @@ class TestLibraryIndex:
         assert zotero_mod._extract_pmid_from_item({"data": {}}) is None
 
 
+class TestLibraryIndexStrictLenient:
+    """The strict/lenient split: writes fail closed; reads degrade to the
+    library_doi_index disk cache (DOI-only) instead of going empty."""
+
+    @staticmethod
+    def _boom(**kw):
+        raise RuntimeError("network is down")
+
+    @staticmethod
+    def _write_doi_cache(map_: dict[str, str]) -> None:
+        """Seed the legacy DOI-only disk cache (zotero_doi_index.json)."""
+        p = zotero_mod._DOI_INDEX_CACHE
+        p.parent.mkdir(parents=True, exist_ok=True)
+        # Stale on purpose — the lenient fallback ignores TTL on a failed read.
+        p.write_text(
+            json.dumps({"fetched_at": time.time() - 10 * 86400, "index": map_}),
+            encoding="utf-8",
+        )
+
+    def test_lenient_falls_back_to_doi_cache(self, monkeypatch):
+        """strict=False + failed fetch + cold combined cache + present DOI cache
+        → DOI-only index, no raise; status reports degraded/doi_only."""
+        doi_map = {"10.1234/alpha": "AKEY", "10.1234/beta": "BKEY"}
+        self._write_doi_cache(doi_map)
+        monkeypatch.setattr(zotero_mod, "fetch_all", self._boom)
+
+        idx, status = zotero_mod.library_index_status(strict=False)
+        assert idx == {"doi": doi_map, "pmid": {}, "title": {}}
+        assert status == {"degraded": True, "doi_only": True}
+        # The plain back-compat accessor returns the same dict (no raise).
+        zotero_mod._lib_index_mem = None
+        assert zotero_mod.library_index(strict=False) == {
+            "doi": doi_map, "pmid": {}, "title": {},
+        }
+
+    def test_strict_failed_fetch_cold_cache_raises(self, monkeypatch):
+        """strict=True (default) + failed fetch + cold combined cache → RAISE,
+        even when a stale DOI cache exists (fail-closed: never serve it to a write)."""
+        # A stale DOI cache is present, but strict must NOT use it.
+        self._write_doi_cache({"10.1234/alpha": "AKEY"})
+        monkeypatch.setattr(zotero_mod, "fetch_all", self._boom)
+
+        with pytest.raises(zotero_mod.LibraryUnavailableError):
+            zotero_mod.library_index()           # default strict=True
+        with pytest.raises(zotero_mod.LibraryUnavailableError):
+            zotero_mod.library_index(strict=True)
+
+    def test_lenient_neither_cache_raises(self, monkeypatch):
+        """strict=False but NEITHER cache loadable → still raises (nothing to serve)."""
+        # No combined cache (tmp), no DOI cache written.
+        assert not zotero_mod._DOI_INDEX_CACHE.exists()
+        assert not zotero_mod._LIB_INDEX_CACHE.exists()
+        monkeypatch.setattr(zotero_mod, "fetch_all", self._boom)
+
+        with pytest.raises(zotero_mod.LibraryUnavailableError):
+            zotero_mod.library_index(strict=False)
+
+    def test_lenient_prefers_fresh_combined_cache_not_degraded(self, monkeypatch):
+        """A usable combined cache is served full (DOI+PMID+title), NOT degraded,
+        even with strict=False — the DOI-only fallback is the LAST resort."""
+        combined = {"doi": {"10.1/x": "XK"}, "pmid": {"99": "XK"}, "title": {"t": "XK"}}
+        lp = zotero_mod._LIB_INDEX_CACHE
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        lp.write_text(
+            json.dumps({"fetched_at": time.time() - 3600, "index": combined}),
+            encoding="utf-8",
+        )
+        # DOI cache also present but must be ignored in favour of the richer cache.
+        self._write_doi_cache({"10.1/x": "XK"})
+
+        def should_not_fetch(**kw):
+            raise AssertionError("fresh combined cache should serve; no fetch")
+
+        monkeypatch.setattr(zotero_mod, "fetch_all", should_not_fetch)
+        idx, status = zotero_mod.library_index_status(strict=False)
+        assert idx == combined
+        assert status == {"degraded": False, "doi_only": False}
+
+    def test_status_clean_on_normal_fetch(self, monkeypatch):
+        """A successful live fetch reports non-degraded status."""
+        monkeypatch.setattr(zotero_mod, "fetch_all", lambda **kw: LIB_ITEMS)
+        idx, status = zotero_mod.library_index_status(strict=False)
+        assert idx["doi"].get("10.1234/alpha") == "DK"
+        assert status == {"degraded": False, "doi_only": False}
+
+
 # ---------------------------------------------------------------------------
 # Tests for unify.py integration
 # ---------------------------------------------------------------------------

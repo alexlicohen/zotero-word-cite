@@ -405,6 +405,14 @@ _LIB_INDEX_CACHE = Path(__file__).parent.parent / "data" / "zotero_library_index
 # index_dict is {"doi": {...}, "pmid": {...}, "title": {...}}.
 _lib_index_mem: Optional[tuple[dict, float]] = None
 
+# Status of the MOST RECENT ``library_index`` call (mirrors the ``*_status``
+# pattern). Set as a side effect of every ``library_index`` invocation so
+# ``library_index_status`` can report degradation WITHOUT re-fetching — and so it
+# observes the result of a monkeypatched ``library_index`` in tests/callers that
+# patch that name. ``doi_only`` ⊆ ``degraded``: True only on a strict=False
+# DOI-cache fallback after a failed combined read.
+_last_index_status: dict = {"degraded": False, "doi_only": False}
+
 
 def _extract_doi_from_item(item: dict) -> Optional[str]:
     """Pull a DOI from a Zotero item's ``data`` block (checks ``DOI`` then ``extra``)."""
@@ -579,8 +587,30 @@ def _build_indexes_from_items(items: list[dict]) -> dict[str, dict[str, str]]:
     return {"doi": doi_idx, "pmid": pmid_idx, "title": title_idx}
 
 
+def _load_doi_cache_only() -> Optional[dict[str, str]]:
+    """Best-effort load of the ``library_doi_index`` disk cache, ignoring TTL.
+
+    Returns the ``{normalized_doi: item_key}`` map from
+    ``data/zotero_doi_index.json`` if it is present and parseable, else ``None``.
+    Used by :func:`library_index` (``strict=False``) to degrade a failed combined
+    fetch to DOI-only coverage rather than empty — the DOI cache survives outages
+    that leave the combined ``library_index`` cache cold. NEVER raises.
+    """
+    if not _DOI_INDEX_CACHE.exists():
+        return None
+    try:
+        with _DOI_INDEX_CACHE.open("r", encoding="utf-8") as fh:
+            cached = json.load(fh)
+        idx = cached.get("index")
+        if isinstance(idx, dict):
+            return idx
+    except Exception:  # noqa: BLE001 — corrupt/unreadable cache: nothing to serve
+        pass
+    return None
+
+
 def library_index(
-    *, refresh: bool = False, max_age_hours: float = 24.0
+    *, refresh: bool = False, max_age_hours: float = 24.0, strict: bool = True
 ) -> dict[str, dict[str, str]]:
     """Return ``{"doi": {...}, "pmid": {...}, "title": {...}}`` for the whole library.
 
@@ -588,17 +618,37 @@ def library_index(
     (normalised-DOI→key, PMID→key, normalised-title→key) so a caller can decide
     presence by DOI → PMID → title without three separate fetches.
 
-    Caching and failure semantics mirror :func:`library_doi_index` exactly — a
-    two-layer cache (in-memory tuple + the gitignored disk file
-    ``data/zotero_library_index.json``), ``refresh=True`` bypasses both, an empty
-    library returns three empty maps, and a *read failure* with no usable cache
-    raises :class:`LibraryUnavailableError` (never a silent empty library) so
-    write paths fail closed. It uses a SEPARATE cache from ``library_doi_index``
-    so that function's on-disk format and tests stay byte-compatible.
+    Caching mirrors :func:`library_doi_index` — a two-layer cache (in-memory
+    tuple + the gitignored disk file ``data/zotero_library_index.json``),
+    ``refresh=True`` bypasses both, and an empty library returns three empty maps.
 
-    The API key is never written to the cache file or any log.
+    **Failure semantics depend on ``strict`` (the WRITE-vs-READ split):**
+
+    * ``strict=True`` (default — the WRITE/fail-closed path, e.g.
+      :func:`unify.apply_unification`): on a fetch failure with no fresh combined
+      cache, RAISE :class:`LibraryUnavailableError`. A stale DOI-only fallback is
+      DELIBERATELY refused — a stale cache could miss recently-added items and
+      cause duplicate creation in the shared group. This is the historical
+      behaviour and MUST NOT change.
+    * ``strict=False`` (the READ/coverage path, e.g.
+      :func:`unify.plan_unification`, :mod:`citelink` coverage): on a fetch
+      failure with no fresh combined cache, FALL BACK to the ``library_doi_index``
+      disk cache and return a DEGRADED, DOI-only index
+      ``{"doi": <that map>, "pmid": {}, "title": {}}`` — far better than empty
+      (empty would flip every reference to "missing"). Only raises if NEITHER
+      cache is loadable. Use :func:`library_index_status` to detect and label the
+      degraded mode in a coverage summary.
+
+    As a side effect, records the degraded/doi_only flags for the most recent
+    call in the module-level ``_last_index_status`` so :func:`library_index_status`
+    can report them without a second fetch. The API key is never written to the
+    cache file or any log.
     """
-    global _lib_index_mem
+    global _lib_index_mem, _last_index_status
+
+    # Default the recorded status to clean; overwritten only on the DOI-cache
+    # degrade branch. (A raise leaves it clean — there is no served index.)
+    _last_index_status = {"degraded": False, "doi_only": False}
 
     now = time.time()
     ttl_seconds = max_age_hours * 3600.0
@@ -647,8 +697,9 @@ def library_index(
         return idx
 
     except Exception as exc:  # noqa: BLE001 — network error or missing credentials
-        # Fall back to a usable disk cache if one is present; otherwise this is a
-        # DEGRADED READ, not an empty library — raise so write paths fail closed.
+        # First fallback: a usable (even stale) combined disk cache. This serves
+        # the full DOI+PMID+title index, so it is NOT degraded — and it is the
+        # ONLY fallback the strict (write) path is allowed to use.
         if _LIB_INDEX_CACHE.exists():
             try:
                 with _LIB_INDEX_CACHE.open("r", encoding="utf-8") as fh:
@@ -660,12 +711,56 @@ def library_index(
                         "pmid": idx.get("pmid") or {},
                         "title": idx.get("title") or {},
                     }
-            except Exception:  # noqa: BLE001 — corrupt/unreadable cache: no fallback
+            except Exception:  # noqa: BLE001 — corrupt/unreadable: keep degrading
                 pass
+
+        # Second fallback (READ/coverage path ONLY, strict=False): the
+        # library_doi_index disk cache. The combined cache is cold but the DOI
+        # cache survived the SAME outage (library_doi_index degrades to it), so
+        # serve DOI-only coverage instead of empty. PMID/title are unavailable in
+        # this mode. The WRITE path (strict=True) NEVER takes this branch — a
+        # stale DOI cache could miss recently-added items and drive duplicate
+        # creation, so writes must fail closed.
+        if not strict:
+            doi_cache = _load_doi_cache_only()
+            if doi_cache is not None:
+                _last_index_status = {"degraded": True, "doi_only": True}
+                return {"doi": doi_cache, "pmid": {}, "title": {}}
+
         raise LibraryUnavailableError(
             "Could not load the Zotero library index (read failed and no usable "
             "cache). Refusing to treat this as an empty library."
         ) from exc
+
+
+def library_index_status(
+    *, refresh: bool = False, max_age_hours: float = 24.0, strict: bool = True
+) -> tuple[dict[str, dict[str, str]], dict]:
+    """Like :func:`library_index`, but also report whether the read was DEGRADED.
+
+    Returns ``(index, status)`` where ``status`` is
+    ``{"degraded": bool, "doi_only": bool}`` — mirroring the ``*_status`` pattern
+    used by :func:`entrez.efetch_pubmed_status`. ``degraded``/``doi_only`` are
+    ``True`` only when a live/combined-cache read FAILED and we served the
+    ``library_doi_index`` disk cache as a DOI-only fallback (``strict=False``
+    only). A normal fresh/cached read reports ``{"degraded": False,
+    "doi_only": False}``.
+
+    This is a thin wrapper over :func:`library_index` (it reads the status that
+    call records as a side effect), so callers and tests that monkeypatch
+    ``library_index`` are observed correctly — a patched non-raising
+    ``library_index`` is reported as non-degraded; a patched raising one
+    propagates :class:`LibraryUnavailableError` to the caller as before.
+
+    See :func:`library_index` for the ``strict`` contract and failure semantics.
+    """
+    global _last_index_status
+    # Reset before the call so a monkeypatched ``library_index`` (which bypasses
+    # the real body's reset) is reported as non-degraded rather than leaking a
+    # prior real call's status.
+    _last_index_status = {"degraded": False, "doi_only": False}
+    idx = library_index(refresh=refresh, max_age_hours=max_age_hours, strict=strict)
+    return idx, dict(_last_index_status)
 
 
 def _item_key_of(item: Any) -> Optional[str]:

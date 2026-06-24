@@ -353,6 +353,33 @@ class TestCoverageFallback:
         assert tito["in_library"] is True
         assert tito["existing_key"] == "TITLEKEY"
 
+    def test_degraded_doi_only_read_still_matches_by_doi(self, four_ref_doc, monkeypatch):
+        """On a DEGRADED read (combined index unavailable, served from the DOI
+        cache) plan_unification consumes library_index_status(strict=False): the
+        DOI-bearing ref still reads in_library (NOT false-missing), and the
+        summary marks the coverage degraded/DOI-only with a provisional note."""
+        monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve_idfallback)
+        monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: (None, None))
+
+        degraded_index = {"doi": {"10.1/smith2020": "SMITHKEY"}, "pmid": {}, "title": {}}
+
+        def _degraded_status(*, strict=True, **kw):
+            assert strict is False, "plan_unification (read) must call strict=False"
+            return degraded_index, {"degraded": True, "doi_only": True}
+
+        monkeypatch.setattr(unify.zotero, "library_index_status", _degraded_status)
+
+        plan = unify.plan_unification(four_ref_doc)
+        by_title = {r["metadata"]["title"]: r for r in plan["references"] if r.get("metadata")}
+        smith = by_title["Tuberous sclerosis and autism"]
+        assert smith["in_library"] is True, "DOI match must survive a degraded read"
+        assert smith["existing_key"] == "SMITHKEY"
+
+        s = plan["summary"]
+        assert s["library_degraded"] is True
+        assert s["library_doi_only"] is True
+        assert "provisional" in s.get("network_note", "").lower()
+
     def test_doi_match_still_works(self, four_ref_doc, monkeypatch):
         """DOI match (the original path) is unbroken."""
         lib_index = {"doi": {"10.1/smith2020": "SMITHKEY"}, "pmid": {}, "title": {}}

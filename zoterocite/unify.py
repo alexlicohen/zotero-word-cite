@@ -306,23 +306,36 @@ def plan_unification(
     def _retracted(doi: Optional[str]) -> bool:
         return citecheck.is_retraction(doi or "", rw_db)
 
-    # ---- fetch library DOI index ONCE for all reference lookups -------------
-    # READ-ONLY path: a DEGRADED read (LibraryUnavailableError) must NOT crash
-    # the dry-run. Degrade to an empty index — every reference then reads as
-    # MISSING, the documented-safe behaviour for planning (nothing is written
-    # here; apply_unification keeps its OWN fail-closed guard so a degraded read
-    # at write time still refuses to create). See zotero.library_doi_index docs.
+    # ---- fetch library index ONCE for all reference lookups -----------------
+    # READ-ONLY (coverage) path: use strict=False so a DEGRADED combined read
+    # falls back to the library_doi_index disk cache (DOI-only coverage) instead
+    # of going fully empty. A DOI cache survives the SAME outage that leaves the
+    # combined cache cold, so a ref whose DOI is in that cache still reads
+    # in_library rather than false-"missing". Only when NEITHER cache is loadable
+    # does library_index raise; we degrade THAT to empty (nothing is written
+    # here — apply_unification keeps its OWN fail-closed guard so a degraded read
+    # at write time still refuses to create). See zotero.library_index docs.
     #
     # When offline=True, pass max_age_hours=inf so that a stale cache is still
-    # used without a live network refresh. If there is no cache at all the fetch
-    # attempt inside library_doi_index raises LibraryUnavailableError (no
-    # network, no cache → nothing to serve), which we degrade to {} just as we
-    # do for any other unavailable read.  Either way: zero network calls.
+    # used without a live network refresh. Either way: zero network calls.
+    network_note: Optional[str] = None
     try:
         _doi_kw = {"max_age_hours": float("inf")} if offline else {}
-        lib_index = zotero.library_index(**_doi_kw)
+        lib_index, _lib_status = zotero.library_index_status(strict=False, **_doi_kw)
     except zotero.LibraryUnavailableError:
         lib_index = {"doi": {}, "pmid": {}, "title": {}}
+        _lib_status = {"degraded": True, "doi_only": True}
+        network_note = (
+            "Zotero library unavailable and no cache — coverage unknown; "
+            "treat 'missing from library' counts as provisional"
+        )
+    else:
+        if _lib_status.get("degraded"):
+            network_note = (
+                "Zotero unreachable — used cached DOI-only library coverage; "
+                "PMID/title matches unavailable, so 'missing from library' "
+                "counts are provisional (DOI matches are real)"
+            )
     # Back-compat alias: existing code below reads ``doi_index`` for DOI lookups.
     doi_index = lib_index.get("doi") or {}
 
@@ -438,7 +451,11 @@ def plan_unification(
         "n_missing": n_missing,
         "n_retracted": n_retracted,
         "n_foreign_fields": n_foreign_fields,
+        "library_degraded": bool(_lib_status.get("degraded")),
+        "library_doi_only": bool(_lib_status.get("doi_only")),
     }
+    if network_note:
+        summary["network_note"] = network_note
 
     return {
         "summary": summary,
@@ -701,8 +718,11 @@ def apply_unification(
     # library: if we proceeded with empty maps every accepted work would look
     # "missing" and we would create DUPLICATES in the shared group. Fail closed —
     # keep ``lib_index = None`` as a sentinel and refuse to create below (step 4).
+    # strict=True (explicit): the WRITE path NEVER serves a stale DOI-only
+    # fallback — a stale cache could miss recently-added items and mass-duplicate
+    # the shared group. A degraded read here MUST raise so we fail closed.
     try:
-        lib_index = zotero.library_index()
+        lib_index = zotero.library_index(strict=True)
     except zotero.LibraryUnavailableError:
         lib_index = None
     # Back-compat: step 4 / create_items take a flat DOI→key map. ``None`` is the
