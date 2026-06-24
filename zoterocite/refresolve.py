@@ -327,6 +327,46 @@ def check_preprint_status(doi: str, *, fetch: bool = True) -> dict:
 # 2. crossref_bibliographic
 # ---------------------------------------------------------------------------
 
+# Author-block noise that depresses Crossref ``query.bibliographic`` recall for
+# two real-world reference styles that are otherwise well-formed:
+#
+#   1. comma-initials with an ``et al.`` BEFORE the title:
+#        ``Saeedi, M.T.S., et al., Title of the paper, Journal, Year``
+#   2. hyphenated-initials with ``et al.`` before the title:
+#        ``Chao H-T, Collins ..., et al. Title of the paper.``
+#
+# In the standard style (``Surname Initials. Title. Journal. Year;...``) the
+# author initials are a single clean token (``MTS``) or space-separated
+# (``M T S``); in the two failing styles they arrive DOTTED (``M.T.S.``) or
+# HYPHENATED (``H-T``), so a whitespace/punctuation tokeniser splits the author
+# surname away from its initials and the literal ``et al`` injects two junk
+# query terms.  Normalising the query — dropping ``et al`` and collapsing a run
+# of single-letter UPPERCASE initials joined by ``.``/``-`` into space-separated
+# letters — makes all three styles present the SAME author-token shape to
+# Crossref without touching the title, DOIs, page ranges, or hyphenated words.
+#
+# ``_INITIALS_RUN_RE`` is deliberately UPPERCASE-only and token-bounded so it
+# cannot mangle a lowercase DOI fragment (``j.neuron``), a hyphenated title word
+# (``anti-inflammatory``), or a page range (``100-110``): those are either
+# lowercase or a single letter followed by a multi-letter run, neither of which
+# matches a run of single uppercase letters.
+_ETAL_RE = re.compile(r',?\s*\bet\s+al\.?\s*,?', re.IGNORECASE)
+_INITIALS_RUN_RE = re.compile(r'\b([A-Z](?:[.\-][A-Z]){1,4})\.?(?=\b|$)')
+
+
+def _normalize_bibliographic_query(query: str) -> str:
+    """Strip ``et al`` and collapse dotted/hyphenated initial runs in *query*.
+
+    Used only for the Crossref ``query.bibliographic`` blob; the resolver scores
+    candidates against the ORIGINAL reference text, so this normalisation affects
+    recall only and can never change the confidence-ladder signals.  Idempotent;
+    a standard-style reference passes through unchanged.
+    """
+    s = _ETAL_RE.sub(' ', query)
+    s = _INITIALS_RUN_RE.sub(lambda m: ' '.join(c for c in m.group(1) if c.isalpha()), s)
+    return re.sub(r'\s{2,}', ' ', s).strip()
+
+
 def _parse_crossref_item(item: dict) -> dict:
     """Extract the fields we care about from one Crossref ``works`` item."""
     doi = (item.get("DOI") or "").strip() or None
@@ -390,8 +430,15 @@ def crossref_bibliographic(query: str, *, rows: int = 5) -> list[dict]:
     if not query or not query.strip():
         return []
 
+    # Normalise author-block noise (``et al``, dotted/hyphenated initials) so the
+    # two comma-/hyphen-initial reference styles present the SAME author-token
+    # shape to Crossref as the standard style — see _normalize_bibliographic_query.
+    normalized = _normalize_bibliographic_query(query)
+    if not normalized:
+        return []
+
     params = urllib.parse.urlencode({
-        "query.bibliographic": query.strip(),
+        "query.bibliographic": normalized,
         "rows": str(rows),
         "mailto": _http.contact_email(),
     })
@@ -472,15 +519,21 @@ def _first_author_surname_in_text(candidate: dict, text: str) -> bool:
     # Short surname (< 3 chars, e.g. 'An', 'Wu', 'Xu', 'Li'): require the
     # author's initials to corroborate so we are matching a real author token,
     # not a coincidental short word.  Initial(s) from the given name must appear
-    # as a standalone token (typical "An H" / "Wu JF" reference forms).
+    # next to the surname.  The separator between surname and initials, and
+    # between the initials themselves, is tolerant so all the real-world byline
+    # styles are credited: "An H" / "Wu JF" (standard), "Ng, M.T.S." (comma +
+    # dotted initials), and "Wu H-T" (hyphenated initials) — the same author
+    # shapes the Crossref query normaliser folds together.
     given = (first.get("given") or "").strip()
     initials = [g[0] for g in re.findall(r"[A-Za-z]+", given) if g]
     if not initials:
         return False
-    init_pat = "".join(initials)  # e.g. "H" or "JF"
+    # Optional comma after the surname; '.', '-', or whitespace between initials.
+    init_sep = r"[.\-\s]*"
+    init_pat = init_sep.join(re.escape(i) for i in initials)
     return bool(
         re.search(
-            rf"\b{re.escape(family)}\s+{re.escape(init_pat)}\b",
+            rf"\b{re.escape(family)}\s*,?\s*{init_pat}\b",
             text,
             re.IGNORECASE,
         )

@@ -208,6 +208,157 @@ class TestCrossrefBibliographic:
 
 
 # ---------------------------------------------------------------------------
+# 2b. Bibliographic-query recall for comma-/hyphen-initial "et al." styles.
+#
+# Two real-world reference styles depress Crossref recall because the author
+# initials arrive DOTTED ("M.T.S.") or HYPHENATED ("H-T") and a literal "et al."
+# precedes the title — so the author surname is split from its initials in the
+# query blob.  The fix normalises the query (drop "et al"; collapse single-letter
+# UPPERCASE initial runs joined by "."/"-" into spaced letters) so all three
+# styles present the SAME author-token shape to Crossref.  These tests assert the
+# QUERY string actually sent, with the network mocked — no live Crossref.
+# ---------------------------------------------------------------------------
+
+class TestBibliographicQueryNormalization:
+    @staticmethod
+    def _capture_query(monkeypatch) -> dict:
+        """Patch http_get to capture the outgoing URL; return a mutable holder."""
+        captured: dict = {}
+
+        def fake(url, **kw):
+            captured["url"] = url
+            return _crossref_works_response([])  # empty result is fine; we only
+            #                                       inspect the request URL
+
+        monkeypatch.setattr(_http_mod, "http_get", fake)
+        return captured
+
+    @staticmethod
+    def _query_param(url: str) -> str:
+        import urllib.parse
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        return qs["query.bibliographic"][0]
+
+    # -- the helper in isolation --------------------------------------------
+    def test_standard_style_query_unchanged(self):
+        std = ("Saeedi MTS, Smith J. A study of cortical tubers in tuberous "
+               "sclerosis. Epilepsia. 2021;62:1100-1110.")
+        assert rr._normalize_bibliographic_query(std) == std
+
+    def test_comma_dotted_etal_query_normalized(self):
+        # FORMAT 1: "Saeedi, M.T.S., et al., Title, Journal, Year"
+        raw = ("Saeedi, M.T.S., et al., A study of cortical tubers in tuberous "
+               "sclerosis, Epilepsia, 2021.")
+        out = rr._normalize_bibliographic_query(raw)
+        # "et al" gone; dotted initials collapsed to spaced letters
+        assert "et al" not in out.lower()
+        assert "M.T.S." not in out
+        assert "M T S" in out
+        # surname + title content preserved
+        assert "Saeedi" in out
+        assert "cortical tubers in tuberous sclerosis" in out
+
+    def test_hyphenated_initials_etal_query_normalized(self):
+        # FORMAT 2: "Chao H-T, Collins ..., et al. Title."
+        raw = ("Chao H-T, Collins MO, et al. The synaptic basis of "
+               "neurodevelopmental disorder. Nature. 2020.")
+        out = rr._normalize_bibliographic_query(raw)
+        assert "et al" not in out.lower()
+        assert "H-T" not in out
+        assert "H T" in out
+        assert "Chao" in out
+        assert "synaptic basis of neurodevelopmental disorder" in out
+
+    def test_normalization_preserves_dois_and_hyphenated_words(self):
+        # Hard negatives: a lowercase DOI fragment, hyphenated title words, and a
+        # page range must NOT be mangled by the initials-run collapse.
+        for s in (
+            "Fox MD. doi:10.1016/j.neuron.2019.01.001 Neuron 2019.",
+            "Smith J. Anti-inflammatory effects in long-term studies. "
+            "Brain. 2019;142:100-110.",
+            "Lee K. T-cell mediated U-Net analysis. Cell. 2022.",
+        ):
+            assert rr._normalize_bibliographic_query(s) == s
+
+    def test_normalization_is_idempotent(self):
+        raw = ("Saeedi, M.T.S., et al., A study of cortical tubers in tuberous "
+               "sclerosis, Epilepsia, 2021.")
+        once = rr._normalize_bibliographic_query(raw)
+        assert rr._normalize_bibliographic_query(once) == once
+
+    # -- the query actually sent over the (mocked) wire ---------------------
+    def test_standard_query_sent_verbatim(self, monkeypatch):
+        cap = self._capture_query(monkeypatch)
+        std = ("Saeedi MTS, Smith J. A study of cortical tubers in tuberous "
+               "sclerosis. Epilepsia. 2021;62:1100-1110.")
+        rr.crossref_bibliographic(std)
+        assert self._query_param(cap["url"]) == std
+
+    def test_format1_query_sent_normalized(self, monkeypatch):
+        cap = self._capture_query(monkeypatch)
+        rr.crossref_bibliographic(
+            "Saeedi, M.T.S., et al., A study of cortical tubers in tuberous "
+            "sclerosis, Epilepsia, 2021."
+        )
+        q = self._query_param(cap["url"])
+        assert "et al" not in q.lower() and "M.T.S." not in q
+        assert "Saeedi" in q and "M T S" in q
+        assert "cortical tubers in tuberous sclerosis" in q
+
+    def test_format2_query_sent_normalized(self, monkeypatch):
+        cap = self._capture_query(monkeypatch)
+        rr.crossref_bibliographic(
+            "Chao H-T, Collins MO, et al. The synaptic basis of "
+            "neurodevelopmental disorder. Nature. 2020."
+        )
+        q = self._query_param(cap["url"])
+        assert "et al" not in q.lower() and "H-T" not in q
+        assert "Chao" in q and "H T" in q
+        assert "synaptic basis of neurodevelopmental disorder" in q
+
+
+# ---------------------------------------------------------------------------
+# 2c. First-author surname signal for SHORT surnames across all byline styles.
+#
+# The author corroboration for a < 3-char surname (Ng/Wu/Xu/Li) must fire for
+# the comma-dotted ("Ng, M.T.S.") and hyphenated ("Wu H-T") styles too, not only
+# the standard "Wu HT" — otherwise the correct paper drops a corroborating
+# signal (high -> medium, and combined with weak recall, can vanish entirely).
+# Coincidental short substrings must still NOT match.
+# ---------------------------------------------------------------------------
+
+class TestShortSurnameAcrossStyles:
+    def test_standard_short_surname_credited(self):
+        cand = {"authors": [{"family": "Wu", "given": "H T"}]}
+        assert rr._first_author_surname_in_text(
+            cand, "Wu HT, Collins MO. Synaptic basis. Nature. 2020."
+        ) is True
+
+    def test_comma_dotted_short_surname_credited(self):
+        cand = {"authors": [{"family": "Ng", "given": "M T S"}]}
+        assert rr._first_author_surname_in_text(
+            cand, "Ng, M.T.S., et al., A study of tubers, Epilepsia, 2021."
+        ) is True
+
+    def test_hyphenated_short_surname_credited(self):
+        cand = {"authors": [{"family": "Wu", "given": "H T"}]}
+        assert rr._first_author_surname_in_text(
+            cand, "Wu H-T, Collins MO, et al. Synaptic basis. Nature. 2020."
+        ) is True
+
+    def test_coincidental_short_substring_still_rejected(self):
+        # Regression of the original guard: 'An' must not match inside 'analysis'.
+        cand = {"authors": [{"family": "An", "given": "H"}]}
+        assert rr._first_author_surname_in_text(
+            cand, "a meta analysis of cortical development 2019"
+        ) is False
+        # but a real "An H" token is credited
+        assert rr._first_author_surname_in_text(
+            cand, "An H, Smith J. 2021"
+        ) is True
+
+
+# ---------------------------------------------------------------------------
 # 3. resolve_reference tests
 # ---------------------------------------------------------------------------
 
