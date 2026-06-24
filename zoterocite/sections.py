@@ -255,6 +255,41 @@ _REF_ENUMERATOR_RE: Pattern = re.compile(
 # Each cue matches a *standalone heading* whose entire (stripped) text is the
 # section name or a common synonym / combined form.  A combined "Results and
 # Discussion" heading satisfies BOTH "results" and "discussion".
+# An OPTIONAL leading decimal section number that real journals prepend to IMRaD
+# headings ("2 Methods", "2.1 Methods", "3 Results", "3. Discussion").  Allows a
+# dotted hierarchy ("2.1") and one trailing dot ("3."), then REQUIRES at least
+# one whitespace before the section word.  Because every cue keeps its trailing
+# ``$`` anchor and matches the section word ALONE, a numbered prose line
+# ("3 patients were enrolled.") still does NOT match — the body word after the
+# number is not a bare section title.  Applied only to the numberable IMRaD body
+# cues (introduction / methods / results / discussion) and the combined
+# Results-and-Discussion cue; the shared "abstract" and "references" cues are
+# left as-is (they are cross-module-shared objects equal to ABSTRACT_HEADING_RE
+# / identical to REFERENCES_HEADING_RE, and are not section-numbered in practice).
+_SECTION_NUM_PREFIX = r"(?:\d+(?:\.\d+)*\.?\s+)?"
+
+# An OPTIONAL leading qualifier on the methods cue, so combined/qualified methods
+# headings match: "Subjects/Materials and Methods", "Subjects and Methods",
+# "Patients and Methods", "Participants and Methods", "Online Methods".  The
+# qualifier is zero-or-more {subjects|patients|participants|materials|online}
+# tokens, each followed by a REQUIRED connector (``/ , &`` optionally spaced, OR
+# " and ", OR bare whitespace).  It is OPTIONAL and the cue still REQUIRES a core
+# methods word at the end, so a bare "Subjects" (no methods word) does NOT match.
+# ("online" is included so the Nature-style "Online Methods" heading matches —
+# strictly additive, anchored whole-line.)
+#
+# Each qualifier unit ends in a MANDATORY connector (never a fully-optional one)
+# and the repetition is bounded ``{0,4}``: this is deliberate to keep the regex
+# LINEAR-time.  An earlier draft used ``(?:token\s*[/,&]?\s*(?:and\s+)?)*`` whose
+# all-optional connectors overlapped with the core ``materials\s+and\s+methods``
+# phrase, producing catastrophic exponential backtracking on a long methods-word
+# heavy near-miss line (~500 chars -> >2s).  Do NOT reintroduce optional
+# connectors here.
+_METHODS_QUALIFIER = (
+    r"(?:(?:subjects?|patients?|participants?|materials|online)"
+    r"(?:\s*[/,&]\s*|\s+and\s+|\s+)){0,4}"
+)
+
 MANUSCRIPT_SECTION_CUES: dict = {
     # Each whole-line cue tolerates an OPTIONAL trailing colon (``\s*:?\s*$``):
     # real accepted papers use colon-terminated headings ("Abstract:",
@@ -262,30 +297,64 @@ MANUSCRIPT_SECTION_CUES: dict = {
     # unambiguous, so this is a strict recall-widening.  This brings the
     # manuscript cues in line with ``ABSTRACT_HEADING_RE`` (which already
     # tolerated the colon) and ``REFERENCES_HEADING_RE`` (likewise).
-    "abstract": re.compile(r"^\s*abstract\s*:?\s*$", re.IGNORECASE),
+    #
+    # The numberable body cues additionally tolerate an OPTIONAL leading decimal
+    # section number (``_SECTION_NUM_PREFIX``), so journal-numbered headings
+    # ("2 Methods", "2.1 Methods", "3 Results", "3. Discussion") match without
+    # admitting numbered prose (the ``$`` anchor + section-word-alone keep
+    # "3 patients were enrolled." out).
+    #
+    # The abstract cue ALSO tolerates a RUN-IN heading where the "Abstract:"
+    # label and the abstract body share one paragraph ("Abstract: Neuroimaging
+    # research depends on ..."), which real accepted papers use.  Two arms:
+    #   * run-in:     ``abstract`` + ``:`` + whitespace + at least one body char
+    #                 (``:\s+\S``) — the colon and body are MANDATORY here;
+    #   * whole-line: the original bare/colon standalone form (``:?\s*$``).
+    # The arms are MUTUALLY EXCLUSIVE on the char after the (optional) colon, so
+    # the regex is linear-time — no nested optional quantifiers (the ReDoS class).
+    #
+    # This is the ONLY manuscript cue that gets run-in tolerance, and it is why
+    # this entry is DECOUPLED from ``ABSTRACT_HEADING_RE`` (which stays strict
+    # whole-line).  Run-in tolerance must NOT spread to the other IMRaD cues: a
+    # STRUCTURED abstract's run-in sub-labels ("Methods:", "Results:",
+    # "Conclusions:") would otherwise be mis-detected as the paper's actual
+    # Methods/Results sections at the wrong location.  And journalprofile reads
+    # the abstract BODY from ``paras[abstract_idx + 1:]`` after locating the
+    # strict ``ABSTRACT_HEADING_RE`` — a run-in match there would drop the
+    # same-line body text — so its pattern is deliberately left strict.
+    "abstract": re.compile(r"^\s*abstract\s*(?::\s+\S|:?\s*$)", re.IGNORECASE),
     "introduction": re.compile(
-        r"^\s*(introduction|background)\s*:?\s*$", re.IGNORECASE
+        r"^\s*" + _SECTION_NUM_PREFIX
+        + r"(?:introduction|background)\s*:?\s*$",
+        re.IGNORECASE,
     ),
     "methods": re.compile(
-        r"^\s*(methods"
-        r"|materials\s+and\s+methods"
-        r"|experimental\s+procedures"
-        r"|patients\s+and\s+methods)\s*:?\s*$",
+        r"^\s*" + _SECTION_NUM_PREFIX + _METHODS_QUALIFIER
+        + r"(?:materials\s+and\s+methods"
+        r"|methods(?:\s+and\s+materials)?"
+        r"|experimental\s+procedures)\s*:?\s*$",
         re.IGNORECASE,
     ),
     "results": re.compile(
-        r"^\s*(results|results\s+and\s+discussion)\s*:?\s*$", re.IGNORECASE
+        r"^\s*" + _SECTION_NUM_PREFIX
+        + r"(?:results|results\s+and\s+discussion)\s*:?\s*$",
+        re.IGNORECASE,
     ),
     "discussion": re.compile(
-        r"^\s*(discussion|results\s+and\s+discussion)\s*:?\s*$", re.IGNORECASE
+        r"^\s*" + _SECTION_NUM_PREFIX
+        + r"(?:discussion|results\s+and\s+discussion)\s*:?\s*$",
+        re.IGNORECASE,
     ),
     "references": REFERENCES_HEADING_RE,
 }
 
 # A combined "Results and Discussion" heading — one heading that doubles as both
-# the Results and the Discussion section (structure._RD_COMBINED_CUE).
+# the Results and the Discussion section (structure._RD_COMBINED_CUE).  Tolerates
+# the same optional leading decimal section number and trailing colon as the body
+# cues above ("5 Results and Discussion", "Results and Discussion:").
 RD_COMBINED_CUE: Pattern = re.compile(
-    r"^\s*results\s+and\s+discussion\s*$", re.IGNORECASE
+    r"^\s*" + _SECTION_NUM_PREFIX + r"results\s+and\s+discussion\s*:?\s*$",
+    re.IGNORECASE,
 )
 
 # Loose word-level section cues used for STYLE-detected headings only
