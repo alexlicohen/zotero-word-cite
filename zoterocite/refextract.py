@@ -203,6 +203,91 @@ _NON_REF_PREFIXES_RE = re.compile(
 )
 
 # ---------------------------------------------------------------------------
+# Contiguous year-less-entry recovery (the "#51 gap" fix)
+# ---------------------------------------------------------------------------
+# A numbered reference list can contain a year-less entry — an in-press / "in
+# preparation" paper with no published year and no DOI/PMID
+# ("51. Miller G, Steeby C. ... Imaging Neuroscience;").  The year requirement
+# in :func:`_is_reference_shaped` is a PRECISION guard for AMBIGUOUS lines, but a
+# numbered entry whose printed number is CONTIGUOUS with an accepted neighbour
+# inside a confirmed reference list is NOT ambiguous — dropping it leaves a
+# phantom gap (printed #51 missing between #50 and #52) so any in-text cite to it
+# can't resolve.
+#
+# These helpers gate the recovery narrowly: only an enumerator-led, reference-
+# LENGTH, author-shaped line whose number == (last accepted number + 1) is
+# admitted.  A standalone year-less numbered body line has no accepted #N-1
+# predecessor, so it never qualifies; a numbered instruction list
+# ("1. Run the script.") fails the length / author-shape bar.
+
+# Minimum length for a year-less filler to be reference-LENGTH (matches the
+# author-led bar in _is_reference_shaped).
+_FILLER_MIN_LEN = 40
+
+
+def _enum_number(txt: str) -> Optional[int]:
+    """Return the integer value of a line's leading enumerator, or ``None``.
+
+    Handles every enumerator shape the extractor recognises: ``51.``, ``[51]``,
+    ``(51)``, ``51)``, ``(51).``  Returns ``None`` for non-enumerator-led lines.
+    """
+    m = _NUMBERING_EXTRACT_RE.match(txt)
+    if not m:
+        return None
+    digits = re.sub(r"\D", "", m.group(1))
+    return int(digits) if digits else None
+
+
+def _is_contiguous_filler(txt: str, last_accepted_num: Optional[int]) -> bool:
+    """Return True if *txt* is a year-less reference entry that fills a numeric
+    hole immediately after *last_accepted_num* in a confirmed reference list.
+
+    Narrow recovery — ALL must hold:
+
+    * the line is enumerator-led and its number == ``last_accepted_num + 1``
+      (contiguous with the previous ACCEPTED entry — never admits an entry with
+      no accepted predecessor at N-1);
+    * it survives the figure/table/"Adapted from" precision guard;
+    * it is reference-LENGTH (> 40 chars);
+    * it is author-shaped: with its leading enumerator stripped, the remainder
+      matches one of the existing author-byline recognisers
+      (:data:`_AUTHOR_LIST_START_RE` — "Miller G, Steeby C, ..." — or
+      :data:`_REF_AUTHOR_START_RE` — "Miller G. ..."), which require a surname
+      FOLLOWED BY INITIALS.  This is what separates a real byline from a numbered
+      instruction sentence ("3. Submit the final report ..."): the instruction's
+      first word is followed by lowercase prose, not author initials, so neither
+      recogniser matches.
+
+    A year-bearing line is handled by :func:`_is_reference_shaped` directly and
+    never reaches here; this only rescues the year-LESS contiguous case.
+    """
+    if last_accepted_num is None:
+        return False
+    stripped = txt.strip()
+    if not stripped:
+        return False
+    if _NON_REF_PREFIXES_RE.match(stripped):
+        return False
+    num = _enum_number(stripped)
+    if num is None or num != last_accepted_num + 1:
+        return False
+    if len(stripped) <= _FILLER_MIN_LEN:
+        return False
+    # Strip the leading enumerator and re-test the remainder against the existing
+    # author-byline recognisers (which require surname + INITIALS — the feature
+    # that distinguishes a real byline from a numbered instruction sentence).
+    # Use the local CAPTURE pattern for the offset, NOT the shared boolean
+    # _ENUM_RE: the latter is a recall-superset that greedily consumes the first
+    # content character, which would corrupt the surname.
+    m = _NUMBERING_EXTRACT_RE.match(stripped)
+    if m is None:
+        return False
+    rest = stripped[m.end():]
+    return bool(
+        _AUTHOR_LIST_START_RE.match(rest) or _REF_AUTHOR_START_RE.match(rest)
+    )
+
+# ---------------------------------------------------------------------------
 # In-text citation patterns
 # ---------------------------------------------------------------------------
 
@@ -327,12 +412,18 @@ def _find_headingless_run(paras, exclude_indices: set) -> Optional[range]:
     best_run: Optional[range] = None
     run_start: Optional[int] = None
     run_len = 0
+    # Enumerator number of the last ACCEPTED entry in the current run, used to
+    # bridge a contiguous year-less filler ("#51 gap" fix).  None when the run is
+    # author-year style (no enumerators), so a year-less filler is never bridged
+    # in an unnumbered run — there is no number to be contiguous with.
+    last_accepted_num: Optional[int] = None
 
     for pi, p in enumerate(paras):
         if pi in exclude_indices:
             # Reset any current run if we hit the heading region
             run_start = None
             run_len = 0
+            last_accepted_num = None
             continue
 
         txt = _para_accepted_text(p).strip()
@@ -342,18 +433,32 @@ def _find_headingless_run(paras, exclude_indices: set) -> Optional[range]:
                 best_run = range(run_start, run_start + run_len)
             run_start = None
             run_len = 0
+            last_accepted_num = None
             continue
 
-        if _is_reference_shaped(txt):
+        # A year-less enumerator-led entry contiguous with the last accepted
+        # number is part of the run (in-press paper inside a numbered list); it
+        # only bridges WITHIN an already-open run, never starts one.
+        is_filler = (
+            run_start is not None
+            and not _is_reference_shaped(txt)
+            and _is_contiguous_filler(txt, last_accepted_num)
+        )
+
+        if _is_reference_shaped(txt) or is_filler:
             if run_start is None:
                 run_start = pi
             run_len += 1
+            n = _enum_number(txt)
+            if n is not None:
+                last_accepted_num = n
         else:
             # Non-ref paragraph — close current run if long enough
             if run_len >= _RUN_MIN_LEN and run_start is not None:
                 best_run = range(run_start, run_start + run_len)
             run_start = None
             run_len = 0
+            last_accepted_num = None
 
     # Handle a run that extends to the end of the document
     if run_len >= _RUN_MIN_LEN and run_start is not None:
@@ -561,6 +666,7 @@ def extract_references(path) -> dict:
     reflist_counter = 0
     if ref_heading_idx is not None:
         end = ref_end_idx if ref_end_idx is not None else len(paras)
+        last_accepted_num: Optional[int] = None
         for pi in range(ref_heading_idx + 1, end):
             txt = _para_accepted_text(paras[pi]).strip()
             if not txt:
@@ -574,8 +680,15 @@ def extract_references(path) -> dict:
             # next section (e.g. 'Disclosures' / 'Author Information' in an author
             # manuscript) — its prose is NOT reference-shaped, so it can never
             # pollute the inventory even though the region ran on past it.
+            #
+            # EXCEPTION (the "#51 gap" fix): a year-LESS enumerator-led entry
+            # whose number is contiguous with the last accepted entry
+            # (in-press / "in preparation" papers with no year, no DOI/PMID) is
+            # NOT ambiguous inside a confirmed reference list — admit it so its
+            # printed number isn't a phantom hole that breaks in-text resolution.
             if not _is_reference_shaped(txt):
-                continue
+                if not _is_contiguous_filler(txt, last_accepted_num):
+                    continue
             numbering = _extract_numbering(txt)
             reflist.append({
                 "index": reflist_counter,
@@ -584,6 +697,9 @@ def extract_references(path) -> dict:
                 "detected_by": "heading",
             })
             reflist_counter += 1
+            n = _enum_number(txt)
+            if n is not None:
+                last_accepted_num = n
 
     # -----------------------------------------------------------------------
     # 4b. Heading-less run detection

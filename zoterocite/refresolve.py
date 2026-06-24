@@ -26,6 +26,7 @@ check_preprint_status(doi, *, fetch=True) -> dict
 from __future__ import annotations
 
 import json
+import os
 import re
 import unicodedata
 import urllib.error
@@ -46,7 +47,37 @@ _CROSSREF_WORKS = "https://api.crossref.org/works"
 # The polite-pool User-Agent + contact email (the ``mailto`` query param) are
 # owned by :mod:`zoterocite._http`; call ``_http.user_agent()`` /
 # ``_http.contact_email()`` at request time instead of carrying our own copy.
+#
+# ``_TIMEOUT`` is the default per-Crossref-call socket timeout (seconds).  A
+# bounded timeout is the retry-saver: an unreachable Crossref host can otherwise
+# hang a CLI run for minutes per reference.  Deployments can lower the ceiling
+# via ``ZOTERO_WORD_CITE_HTTP_TIMEOUT`` (read at call time by :func:`resolve_timeout`,
+# clamped to a sane floor); with no env var set the value is the historical 15 s
+# so existing behaviour and the network-mock tests are byte-identical.
 _TIMEOUT = 15.0
+# Never allow a sub-second timeout to slip through (a typo'd env var) and turn
+# every lookup into a guaranteed failure; clamp to at least this many seconds.
+_MIN_TIMEOUT = 1.0
+
+
+def resolve_timeout() -> float:
+    """Per-Crossref-call socket timeout (seconds), read at CALL time.
+
+    Honours ``ZOTERO_WORD_CITE_HTTP_TIMEOUT`` (a per-process override so an unreachable
+    Crossref cannot hang the run for minutes), falling back to :data:`_TIMEOUT`.
+    A malformed/absent value yields the default; a too-small value is clamped to
+    :data:`_MIN_TIMEOUT`.
+    """
+    raw = os.environ.get("ZOTERO_WORD_CITE_HTTP_TIMEOUT")
+    if not raw:
+        return _TIMEOUT
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return _TIMEOUT
+    if val <= 0:
+        return _TIMEOUT
+    return max(val, _MIN_TIMEOUT)
 
 # DOI prefixes for known preprint servers.
 _PREPRINT_DOI_PREFIXES = (
@@ -243,7 +274,7 @@ def check_preprint_status(doi: str, *, fetch: bool = True) -> dict:
     # we need the raw ``relation`` field not surfaced by _parse_crossref_item).
     safe_doi = urllib.parse.quote(doi_clean, safe="/")
     url = f"{_CROSSREF_WORKS}/{safe_doi}"
-    body = _http.http_get(url, timeout=_TIMEOUT, headers={"Accept": "application/json"})
+    body = _http.http_get(url, timeout=resolve_timeout(), headers={"Accept": "application/json"})
     if body is None:
         return base_result
 
@@ -365,7 +396,7 @@ def crossref_bibliographic(query: str, *, rows: int = 5) -> list[dict]:
         "mailto": _http.contact_email(),
     })
     url = f"{_CROSSREF_WORKS}?{params}"
-    body = _http.http_get(url, timeout=_TIMEOUT, headers={"Accept": "application/json"})
+    body = _http.http_get(url, timeout=resolve_timeout(), headers={"Accept": "application/json"})
     if body is None:
         return []
 
@@ -676,7 +707,7 @@ def _crossref_doi_fetch(doi: str) -> Optional[dict]:
     """Fetch a single work by DOI from Crossref. Returns parsed item or None."""
     safe_doi = urllib.parse.quote(doi, safe="/")
     url = f"{_CROSSREF_WORKS}/{safe_doi}"
-    body = _http.http_get(url, timeout=_TIMEOUT, headers={"Accept": "application/json"})
+    body = _http.http_get(url, timeout=resolve_timeout(), headers={"Accept": "application/json"})
     if body is None:
         return None
     try:

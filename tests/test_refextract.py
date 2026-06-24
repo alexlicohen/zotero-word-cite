@@ -875,3 +875,138 @@ def test_mismatched_bracket_not_a_numeric_cite(tmp_path):
     nums = [m["text"] for m in extract_references(src)["intext"] if m["kind"] == "numeric"]
     assert "[12]" in nums and "(3,4)" in nums
     assert "[12)" not in nums and "(5]" not in nums
+
+
+# ===========================================================================
+# Year-less contiguous-entry recovery (the "#51 gap" fix)
+# ===========================================================================
+
+class TestYearlessContiguousFiller:
+    """A numbered reference entry with NO year (in-press / "in preparation"
+    paper, no DOI/PMID) that is numerically CONTIGUOUS inside a confirmed
+    reference list must be retained — not dropped as a phantom gap — while
+    numbered NON-reference lists (instructions) and standalone year-less lines
+    stay excluded.
+    """
+
+    _INPRESS = (
+        "3. Miller G, Steeby C, Cohen A. Comparison of Brain Normalization "
+        "Software. Imaging Neuroscience;"
+    )
+
+    def test_heading_path_yearless_entry_retained(self, tmp_path):
+        """Heading path: year-less #3 flanked by year-bearing #2 and #4 is kept;
+        numbering is contiguous 2-3-4 with NO gap."""
+        path = _build_doc(tmp_path, [
+            "Body paragraph introducing the work in some detail here.",
+            "References",
+            "2. Jones B, Adams C. Cortical tubers in TSC. Brain. 2019;50:200-210.",
+            self._INPRESS,
+            "4. Roe G, Doe E. mTOR signaling pathways. Nature. 2021;5:1-9.",
+        ])
+        result = extract_references(path)
+        nums = [e["numbering"] for e in result["reflist"]]
+        assert len(result["reflist"]) == 3, (
+            f"Expected 3 entries (no #3 gap), got {len(result['reflist'])}: "
+            f"{[e['text'][:40] for e in result['reflist']]}"
+        )
+        assert nums == ["2.", "3.", "4."], f"Expected contiguous 2-3-4, got {nums}"
+        # the year-less entry's text is actually present
+        joined = " ".join(e["text"] for e in result["reflist"])
+        assert "Miller G" in joined
+
+    def test_run_path_yearless_entry_retained(self, tmp_path):
+        """Headingless run path: a 4-entry numbered run where #3 is year-less is
+        detected in full, contiguous 1-4, all via 'run'."""
+        path = _build_doc(tmp_path, [
+            "Body paragraph introducing the work in some detail here.",
+            "1. Smith A, Brown D. TSC genetics overview. Brain. 2020;10:1-10.",
+            "2. Jones B, Adams C. Cortical tubers in TSC. Brain. 2019;50:200-210.",
+            self._INPRESS,
+            "4. Roe G, Doe E. mTOR signaling pathways. Nature. 2021;5:1-9.",
+        ])
+        result = extract_references(path)
+        nums = [e["numbering"] for e in result["reflist"]]
+        assert len(result["reflist"]) == 4, (
+            f"Expected 4 entries (no #3 gap), got {len(result['reflist'])}: "
+            f"{[e['text'][:40] for e in result['reflist']]}"
+        )
+        assert nums == ["1.", "2.", "3.", "4."], f"Expected contiguous 1-4, got {nums}"
+        for e in result["reflist"]:
+            assert e["detected_by"] == "run", e
+
+    def test_bracket_enumerator_yearless_retained(self, tmp_path):
+        """The [N] enumerator form is handled too: year-less [3] between [2]/[4]."""
+        path = _build_doc(tmp_path, [
+            "Body paragraph introducing the work in some detail here.",
+            "References",
+            "[2] Jones B, Adams C. Cortical tubers in TSC. Brain. 2019;50:200-210.",
+            "[3] Miller G, Steeby C, Cohen A. Comparison of Brain Normalization "
+            "Software. Imaging Neuroscience;",
+            "[4] Roe G, Doe E. mTOR signaling pathways. Nature. 2021;5:1-9.",
+        ])
+        result = extract_references(path)
+        nums = [e["numbering"] for e in result["reflist"]]
+        assert nums == ["[2]", "[3]", "[4]"], f"Expected [2][3][4], got {nums}"
+
+    # ---- false-positive guards ----------------------------------------------
+
+    def test_instruction_list_not_detected(self, tmp_path):
+        """A numbered instruction/enumeration list with NO reference shape must
+        NOT be detected as references."""
+        path = _build_doc(tmp_path, [
+            "How to reproduce the analysis pipeline is described below.",
+            "1. Run the script.",
+            "2. Check output.",
+            "3. Submit.",
+        ])
+        result = extract_references(path)
+        assert result["reflist"] == [], (
+            f"Instruction list wrongly detected: {result['reflist']}"
+        )
+
+    def test_long_instruction_sentences_not_detected(self, tmp_path):
+        """Long numbered instruction SENTENCES (> 40 chars, capital-led) must not
+        be admitted — they lack author-initials byline shape."""
+        path = _build_doc(tmp_path, [
+            "Reproduce the analysis with the following ordered steps here now.",
+            "1. Run the analysis script and then carefully verify the output.",
+            "2. Submit the final report to the committee for review by Friday.",
+            "3. Archive the intermediate files in the shared project directory.",
+        ])
+        result = extract_references(path)
+        assert result["reflist"] == [], (
+            f"Long instruction sentences wrongly detected: {result['reflist']}"
+        )
+
+    def test_standalone_yearless_numbered_line_not_admitted(self, tmp_path):
+        """A year-less numbered line standalone in body prose (NOT inside a
+        reference run, no accepted #N-1 predecessor) is not admitted."""
+        path = _build_doc(tmp_path, [
+            "The cohort was assembled over many years for this longitudinal work.",
+            "7. Miller G, Steeby C, Cohen A. Comparison of Brain Normalization "
+            "Software. Imaging Neuroscience;",
+            "We then performed the primary statistical analysis on this cohort.",
+        ])
+        result = extract_references(path)
+        assert result["reflist"] == [], (
+            f"Standalone year-less line wrongly admitted: {result['reflist']}"
+        )
+
+    def test_noncontiguous_yearless_entry_not_admitted(self, tmp_path):
+        """A year-less entry whose number is NOT N+1 of the prior accepted entry
+        does not fill a hole and is not recovered (heading path)."""
+        path = _build_doc(tmp_path, [
+            "Body paragraph introducing the work in some detail here.",
+            "References",
+            "2. Jones B, Adams C. Cortical tubers in TSC. Brain. 2019;50:200-210.",
+            # printed #9 is NOT contiguous after #2 -> not a hole-filler
+            "9. Miller G, Steeby C, Cohen A. Comparison of Brain Normalization "
+            "Software. Imaging Neuroscience;",
+            "3. Roe G, Doe E. mTOR signaling pathways. Nature. 2021;5:1-9.",
+        ])
+        result = extract_references(path)
+        texts = " ".join(e["text"] for e in result["reflist"])
+        assert "Miller G" not in texts, (
+            f"Non-contiguous year-less entry wrongly admitted: {result['reflist']}"
+        )

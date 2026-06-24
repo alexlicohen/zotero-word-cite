@@ -32,6 +32,26 @@ import urllib.parse
 import urllib.request
 from typing import Optional
 
+
+def _timeout_ceiling() -> Optional[float]:
+    """A process-wide hard ceiling (seconds) on every GET, or ``None``.
+
+    Read from ``ZOTERO_WORD_CITE_HTTP_TIMEOUT`` at call time.  This is the retry-saver
+    for unreachable hosts: a deployment can guarantee no single read blocks a CLI
+    for more than N seconds regardless of the per-call ``timeout`` a caller
+    passes.  Absent / malformed / non-positive → no ceiling (the caller's own
+    timeout stands), so default behaviour and the network-mock tests are
+    unchanged.
+    """
+    raw = os.environ.get("ZOTERO_WORD_CITE_HTTP_TIMEOUT")
+    if not raw:
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return val if val > 0 else None
+
 _TOOL = "zotero-word-cite"
 # The polite-pool contact email is sourced from the environment first so the
 # toolkit can be used by anyone without editing code; the literal below is just
@@ -155,6 +175,14 @@ def http_get(
     req_headers = {"User-Agent": user_agent()}
     if headers:
         req_headers.update(headers)
+
+    # Apply a process-wide timeout CEILING if one is configured, so an
+    # unreachable host can never hang longer than the deployment allows even if a
+    # caller passed a generous per-call timeout. With no env var set, the caller's
+    # timeout stands unchanged (byte-identical default behaviour).
+    _ceiling = _timeout_ceiling()
+    if _ceiling is not None and _ceiling < timeout:
+        timeout = _ceiling
 
     # Scheme allow-list (defense-in-depth): this is the shared fetch primitive,
     # so never let a caller-supplied URL make urlopen read a local file or other
