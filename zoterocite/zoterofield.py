@@ -332,6 +332,81 @@ def insert_citation(
     return doc
 
 
+_BIBL_INSTR = 'ADDIN ZOTERO_BIBL {"uncited":[],"omitted":[],"custom":[]} CSL_BIBLIOGRAPHY'
+
+
+def has_bibliography_field(root: etree._Element) -> bool:
+    """True when the document already contains a Zotero ``ZOTERO_BIBL`` field, so
+    a caller can avoid inserting a second one (idempotent bib handling)."""
+    return any("ZOTERO_BIBL" in (code or "") for code in _field_codes(root))
+
+
+def append_bibliography_field(
+    doc: Docx,
+    *,
+    style: str = DEFAULT_STYLE,
+    bib_rendered: str = "",
+    heading: Optional[str] = None,
+    track: bool = False,
+    author: str = "zotero-word-cite",
+    date: Optional[str] = None,
+) -> bool:
+    """Append a Zotero ``ZOTERO_BIBL`` bibliography field at the end of the body
+    (before the trailing ``sectPr``), so a single Zotero Refresh renders the
+    bibliography from the cited items. Idempotent: returns ``False`` without
+    writing if a ``ZOTERO_BIBL`` field already exists.
+
+    Registers the CSL ``style`` prefs (so Refresh knows the style). The field
+    starts code-only (``None`` result) unless ``bib_rendered`` is given; Zotero
+    fills the rendered list on Refresh. An optional ``heading`` paragraph (e.g.
+    "References") is inserted before the field. With ``track=True`` the inserted
+    paragraph(s) are wrapped as a tracked insertion.
+
+    This is intentionally ADDITIVE — it never deletes a manual bibliography (a
+    caller that wants the manual block removed must do so explicitly, and only
+    when the block is unambiguously located).
+    """
+    root = doc.tree(DOCUMENT)
+    if has_bibliography_field(root):
+        return False
+    ensure_pref(doc, style)
+    date = date or now_iso()
+    body = get_body(root)
+    sect = body.find(qn("w:sectPr"))
+
+    new_paras: List[etree._Element] = []
+    if heading:
+        new_paras.append(_paragraph(_plain_run(heading)))
+    bib_p = _paragraph(_field_runs(
+        _BIBL_INSTR, _plain_run(bib_rendered) if bib_rendered else None))
+    new_paras.append(bib_p)
+
+    if track:
+        rev_id = _next_rev_id(root)
+        for p in new_paras:
+            # Wrap each inserted paragraph's runs in <w:ins>; the paragraph mark
+            # itself is marked inserted via <w:rPr><w:ins/></w:rPr> in <w:pPr>.
+            ins = etree.Element(qn("w:ins"))
+            ins.set(qn("w:id"), str(rev_id)); rev_id += 1
+            ins.set(qn("w:author"), author); ins.set(qn("w:date"), date)
+            for r in list(p):
+                p.remove(r); ins.append(r)
+            p.append(ins)
+            ppr = etree.SubElement(p, qn("w:pPr"))
+            p.remove(ppr); p.insert(0, ppr)
+            rpr = etree.SubElement(ppr, qn("w:rPr"))
+            mark_ins = etree.SubElement(rpr, qn("w:ins"))
+            mark_ins.set(qn("w:id"), str(rev_id)); rev_id += 1
+            mark_ins.set(qn("w:author"), author); mark_ins.set(qn("w:date"), date)
+
+    for p in new_paras:
+        if sect is not None:
+            sect.addprevious(p)
+        else:
+            body.append(p)
+    return True
+
+
 def cite_into(
     path,
     anchor: str,
@@ -755,6 +830,55 @@ def _isolate_marker_runs(para: etree._Element, anchor: str):
     return marker_runs, parent, insert_idx
 
 
+def _splice_field_at_marker(
+    doc: Docx,
+    root: etree._Element,
+    para: etree._Element,
+    anchor: str,
+    field_xml: str,
+    *,
+    track: bool,
+    author: str,
+    date: str,
+) -> bool:
+    """Isolate the FIRST occurrence of ``anchor`` in ``para`` and splice the
+    pre-built ``field_xml`` (a complete begin/instr/sep/result/end field) in its
+    place, striking the marker. Returns ``True`` on a successful splice, ``False``
+    if ``anchor`` is not present in this paragraph's visible text.
+
+    Shared inner step of :func:`replace_text_with_zotero_field` (single occurrence)
+    and :func:`replace_all_text_with_zotero_field` (paragraph-iterating loop). It
+    converts exactly ONE occurrence so a caller can re-scan and convert the next:
+    after a splice the marker text is gone (struck or removed) and replaced by the
+    field's result runs, so a fresh :func:`_isolate_marker_runs` lands on the next
+    genuine occurrence and never re-matches the one just converted.
+    """
+    try:
+        marker_runs, parent, idx = _isolate_marker_runs(para, anchor)
+    except LookupError:
+        return False
+    new_runs = _runs(field_xml)
+    if track:
+        rev_id = _next_rev_id(root)
+        # Strike the marker (tracked deletion), then splice the field as a
+        # tracked insertion immediately after it (so document order is
+        # del-marker then ins-field at the marker's former position).
+        d = _wrap_runs_as_del(marker_runs, rev_id, author, date)
+        ins = etree.Element(qn("w:ins"))
+        ins.set(qn("w:id"), str(rev_id + 1))
+        ins.set(qn("w:author"), author)
+        ins.set(qn("w:date"), date)
+        for r in new_runs:
+            ins.append(r)
+        d.addnext(ins)
+    else:
+        for r in marker_runs:
+            parent.remove(r)
+        for offset, r in enumerate(new_runs):
+            parent.insert(idx + offset, r)
+    return True
+
+
 def replace_text_with_zotero_field(
     doc: Docx,
     anchor: str,
@@ -797,34 +921,86 @@ def replace_text_with_zotero_field(
     """
     date = date or now_iso()
     root = doc.tree(DOCUMENT)
-    # Locate + isolate the marker BEFORE any mutation (prefs/field), so a missing
-    # anchor raises LookupError without leaving the document half-modified.
+    # Locate the marker BEFORE any mutation (prefs/field), so a missing anchor
+    # raises LookupError without leaving the document half-modified.
     para = find_paragraph(root, anchor)  # raises LookupError unless exactly 1
-    marker_runs, parent, idx = _isolate_marker_runs(para, anchor)
-
     ensure_pref(doc, style)
     field_xml = _build_zotero_field_xml(
         [anchor], keys, itemdata, uris,
         rendered=rendered, rendered_html=rendered_html, extras=extras,
     )
-    new_runs = _runs(field_xml)
-
-    if track:
-        rev_id = _next_rev_id(root)
-        # Strike the marker (tracked deletion), then splice the field as a
-        # tracked insertion immediately after it (so document order is
-        # del-marker then ins-field at the marker's former position).
-        d = _wrap_runs_as_del(marker_runs, rev_id, author, date)
-        ins = etree.Element(qn("w:ins"))
-        ins.set(qn("w:id"), str(rev_id + 1))
-        ins.set(qn("w:author"), author)
-        ins.set(qn("w:date"), date)
-        for r in new_runs:
-            ins.append(r)
-        d.addnext(ins)
-    else:
-        for r in marker_runs:
-            parent.remove(r)
-        for offset, r in enumerate(new_runs):
-            parent.insert(idx + offset, r)
+    if not _splice_field_at_marker(
+        doc, root, para, anchor, field_xml,
+        track=track, author=author, date=date,
+    ):  # pragma: no cover — find_paragraph already guaranteed a contiguous match
+        raise LookupError(f"anchor {anchor!r} could not be isolated in paragraph")
     return doc
+
+
+def replace_all_text_with_zotero_field(
+    doc: Docx,
+    anchor: str,
+    keys: List[str],
+    *,
+    itemdata: List[dict],
+    uris: List[str],
+    rendered: str = "(citation)",
+    rendered_html: Optional[str] = None,
+    extras: Optional[List[dict]] = None,
+    style: str = DEFAULT_STYLE,
+    track: bool = False,
+    author: str = "zotero-word-cite",
+    date: Optional[str] = None,
+) -> int:
+    """Replace EVERY occurrence of the literal ``anchor`` text across the whole
+    document with the SAME live Zotero ``ZOTERO_ITEM CSL_CITATION`` field, in
+    place. Returns the number of occurrences converted.
+
+    This is the occurrence-scoped generalisation of
+    :func:`replace_text_with_zotero_field`, which targets a marker that occurs in
+    exactly ONE paragraph. A numeric bibliography marker like ``"(12)"`` recurs
+    across many paragraphs (and can repeat within one paragraph), and — because in
+    a numbered style the marker text is a *function* of the cited item(s)
+    (``"(12)"`` always means reference 12) — every occurrence must become the same
+    field. So we iterate ALL body paragraphs (:func:`find_paragraphs`) and, within
+    each, repeatedly isolate-and-splice the FIRST remaining occurrence until none
+    is left: once an occurrence is converted to a field its plain ``<w:t>`` text
+    no longer matches, so re-scanning lands on the next genuine occurrence.
+
+    Boundary safety: ``anchor`` is the FULL delimited token (e.g. ``"(12)"``
+    including its parens/brackets), so a literal substring match can never fire
+    inside ``"(112)"``, ``"(12,15)"`` or ``"(5-7)"`` — the closing delimiter must
+    immediately follow. Pass the marker's own ``text`` (as extracted by
+    refextract's numeric-cite regex) to inherit that guarantee; do NOT pass a bare
+    number.
+
+    Builds the field ONCE (identical citationID for all occurrences — Zotero
+    re-derives unique ids on Refresh from the citationItems) and registers prefs
+    once. With ``track=True`` each converted occurrence is a struck marker
+    (``<w:del>``) + inserted field (``<w:ins>``); the document round-trips.
+    """
+    if not anchor:
+        return 0
+    date = date or now_iso()
+    root = doc.tree(DOCUMENT)
+    ensure_pref(doc, style)
+    field_xml = _build_zotero_field_xml(
+        [anchor], keys, itemdata, uris,
+        rendered=rendered, rendered_html=rendered_html, extras=extras,
+    )
+    converted = 0
+    for para in find_paragraphs(root, anchor):
+        # Re-scan this paragraph until no occurrence remains. A hard cap on
+        # iterations (one per occurrence in the paragraph's current text, +1)
+        # makes a non-progressing splice fail safe instead of looping forever.
+        from .paras import paragraph_text
+        guard = paragraph_text(para).count(anchor) + 1
+        while guard > 0:
+            guard -= 1
+            if not _splice_field_at_marker(
+                doc, root, para, anchor, field_xml,
+                track=track, author=author, date=date,
+            ):
+                break
+            converted += 1
+    return converted
