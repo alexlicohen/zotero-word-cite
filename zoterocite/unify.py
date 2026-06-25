@@ -776,6 +776,25 @@ def apply_unification(
 
     for ref in accepted_refs:
         meta = _strip_score(ref.get("metadata"))
+        # An accepted ref that resolved to NO usable metadata (refresolve miss) has
+        # nothing to create from and no key to cite — it must be SURFACED with a
+        # clear reason, never silently dropped. Without this it would be threaded
+        # into to_create_metas as ``None``; create_items() silently filters None
+        # entries, and the placement then surfaced only via a MISLEADING
+        # "could not map a Zotero key after create" message (no create was ever
+        # possible). Filter it here so the user sees the true cause. (The
+        # fail-closed CREATE logic below is unchanged — this only diverts refs that
+        # have no metadata to create in the first place.)
+        if not (ref.get("in_library") and ref.get("existing_key")) and meta is None:
+            report["needs_input"].append({
+                "ref_index": ref["ref_index"],
+                "title": ref["input"][:80],
+                "doi": None,
+                "reason": "accepted reference resolved to no usable metadata "
+                          "(could not be identified); nothing to add to Zotero or "
+                          "cite — supply an identifier (DOI/PMID) or fuller citation.",
+            })
+            continue
         placement = {
             "meta": meta,
             "key": None,

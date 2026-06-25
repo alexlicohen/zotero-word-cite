@@ -781,6 +781,192 @@ class TestApply:
 
 
 # ===========================================================================
+# Idempotency: a second apply on the first apply's OUTPUT is a no-op for in-text
+# fields (existing_renderings guard) and never double-creates (DOI/PMID dedup).
+# ===========================================================================
+
+def _zotero_item_field_count(path) -> int:
+    """Number of live ZOTERO_ITEM CSL_CITATION fields in a saved .docx."""
+    root = Docx(path).tree(zoterofield.DOCUMENT)
+    return sum(1 for c in zoterofield._field_codes(root)
+               if "ZOTERO_ITEM CSL_CITATION" in (c or ""))
+
+
+class TestIdempotency:
+    """Running apply_unification twice (the 2nd run on the 1st run's OUTPUT) must
+    not re-cite already-live fields nor re-create items already in the library.
+
+    These use the REAL replace_text_with_zotero_field + existing_renderings (NOT
+    the recording fake) so run 1 produces genuine live fields and run 2's guard is
+    actually exercised. The library index is DYNAMIC: it absorbs whatever run 1
+    creates, mirroring a real re-read of the group after the first write."""
+
+    def test_second_apply_does_not_recite_live_fields(self, draft, monkeypatch):
+        # Smith is in-library and high/auto → run 1 converts its in-text markers to
+        # live fields. No creation needed (isolate the in-text no-op claim).
+        monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve)
+        monkeypatch.setattr(
+            unify.zotero, "library_index",
+            lambda **kw: {"doi": {"10.1/smith2020": "SMITHKEY"}, "pmid": {}, "title": {}},
+        )
+        monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: (None, None))
+        monkeypatch.setattr(unify.zotero, "key_can_write_status", lambda: True)
+        monkeypatch.setattr(unify.zotero, "key_can_write", lambda: True)
+        monkeypatch.setattr(unify.zotero, "item_uri",
+                            lambda key: "http://zotero.org/groups/2504198/items/" + key)
+        creates = []
+        monkeypatch.setattr(
+            unify.zotero, "create_items",
+            lambda metas, **k: creates.append(metas) or {
+                "created": [], "skipped_existing": [], "failed": []},
+        )
+        # REAL field insertion + existing_renderings (no fake).
+
+        out1 = draft.parent / "idem1.docx"
+        plan1 = unify.plan_unification(draft)
+        rep1 = unify.apply_unification(draft, plan1, {"accept": []}, out=out1, track=True)
+        assert rep1["replaced"] >= 1, "run 1 should have converted Smith's in-text cites"
+        n_fields_1 = _zotero_item_field_count(out1)
+        assert n_fields_1 >= 1
+
+        # RUN 2 on run-1's output: a fresh plan over the rewritten doc, then apply.
+        out2 = out1.parent / "idem2.docx"
+        plan2 = unify.plan_unification(out1)
+        rep2 = unify.apply_unification(out1, plan2, {"accept": []}, out=out2, track=True)
+
+        # The already-live Smith fields must NOT be re-cited.
+        assert rep2["replaced"] == 0, (
+            f"second apply re-cited live fields (replaced={rep2['replaced']}); "
+            "the existing_renderings guard failed"
+        )
+        # Field count is unchanged — no field was duplicated or clobbered.
+        assert _zotero_item_field_count(out2) == n_fields_1
+        # And nothing was created in either run (Smith already in library).
+        assert [m for batch in creates for m in batch] == []
+
+    def test_second_apply_does_not_double_create(self, draft, monkeypatch):
+        # Jones is missing → run 1 creates it. Run 2 must see it (dynamic index) and
+        # NOT create it again (DOI dedup). Accept the medium Jones ref explicitly.
+        lib = {"doi": {"10.1/smith2020": "SMITHKEY"}, "pmid": {}, "title": {}}
+        monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve)
+        monkeypatch.setattr(unify.zotero, "library_index", lambda **kw: {
+            "doi": dict(lib["doi"]), "pmid": dict(lib["pmid"]), "title": dict(lib["title"])})
+        monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: (None, None))
+        monkeypatch.setattr(unify.zotero, "key_can_write_status", lambda: True)
+        monkeypatch.setattr(unify.zotero, "key_can_write", lambda: True)
+        monkeypatch.setattr(unify.zotero, "item_uri",
+                            lambda key: "http://zotero.org/groups/2504198/items/" + key)
+
+        created_log = []
+
+        def dynamic_create(metas, *, collection=None, tags=None, dedup=True,
+                           doi_index=None, pmid_index=None, attach_pdfs=False):
+            # Mirror real dedup: skip any meta whose DOI is already in the index;
+            # create the rest and ADD them to the shared index (so a re-read sees them).
+            out = {"created": [], "skipped_existing": [], "failed": []}
+            for m in metas:
+                if not isinstance(m, dict):
+                    continue
+                doi = (m.get("doi") or "")
+                norm = doi.lower()
+                if dedup and norm in lib["doi"]:
+                    out["skipped_existing"].append(
+                        {"title": m.get("title", ""), "existing_key": lib["doi"][norm]})
+                    continue
+                key = "NEW_" + (doi.split("/")[-1] or m.get("title", "x")[:6])
+                out["created"].append({"title": m.get("title", ""), "key": key, "doi": doi})
+                created_log.append(doi or m.get("title"))
+                if norm:
+                    lib["doi"][norm] = key      # absorb into the index
+            return out
+
+        monkeypatch.setattr(unify.zotero, "create_items", dynamic_create)
+
+        out1 = draft.parent / "dc1.docx"
+        plan1 = unify.plan_unification(draft)
+        rep1 = unify.apply_unification(
+            draft, plan1, {"accept": [1], "add_missing": True}, out=out1, track=True)
+        assert any("Cortical tubers" in a["title"] for a in rep1["added"]), \
+            "run 1 should create the missing Jones ref"
+        n_created_after_run1 = len(created_log)
+        assert n_created_after_run1 >= 1
+
+        # RUN 2 on the output, fresh plan. Jones is now in the (grown) library index.
+        out2 = out1.parent / "dc2.docx"
+        plan2 = unify.plan_unification(out1)
+        rep2 = unify.apply_unification(
+            out1, plan2, {"accept": [1], "add_missing": True}, out=out2, track=True)
+
+        # No NEW items were created on the second run — Jones deduped by DOI.
+        assert len(created_log) == n_created_after_run1, (
+            f"second apply double-created items: {created_log[n_created_after_run1:]}"
+        )
+        assert rep2["added"] == [], "second apply must add nothing new"
+
+
+# ===========================================================================
+# Surfacing: an accepted ref with NO usable metadata must not vanish.
+# ===========================================================================
+
+class TestNoMetadataSurfacing:
+    """An accepted reference that resolved to no usable metadata (a refresolve
+    miss) has nothing to create and no key to cite. It must be SURFACED in
+    needs_input with a clear reason — never silently dropped, and never threaded
+    into create_items as a None (which create_items silently filters)."""
+
+    def test_accepted_no_metadata_ref_surfaced_not_dropped(self, tmp_path, monkeypatch):
+        p = tmp_path / "nometa.docx"
+        new_doc(p, [
+            "Body cites a mystery work [1].",
+            "References",
+            "1. Mystery A, Unknown B. An unindexed local report. Internal Memo. 2018;3:1-9.",
+        ])
+
+        def _resolve(text, *, fetch=True):
+            # Everything resolves to NO metadata (the miss case).
+            return {
+                "input": text, "metadata": None, "confidence": "none",
+                "source": None, "candidates": [],
+                "identifiers": {"doi": None, "pmid": None, "arxiv": None, "isbn": None},
+            }
+
+        monkeypatch.setattr(unify.refresolve, "resolve_reference", _resolve)
+        monkeypatch.setattr(unify.zotero, "library_index",
+                            lambda **kw: {"doi": {}, "pmid": {}, "title": {}})
+        monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: (None, None))
+        monkeypatch.setattr(unify.zotero, "key_can_write_status", lambda: True)
+        monkeypatch.setattr(unify.zotero, "key_can_write", lambda: True)
+        monkeypatch.setattr(unify.zotero, "item_uri", lambda key: "http://x/" + key)
+
+        # create_items must NEVER be handed a None meta for this ref.
+        seen_metas = []
+
+        def _create(metas, **k):
+            seen_metas.extend(metas)
+            return {"created": [], "skipped_existing": [], "failed": []}
+
+        monkeypatch.setattr(unify.zotero, "create_items", _create)
+        monkeypatch.setattr(unify.zoterofield, "replace_text_with_zotero_field",
+                            lambda doc, *a, **k: doc)
+
+        plan = unify.plan_unification(p)
+        # The single low ref (index 0) must be explicitly accepted to be applied.
+        out = p.parent / "out.docx"
+        report = unify.apply_unification(
+            p, plan, {"accept": [0], "add_missing": True}, out=out, track=True)
+
+        # Surfaced in needs_input with the honest "no usable metadata" reason.
+        reasons = [ni.get("reason", "") for ni in report["needs_input"]]
+        assert any("no usable metadata" in r for r in reasons), (
+            f"accepted no-metadata ref was not surfaced; needs_input={report['needs_input']}"
+        )
+        # It was NOT created and NOT added.
+        assert report["added"] == []
+        # The no-metadata ref was never threaded into create_items (no None meta).
+        assert None not in seen_metas
+
+
+# ===========================================================================
 # Edge: empty document
 # ===========================================================================
 
