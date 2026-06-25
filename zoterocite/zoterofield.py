@@ -445,7 +445,7 @@ def cite_into(
     # the alignment so a future contract change can't silently mis-pair them in
     # the positional zip inside _build_zotero_field_xml (CRIT-3).
     itemdata = zotero.csljson(keys)
-    uris = [zotero.item_uri(k) for k in keys]
+    uris = [zotero.item_uri_offline_safe(k) for k in keys]
     if not (len(itemdata) == len(uris) == len(keys)):
         raise RuntimeError(
             "Zotero metadata/URI lists are not aligned with keys "
@@ -981,6 +981,17 @@ def replace_all_text_with_zotero_field(
     """
     if not anchor:
         return 0
+    if anchor in (rendered or ""):
+        # SAFETY: the inserted field's result run is itself <w:t>-bearing text.
+        # If ``rendered`` contains ``anchor``, the per-paragraph rescan would
+        # re-isolate the field's OWN result and splice a nested field — a runaway
+        # that double-converts (one spurious nest per occurrence). Refuse loudly
+        # rather than corrupt; callers pass a NEUTRAL token (e.g. "(citation)").
+        raise ValueError(
+            f"rendered text {rendered!r} contains the anchor {anchor!r}: the "
+            "field's own result run would be re-isolated on rescan. Pass a "
+            "neutral rendered token (e.g. '(citation)')."
+        )
     date = date or now_iso()
     root = doc.tree(DOCUMENT)
     ensure_pref(doc, style)

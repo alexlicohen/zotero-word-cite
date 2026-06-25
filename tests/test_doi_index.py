@@ -410,6 +410,52 @@ class TestLibraryIndexStrictLenient:
         assert idx["doi"].get("10.1234/alpha") == "DK"
         assert status == {"degraded": False, "doi_only": False}
 
+    def test_strict_stale_combined_cache_raises(self, monkeypatch):
+        """H1: strict=True + failed fetch + a TTL-EXPIRED combined cache must RAISE,
+        not silently serve the stale index. A stale combined cache can miss
+        recently-added group items → duplicate creation on the WRITE path.
+        'Complete' is not 'fresh'. (Before the fix this returned the stale dict as
+        degraded=False and apply_unification created against it.)"""
+        stale = {"doi": {"10.1/x": "XK"}, "pmid": {}, "title": {}}
+        lp = zotero_mod._LIB_INDEX_CACHE
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        lp.write_text(
+            json.dumps({"fetched_at": time.time() - 25 * 3600, "index": stale}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(zotero_mod, "fetch_all", self._boom)
+        with pytest.raises(zotero_mod.LibraryUnavailableError):
+            zotero_mod.library_index()  # strict=True default — fail closed
+
+    def test_lenient_stale_combined_cache_served_degraded(self, monkeypatch):
+        """H1: strict=False + failed fetch + a TTL-expired combined cache serves the
+        (richer) combined index but flags it DEGRADED (not doi_only), so coverage
+        consumers surface a 'provisional' note rather than trusting it blindly."""
+        stale = {"doi": {"10.1/x": "XK"}, "pmid": {"9": "XK"}, "title": {"t": "XK"}}
+        lp = zotero_mod._LIB_INDEX_CACHE
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        lp.write_text(
+            json.dumps({"fetched_at": time.time() - 25 * 3600, "index": stale}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(zotero_mod, "fetch_all", self._boom)
+        idx, status = zotero_mod.library_index_status(strict=False)
+        assert idx == stale
+        assert status == {"degraded": True, "doi_only": False}
+
+    def test_strict_fresh_combined_cache_on_refresh_serves(self, monkeypatch):
+        """A FRESH (within-TTL) combined cache IS still served to strict on a
+        fetch failure (refresh=True path) — only TTL-expired caches fail closed."""
+        fresh = {"doi": {"10.1/x": "XK"}, "pmid": {}, "title": {}}
+        lp = zotero_mod._LIB_INDEX_CACHE
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        lp.write_text(
+            json.dumps({"fetched_at": time.time() - 3600, "index": fresh}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(zotero_mod, "fetch_all", self._boom)
+        assert zotero_mod.library_index(refresh=True) == fresh  # fresh → served
+
 
 # ---------------------------------------------------------------------------
 # Tests for unify.py integration

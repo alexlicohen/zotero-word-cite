@@ -10,7 +10,8 @@ the citations were built from). This module:
 2. **Plans** a migration (:func:`plan_endnote_migration`) — a *read-only* dry
    run that resolves/validates every record (canonical DOI + confidence tier via
    :mod:`refresolve`), retraction-screens them (:mod:`citecheck`), checks which
-   are already in the group library (:func:`zotero.library_doi_index`), and
+   are already in the group library (DOI→PMID→title via
+   :func:`zotero.library_index` / :func:`zotero.lookup_index_key`), and
    counts the document's EndNote citation fields and how many map to a library
    record (:mod:`citeconvert`). NOTHING is written; the document is untouched.
 3. **Applies** the migration (:func:`apply_endnote_migration`) — the *gated*
@@ -499,7 +500,8 @@ def _meta_to_zotero_meta(meta: Optional[dict], rec: dict) -> dict:
     return out
 
 
-def _resolve_record(rec: dict, *, fetch: bool, doi_index: Dict[str, str],
+def _resolve_record(rec: dict, *, fetch: bool,
+                    lib_index: Optional[Dict[str, Dict[str, str]]],
                     rw_db: Dict[str, dict]) -> dict:
     """Resolve + screen one parsed record. NO writes. Returns a plan entry."""
     query = _record_query(rec)
@@ -520,14 +522,23 @@ def _resolve_record(rec: dict, *, fetch: bool, doi_index: Dict[str, str],
     elif rec.get("doi"):
         canonical_doi = rec["doi"]
 
-    in_library = False
-    existing_key: Optional[str] = None
-    if canonical_doi:
-        norm = citecheck._normalise_doi(canonical_doi)
-        key = doi_index.get(norm)
-        if key:
-            in_library = True
-            existing_key = key
+    # Presence by DOI → PMID → normalized-title via the SINGLE owner of that
+    # precedence (:func:`zotero.lookup_index_key`). A DOI-only test false-flagged
+    # a present-but-DOI-less group item as "missing" — under --apply that
+    # re-created it and DUPLICATED the shared group (the bug 59c4d64 fixed
+    # everywhere else). The resolved metadata wins for each identifier, else the
+    # record's own parsed value.
+    pmid = None
+    if meta and meta.get("pmid"):
+        pmid = meta["pmid"]
+    elif rec.get("pmid"):
+        pmid = rec["pmid"]
+    title = (meta.get("title") if meta else None) or rec.get("title")
+
+    existing_key = zotero.lookup_index_key(
+        lib_index, doi=canonical_doi, pmid=pmid, title=title
+    )
+    in_library = existing_key is not None
 
     retracted = _retracted(canonical_doi, rw_db)
 
@@ -562,7 +573,8 @@ def plan_endnote_migration(
 
     Parses *library_path*, resolves/validates every record via :mod:`refresolve`
     (canonical DOI + confidence tier), retraction-screens them, checks presence
-    in the group library via :func:`zotero.library_doi_index`, and inspects
+    in the group library by DOI→PMID→title (:func:`zotero.library_index` +
+    :func:`zotero.lookup_index_key`), and inspects
     *doc_path*'s EndNote citation fields via
     :func:`citeconvert.classify_citation_sources` (counting how many map to a
     parsed library record by DOI/title).
@@ -602,20 +614,25 @@ def plan_endnote_migration(
 
     records = parse_endnote_library(library_path)
 
-    # Library DOI index. A DEGRADED READ (LibraryUnavailableError) is NOT the
-    # same as an empty library: with an empty index every record looks "missing"
-    # and the apply pass would create DUPLICATES in the shared group. The
-    # read-only plan still degrades gracefully (records resolve, just unmatched),
-    # but we record ``library_available=False`` so the GATED apply refuses to
-    # create. Other (non-read) failures fall back to {} as before.
+    # Library index (DOI+PMID+title). READ/coverage path: strict=False so a
+    # DEGRADED combined read falls back to the library_doi_index disk cache
+    # (DOI-only coverage) instead of going fully empty — a ref whose DOI is in
+    # that cache still reads in_library rather than false-"missing". A DEGRADED
+    # READ (LibraryUnavailableError) is NOT the same as an empty library: with an
+    # empty index every record looks "missing" and the apply pass would create
+    # DUPLICATES in the shared group. The read-only plan still degrades
+    # gracefully (records resolve, just unmatched), but we record
+    # ``library_available=False`` so the GATED apply refuses to create. Other
+    # (non-read) failures fall back to empty maps as before. (Mirror of
+    # :func:`unify.plan_unification`.)
     library_available = True
     try:
-        doi_index = zotero.library_doi_index()
+        lib_index, _ = zotero.library_index_status(strict=False)
     except zotero.LibraryUnavailableError:
-        doi_index = {}
+        lib_index = {"doi": {}, "pmid": {}, "title": {}}
         library_available = False
     except Exception:  # noqa: BLE001
-        doi_index = {}
+        lib_index = {"doi": {}, "pmid": {}, "title": {}}
 
     rw_db = _load_retraction_db() if check_retractions else {}
 
@@ -629,7 +646,7 @@ def plan_endnote_migration(
     lib_titles: set = set()
 
     for rec in records:
-        entry = _resolve_record(rec, fetch=fetch, doi_index=doi_index, rw_db=rw_db)
+        entry = _resolve_record(rec, fetch=fetch, lib_index=lib_index, rw_db=rw_db)
         resolved_records.append(entry)
         tier_counts[entry["tier"]] = tier_counts.get(entry["tier"], 0) + 1
         if entry["retracted"]:
@@ -821,18 +838,24 @@ def apply_endnote_migration(
         to_create_metas.append(_meta_to_zotero_meta(resolution, rec))
 
     # ---- the WRITE: create items (deduped, tagged, in-collection) ------------
-    # Thread the already-built DOI index into create_items so its per-item dedup
-    # answers from the index (O(1)/item) instead of a full-library fetch_all scan
-    # per DOI (the F3 O(N·M) blow-up). The library is reachable here (gate above),
-    # and the in-process cache means this re-fetch is free.
+    # Re-fetch the combined library index (DOI+PMID+title) and thread its DOI AND
+    # PMID maps into create_items so its per-item dedup answers from the index
+    # (O(1)/item) instead of a full-library fetch_all scan per DOI (the F3 O(N·M)
+    # blow-up) — and so a ref present only by PMID is deduped (defense-in-depth),
+    # not re-created. WRITE path: strict=True (fail-closed). A stale DOI-only
+    # fallback is DELIBERATELY refused — it could miss recently-added items and
+    # mass-duplicate the shared group; a degraded read MUST refuse rather than
+    # create blind. (Mirror of :func:`unify.apply_unification`.)
     try:
-        doi_index = zotero.library_doi_index()
+        lib_index = zotero.library_index(strict=True)
     except zotero.LibraryUnavailableError:
         # Became unreachable between plan and write — refuse rather than create blind.
         raise WriteRefusedError(
             "Zotero library became unreadable before the migration write; "
             "refusing to create to avoid duplicate entries in the shared group."
         )
+    doi_index = lib_index.get("doi") or {}
+    pmid_index = lib_index.get("pmid") or {}
 
     created_report = {"created": [], "skipped_existing": [], "failed": []}
     if to_create_metas:
@@ -842,6 +865,7 @@ def apply_endnote_migration(
             tags=[ADDED_TAG, source_label],
             dedup=True,
             doi_index=doi_index,
+            pmid_index=pmid_index,
             attach_pdfs=attach_pdfs,
         )
         # Items create_items found already present count as matched, not created.

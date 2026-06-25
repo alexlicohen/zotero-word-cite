@@ -60,6 +60,27 @@ def test_existing_renderings_reports_live_field_text(tmp_path):
     assert zoterofield.existing_renderings(Docx(bare).read_tree(zoterofield.DOCUMENT)) == set()
 
 
+def test_replace_all_refuses_rendered_echo(tmp_path):
+    """SAFETY: replace_all_text_with_zotero_field must REFUSE a ``rendered`` text
+    that contains the anchor — the inserted field's own result run is <w:t>-bearing,
+    so the per-paragraph rescan would re-isolate it and splice a nested field
+    (runaway double-convert). The neutral token then converts ALL occurrences."""
+    src = tmp_path / "src.docx"
+    new_doc(src, ["See (12) and again (12) here."])
+    doc = Docx(src)
+    with pytest.raises(ValueError, match="neutral rendered token"):
+        zoterofield.replace_all_text_with_zotero_field(
+            doc, "(12)", ["X8ISWWQ2"], itemdata=[ITEMDATA], uris=[URI],
+            rendered="(12)",  # echoes the anchor → must be refused
+        )
+    # the safe neutral token converts BOTH occurrences (the repeated-marker blocker)
+    n = zoterofield.replace_all_text_with_zotero_field(
+        doc, "(12)", ["X8ISWWQ2"], itemdata=[ITEMDATA], uris=[URI],
+        rendered="(citation)",
+    )
+    assert n == 2
+
+
 def test_pref_added_only_once(tmp_path):
     src = tmp_path / "s.docx"
     new_doc(src, ["First spot here.", "Second spot here."])

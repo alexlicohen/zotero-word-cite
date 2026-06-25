@@ -730,11 +730,19 @@ def classification_findings(result: dict) -> List[Finding]:
 # ===========================================================================
 
 def normalize_title(title: str) -> str:
-    """Normalise a title for cross-source matching: lowercase, collapse every
-    run of non-alphanumeric characters to a single space, and strip.
+    """Normalise a title for FUZZY cross-source matching: lowercase, collapse
+    every run of non-alphanumeric characters to a single space, and strip — it
+    aggressively DROPS punctuation to absorb PubMed-vs-Zotero punctuation drift.
 
-    PUBLIC (documented) contract: other modules (e.g. ``endnote``) import this to
-    match titles against the same key-space ``convert_to_zotero`` uses.
+    NOT the library-PRESENCE key. Library presence is decided by
+    :func:`zotero.lookup_index_key` against :func:`zotero.library_index`, whose
+    title map is keyed with :func:`zotero._normalize_title` (whitespace-only;
+    punctuation KEPT). The two key-spaces are DELIBERATELY distinct: this one is a
+    fuzzy cross-source/dedup key (used here for live-search candidate comparison
+    and dedup-state keys, and imported by ``endnote`` for its own within-batch
+    title set); the library key is intentionally stricter to minimise false-present
+    mis-links on the create-dedup decision. Do NOT pre-normalise a title with this
+    function and then query ``library_index``'s title map — they will not match.
     """
     return re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip()
 

@@ -194,9 +194,16 @@ def offline(monkeypatch):
     monkeypatch.setattr(refresolve, "resolve_reference", fake_resolve)
     monkeypatch.setattr(en.refresolve, "resolve_reference", fake_resolve)
 
-    # Empty library + no retractions by default.
+    # Empty library + no retractions by default. The plan path now reads presence
+    # via the combined DOI+PMID+title index (library_index_status, strict=False)
+    # and the write path via library_index(strict=True); library_index_status is
+    # a thin wrapper over library_index, so stubbing library_index covers both.
+    # library_doi_index is kept stubbed for any residual/indirect caller.
     monkeypatch.setattr(zotero, "library_doi_index", lambda *a, **k: {})
     monkeypatch.setattr(en.zotero, "library_doi_index", lambda *a, **k: {})
+    _empty_index = {"doi": {}, "pmid": {}, "title": {}}
+    monkeypatch.setattr(zotero, "library_index", lambda *a, **k: dict(_empty_index))
+    monkeypatch.setattr(en.zotero, "library_index", lambda *a, **k: dict(_empty_index))
     monkeypatch.setattr(citecheck, "ensure_retraction_db", lambda *a, **k: (None, None))
     monkeypatch.setattr(en.citecheck, "ensure_retraction_db", lambda *a, **k: (None, None))
 
@@ -359,11 +366,11 @@ class TestPlan:
     def test_plan_records_already_in_library(self, tmp_path, offline):
         lib = _write(tmp_path, "lib.xml", ENDNOTE_XML)
         doc = _build_doc(tmp_path)
-        # Pretend one record is already present in the group library.
+        # Pretend one record is already present in the group library (by DOI).
         from zoterocite import zotero
-        idx = {"10.1002/ana.99999": "EXISTING1"}
-        offline.setattr(zotero, "library_doi_index", lambda *a, **k: idx)
-        offline.setattr(en.zotero, "library_doi_index", lambda *a, **k: idx)
+        idx = {"doi": {"10.1002/ana.99999": "EXISTING1"}, "pmid": {}, "title": {}}
+        offline.setattr(zotero, "library_index", lambda *a, **k: dict(idx))
+        offline.setattr(en.zotero, "library_index", lambda *a, **k: dict(idx))
 
         plan = plan_endnote_migration(doc, lib)
         assert plan["to_match"] == 1
@@ -371,6 +378,98 @@ class TestPlan:
         matched = [r for r in plan["records"] if r["in_library"]]
         assert len(matched) == 1
         assert matched[0]["existing_key"] == "EXISTING1"
+
+    def test_plan_doi_less_present_by_pmid_not_missing(self, tmp_path, offline):
+        """TEETH (the bug 59c4d64 fixed): a ref already in the shared group but
+        whose library index entry has NO DOI (present only by PMID) must read
+        PRESENT — not "missing". A DOI-only presence test false-flagged it
+        missing, and a confident --apply then re-created it as a DUPLICATE.
+
+        Library index: DOI map EMPTY, the item keyed ONLY under its PMID.
+        Record 1 carries PMID 34567890 (EndNote <accession-num>); the resolver
+        stub still hands back a DOI, so the OLD DOI-only path would NOT find it.
+        """
+        lib = _write(tmp_path, "lib.xml", ENDNOTE_XML)
+        doc = _build_doc(tmp_path)
+        from zoterocite import zotero
+        idx = {"doi": {}, "pmid": {"34567890": "PMIDKEY1"}, "title": {}}
+        offline.setattr(zotero, "library_index", lambda *a, **k: dict(idx))
+        offline.setattr(en.zotero, "library_index", lambda *a, **k: dict(idx))
+
+        plan = plan_endnote_migration(doc, lib)
+        matched = [r for r in plan["records"] if r["in_library"]]
+        assert len(matched) == 1, "DOI-less-but-PMID-present ref must read PRESENT"
+        assert matched[0]["existing_key"] == "PMIDKEY1"
+        assert plan["to_match"] == 1
+        assert plan["to_create"] == 1, "only the genuinely-absent record is created"
+
+    def test_plan_doi_less_present_by_title_not_missing(self, tmp_path, offline):
+        """TEETH: same bug, matched by normalized TITLE when neither DOI nor PMID
+        is in the index. Title precedence is the last line of defense against a
+        duplicate write for a DOI-less group item."""
+        lib = _write(tmp_path, "lib.xml", ENDNOTE_XML)
+        doc = _build_doc(tmp_path)
+        from zoterocite import zotero
+        nt = zotero._normalize_title(
+            "Network localization of tuberous sclerosis phenotypes"
+        )
+        idx = {"doi": {}, "pmid": {}, "title": {nt: "TITLEKEY1"}}
+        offline.setattr(zotero, "library_index", lambda *a, **k: dict(idx))
+        offline.setattr(en.zotero, "library_index", lambda *a, **k: dict(idx))
+
+        plan = plan_endnote_migration(doc, lib)
+        matched = [r for r in plan["records"] if r["in_library"]]
+        assert len(matched) == 1, "DOI-less-but-title-present ref must read PRESENT"
+        assert matched[0]["existing_key"] == "TITLEKEY1"
+
+    def test_apply_threads_pmid_index_and_skips_doi_less_present(
+        self, tmp_path, offline
+    ):
+        """TEETH (write path): apply must (a) thread the PMID index into
+        create_items as defense-in-depth and (b) NOT create a record that is
+        present in the library only by PMID — it is matched, not re-created."""
+        lib = _write(tmp_path, "lib.xml", ENDNOTE_XML)
+        doc = _build_doc(tmp_path)
+        from zoterocite import zotero, citeconvert
+
+        offline.setattr(zotero, "key_can_write", lambda: True)
+        offline.setattr(en.zotero, "key_can_write", lambda: True)
+        offline.setattr(zotero, "key_can_write_status", lambda: True)
+        offline.setattr(en.zotero, "key_can_write_status", lambda: True)
+
+        # Record 1 present ONLY by PMID; record 2 genuinely absent.
+        idx = {"doi": {}, "pmid": {"34567890": "PMIDKEY1"}, "title": {}}
+        offline.setattr(zotero, "library_index", lambda *a, **k: dict(idx))
+        offline.setattr(en.zotero, "library_index", lambda *a, **k: dict(idx))
+
+        captured = {}
+
+        def fake_create_items(metas, *, collection=None, tags=None, dedup=True,
+                              doi_index=None, pmid_index=None, attach_pdfs=False):
+            captured["pmid_index"] = pmid_index
+            captured["n"] = len(metas)
+            return {"created": [{"title": m.get("title", ""), "key": f"K{i}",
+                                 "doi": m.get("doi", "")}
+                                for i, m in enumerate(metas)],
+                    "skipped_existing": [], "failed": []}
+
+        def fake_convert(path, *, out=None, managers=("endnote",), track=False, **kw):
+            return {"out": str(out), "converted": [], "unmatched": [],
+                    "manual_skipped": [], "deduped": 0,
+                    "classification": {"counts": {}, "items": []}}
+
+        offline.setattr(zotero, "create_items", fake_create_items)
+        offline.setattr(en.zotero, "create_items", fake_create_items)
+        offline.setattr(citeconvert, "convert_to_zotero", fake_convert)
+        offline.setattr(en.citeconvert, "convert_to_zotero", fake_convert)
+
+        report = apply_endnote_migration(doc, lib, out=tmp_path / "out.docx")
+        # PMID index threaded for defense-in-depth dedup.
+        assert captured.get("pmid_index") == {"34567890": "PMIDKEY1"}
+        # Only the genuinely-absent record 2 is sent to create_items.
+        assert captured.get("n") == 1, "DOI-less-but-PMID-present ref must NOT be re-created"
+        assert len(report["created"]) == 1
+        assert any(m.get("key") == "PMIDKEY1" for m in report["matched"])
 
     def test_plan_retracted_not_counted_for_create(self, tmp_path, offline):
         lib = _write(tmp_path, "lib.xml", ENDNOTE_XML)
@@ -462,7 +561,7 @@ class TestApply:
 
         captured = {}
 
-        def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, attach_pdfs=False):
+        def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, pmid_index=None, attach_pdfs=False):
             captured["metas"] = metas
             return {"created": [{"title": m.get("title", ""), "key": f"K{i}",
                                  "doi": m.get("doi", "")} for i, m in enumerate(metas)],
@@ -508,7 +607,7 @@ class TestApply:
         offline.setattr(zotero, "key_can_write_status", lambda: True)
         offline.setattr(en.zotero, "key_can_write_status", lambda: True)
 
-        def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, attach_pdfs=False):
+        def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, pmid_index=None, attach_pdfs=False):
             calls.append(("create", collection, tuple(tags or ()), len(metas)))
             return {
                 "created": [{"title": m.get("title", ""), "key": f"K{i}", "doi": m.get("doi", "")}
@@ -558,7 +657,7 @@ class TestApply:
 
         created_metas = {}
 
-        def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, attach_pdfs=False):
+        def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, pmid_index=None, attach_pdfs=False):
             created_metas["n"] = len(metas)
             return {"created": [{"title": m.get("title", ""), "key": "K", "doi": ""} for m in metas],
                     "skipped_existing": [], "failed": []}
@@ -597,6 +696,8 @@ class TestApply:
         def _raise(*a, **k):
             raise zotero.LibraryUnavailableError("read failed")
 
+        offline.setattr(zotero, "library_index", _raise)
+        offline.setattr(en.zotero, "library_index", _raise)
         offline.setattr(zotero, "library_doi_index", _raise)
         offline.setattr(en.zotero, "library_doi_index", _raise)
 
@@ -624,6 +725,8 @@ class TestApply:
         def _raise(*a, **k):
             raise zotero.LibraryUnavailableError("read failed")
 
+        offline.setattr(zotero, "library_index", _raise)
+        offline.setattr(en.zotero, "library_index", _raise)
         offline.setattr(zotero, "library_doi_index", _raise)
         offline.setattr(en.zotero, "library_doi_index", _raise)
 
@@ -649,7 +752,7 @@ class TestApply:
 
         created_n = {}
 
-        def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, attach_pdfs=False):
+        def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, pmid_index=None, attach_pdfs=False):
             created_n["n"] = len(metas)
             return {"created": [{"title": m.get("title", ""), "key": f"K{i}", "doi": m.get("doi", "")}
                                 for i, m in enumerate(metas)],

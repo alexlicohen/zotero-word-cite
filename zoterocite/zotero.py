@@ -697,20 +697,36 @@ def library_index(
         return idx
 
     except Exception as exc:  # noqa: BLE001 — network error or missing credentials
-        # First fallback: a usable (even stale) combined disk cache. This serves
-        # the full DOI+PMID+title index, so it is NOT degraded — and it is the
-        # ONLY fallback the strict (write) path is allowed to use.
+        # First fallback: the combined disk cache — but ONLY while it is FRESH
+        # (within the TTL). "Complete" is not "fresh": a TTL-EXPIRED combined
+        # cache predating recently-added group items would classify those items
+        # as missing and, on the WRITE path, drive DUPLICATE creation — the very
+        # thing strict=True exists to prevent. So enforce the same TTL the normal
+        # disk read uses. A FRESH cache here is reached only on refresh=True (the
+        # normal read above already returns a fresh cache before any fetch).
         if _LIB_INDEX_CACHE.exists():
             try:
                 with _LIB_INDEX_CACHE.open("r", encoding="utf-8") as fh:
                     cached = json.load(fh)
                 idx = cached.get("index")
+                fetched_at = float(cached.get("fetched_at", 0))
                 if isinstance(idx, dict) and "doi" in idx:
-                    return {
+                    combined = {
                         "doi": idx.get("doi") or {},
                         "pmid": idx.get("pmid") or {},
                         "title": idx.get("title") or {},
                     }
+                    if now - fetched_at < ttl_seconds:
+                        # Fresh & complete: trustworthy, NOT degraded.
+                        return combined
+                    if not strict:
+                        # READ/coverage MAY use a stale combined index (richer
+                        # than DOI-only) but flags it degraded so consumers
+                        # surface a "provisional" note. The WRITE path must NOT —
+                        # it falls through below and fails closed.
+                        _last_index_status = {"degraded": True, "doi_only": False}
+                        return combined
+                    # strict + STALE: do not serve; fall through to fail closed.
             except Exception:  # noqa: BLE001 — corrupt/unreadable: keep degrading
                 pass
 
