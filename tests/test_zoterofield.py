@@ -192,6 +192,51 @@ def _group_creds(monkeypatch):
     )
 
 
+def test_resolve_doi_item_cached_then_refresh(monkeypatch):
+    """resolve_doi_item (THE owner for interactive single-DOI lookups): a cached-index HIT
+    is O(1) (never fetch_all); a MISS refreshes the index ONCE (catches a just-added item)."""
+    monkeypatch.setattr(zotero, "fetch_all",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("full scan!")))
+    # HIT on the first (cached) index
+    monkeypatch.setattr(zotero, "library_doi_index", lambda **k: {"10.1/x": "K1"})
+    assert zotero.resolve_doi_item("10.1/x") == {"key": "K1"}
+    # MISS then refresh: 1st (cached) index empty, refreshed index has it
+    calls = {"n": 0}
+
+    def _idx(**k):
+        calls["n"] += 1
+        return {} if calls["n"] == 1 else {"10.1/y": "K2"}
+    monkeypatch.setattr(zotero, "library_doi_index", _idx)
+    assert zotero.resolve_doi_item("10.1/y") == {"key": "K2"}
+    assert calls["n"] == 2                              # cached miss + one refresh, no scan
+
+
+def test_cite_into_doi_uses_cached_index_not_full_scan(tmp_path, monkeypatch):
+    """cite_into(--doi) must resolve via the CACHED {doi:key} index (O(1)), NOT
+    get_item_by_doi's full-library fetch_all scan (which hung ~25s on a 3,259-item
+    group library — TSC R01 perf complaint)."""
+    _group_creds(monkeypatch)
+
+    def _boom_fetch_all(*a, **k):
+        raise AssertionError("fetch_all (full library scan) must not run for --doi")
+    monkeypatch.setattr(zotero, "fetch_all", _boom_fetch_all)
+    monkeypatch.setattr(zotero, "library_doi_index", lambda **k: {"10.1000/x": "KEYAAA"})
+    seen = {}
+
+    def _get(doi, *, doi_index=None):
+        seen["doi_index"] = doi_index is not None
+        return {"key": "KEYAAA"} if doi_index else None
+    monkeypatch.setattr(zotero, "get_item_by_doi", _get)
+    monkeypatch.setattr(zotero, "csljson",
+                        lambda keys: [{"id": f"{GROUP}/KEYAAA", "type": "article-journal", "title": "X"}])
+    monkeypatch.setattr(zotero, "item_uri_offline_safe", lambda k: f"http://z/{k}")
+    monkeypatch.setattr(zotero, "formatted_citations", lambda keys, **kw: ["(1)"])
+
+    src = tmp_path / "s.docx"; new_doc(src, ["A claim citing here."])
+    cite_into(src, "claim citing", doi="10.1000/x", out=tmp_path / "o.docx")
+    assert seen["doi_index"] is True                   # resolved via the cached index, not a scan
+
+
 def test_cite_into_binds_correctly_when_zotero_reverses_order(tmp_path, monkeypatch):
     """Two keys; Zotero's csljson response is REVERSED vs the request. Each
     citationItem's embedded itemData/id AND uri must match its OWN key."""

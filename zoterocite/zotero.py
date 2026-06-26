@@ -391,6 +391,19 @@ def get_item_by_doi(
     return None
 
 
+def resolve_doi_item(doi: str) -> Optional[dict]:
+    """Resolve a single DOI to its item (a minimal ``{"key": ...}`` stub) via the CACHED
+    ``{doi: key}`` index — O(1), NOT :func:`get_item_by_doi`'s full-library ``fetch_all``
+    scan (which hung ~25 s on a 3,259-item group library). On a cached-index MISS, refresh
+    the index ONCE (so a just-added item is still found) before giving up. THE single owner
+    for INTERACTIVE single-DOI lookups (``zotero --doi``, ``cite-into --doi``); the BATCH
+    dedup path passes its own pre-built ``doi_index`` to :func:`get_item_by_doi` directly."""
+    item = get_item_by_doi(doi, doi_index=library_doi_index())
+    if item is None:
+        item = get_item_by_doi(doi, doi_index=library_doi_index(refresh=True))
+    return item
+
+
 # Path to the DOI index cache, relative to this file's package root.
 _DOI_INDEX_CACHE = Path(__file__).parent.parent / "data" / "zotero_doi_index.json"
 

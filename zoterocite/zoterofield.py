@@ -430,7 +430,8 @@ def cite_into(
         keys = [it["key"] for it in items]
         extras = items
     elif doi and not keys:
-        item = zotero.get_item_by_doi(doi)
+        # Cached-index DOI resolve (O(1)), never the full-library scan — see resolve_doi_item.
+        item = zotero.resolve_doi_item(doi)
         if not item:
             raise RuntimeError(f"no Zotero item with DOI {doi}")
         keys = [item["key"]]
