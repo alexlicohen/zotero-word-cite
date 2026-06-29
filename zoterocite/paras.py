@@ -108,13 +108,59 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+class ParaIndex:
+    """One-shot anchor resolver: walk the tree ONCE, then resolve many anchors.
+
+    :func:`find_paragraph` / :func:`find_paragraphs` re-walk the whole tree on
+    EVERY call — :func:`iter_paragraphs` (a full ``root.iter(w:p)`` plus a textbox
+    ancestor walk per paragraph) and :func:`paragraph_text` (a subtree walk per
+    paragraph). Inside a per-item / per-token / per-placement loop that is
+    O(items * doc) — quadratic. ``ParaIndex`` does those tree walks ONCE at
+    construction, caching ``(p_el, _norm(paragraph_text(p)))`` per paragraph in
+    :func:`iter_paragraphs` order, then resolves each anchor by a cheap substring
+    scan over the cached normalized strings: O(doc) build + O(doc) substring checks
+    per query, with NO tree walk per query.
+
+    Resolution is BYTE-IDENTICAL to the module functions: it reuses the very same
+    :func:`iter_paragraphs` ordering, the same :func:`paragraph_text` reassembly,
+    the same :func:`_norm` normalization, the same ``substring`` match rule, and
+    the same unique / ambiguous / not-found handling (:meth:`find` raises the
+    identical ``LookupError``). The module functions now delegate here, so there is
+    a SINGLE matching implementation.
+
+    Caching contract (the caller's responsibility): the cached normalized text is a
+    SNAPSHOT taken at construction. Build the index on a stable tree and resolve
+    before mutating, OR only under mutations that leave BOTH the paragraph SET
+    (:func:`iter_paragraphs`) AND :func:`paragraph_text` of every still-to-resolve
+    anchor unchanged. The zotero-word-cite write callers satisfy this: feedback validate
+    never mutates; feedback apply resolves every anchor in a pre-scan BEFORE the
+    edit pass; comment-wrapping adds ``commentRangeStart/End``/``commentReference``
+    runs (no ``w:t``/``w:tab``/``w:br``, so ``paragraph_text`` is unchanged, and no
+    ``w:p`` is added/removed); cite-link/unify field-splice replaces only an
+    already-resolved token's own occurrences with a NEUTRAL placeholder that
+    contains no other (distinct) anchor, so a not-yet-resolved anchor's match-set is
+    invariant.
+    """
+
+    __slots__ = ("_entries",)
+
+    def __init__(self, root: etree._Element) -> None:
+        self._entries = [(p, _norm(paragraph_text(p))) for p in iter_paragraphs(root)]
+
+    def find_all(self, anchor: str) -> List[etree._Element]:
+        a = _norm(anchor)
+        return [p for (p, t) in self._entries if a in t]
+
+    def find(self, anchor: str) -> etree._Element:
+        hits = self.find_all(anchor)
+        if len(hits) != 1:
+            raise LookupError(f"anchor {anchor!r} matched {len(hits)} paragraphs (need exactly 1)")
+        return hits[0]
+
+
 def find_paragraphs(root: etree._Element, anchor: str) -> List[etree._Element]:
-    a = _norm(anchor)
-    return [p for p in iter_paragraphs(root) if a in _norm(paragraph_text(p))]
+    return ParaIndex(root).find_all(anchor)
 
 
 def find_paragraph(root: etree._Element, anchor: str) -> etree._Element:
-    hits = find_paragraphs(root, anchor)
-    if len(hits) != 1:
-        raise LookupError(f"anchor {anchor!r} matched {len(hits)} paragraphs (need exactly 1)")
-    return hits[0]
+    return ParaIndex(root).find(anchor)

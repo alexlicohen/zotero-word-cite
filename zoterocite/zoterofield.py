@@ -27,7 +27,7 @@ from lxml import etree
 from . import csldb
 from .docxio import DOCUMENT, Docx
 from .ooxml import NS, now_iso, qn
-from .paras import find_paragraph, find_paragraphs, get_body
+from .paras import ParaIndex, find_paragraph, find_paragraphs, get_body
 
 W = NS["w"]
 CSL_SCHEMA = "https://github.com/citation-style-language/schema/raw/master/csl-citation.json"
@@ -952,6 +952,7 @@ def replace_all_text_with_zotero_field(
     track: bool = False,
     author: str = "zotero-word-cite",
     date: Optional[str] = None,
+    index: Optional[ParaIndex] = None,
 ) -> int:
     """Replace EVERY occurrence of the literal ``anchor`` text across the whole
     document with the SAME live Zotero ``ZOTERO_ITEM CSL_CITATION`` field, in
@@ -1001,7 +1002,15 @@ def replace_all_text_with_zotero_field(
         rendered=rendered, rendered_html=rendered_html, extras=extras,
     )
     converted = 0
-    for para in find_paragraphs(root, anchor):
+    # When a caller converts MANY distinct tokens against one document (cite-link's
+    # token loop), it can pass a prebuilt ``index`` so the whole-doc paragraph scan
+    # happens ONCE for all tokens instead of per token (O(tokens*doc) -> O(doc)).
+    # Safe because each conversion replaces only THIS anchor's occurrences with a
+    # NEUTRAL ``rendered`` placeholder (the guard above refuses ``anchor in rendered``)
+    # that contains no other distinct token, so a later token's match-set is unchanged;
+    # and the per-paragraph re-scan below still reads each paragraph's LIVE text.
+    target_paras = index.find_all(anchor) if index is not None else find_paragraphs(root, anchor)
+    for para in target_paras:
         # Re-scan this paragraph until no occurrence remains. A hard cap on
         # iterations (one per occurrence in the paragraph's current text, +1)
         # makes a non-progressing splice fail safe instead of looping forever.

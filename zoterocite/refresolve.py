@@ -107,7 +107,12 @@ _DOI_RE = re.compile(
 )
 _TRAILING_PUNCT = re.compile(r'[.,);:]+$')
 
-_PMID_RE = re.compile(r'PMID:?\s*(\d+)', re.IGNORECASE)
+# PMID extraction is NOT open-coded here — :func:`extract_identifier` routes
+# through the recall-superset owner :func:`textpatterns.extract_pmids`
+# (``textpatterns.PMID_RE``).  The old local copy (a "PMID" label, optional
+# colon, then a digit run) had no deliberate divergence from the owner — it was
+# unbounded like the owner — yet MISSED forms the owner catches, e.g. a label
+# with whitespace before the colon.  See the A9 owner-routing adjudication.
 _ARXIV_RE = re.compile(r'arxiv:\s*(\d{4}\.\d{4,5})', re.IGNORECASE)
 
 # ISBN: 10 or 13 digits, possibly hyphenated/spaced.
@@ -141,10 +146,13 @@ def extract_identifier(text: str) -> dict:
     if found:
         doi = _normalise_doi(found[0]) or None
 
-    pmid: Optional[str] = None
-    m = _PMID_RE.search(text)
-    if m:
-        pmid = m.group(1)
+    # PMID via the recall-superset owner.  ``extract_pmids`` preserves
+    # first-appearance order, so ``[0]`` reproduces the historical "first PMID in
+    # the string" behaviour while also catching the forms the old local regex
+    # missed (e.g. "PMID : 12345" — whitespace before the colon — and the
+    # "PubMed PMID:" label).  It is a strict superset, so no prior match is lost.
+    pmids = textpatterns.extract_pmids(text)
+    pmid: Optional[str] = pmids[0] if pmids else None
 
     arxiv: Optional[str] = None
     m = _ARXIV_RE.search(text)

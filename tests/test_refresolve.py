@@ -127,6 +127,17 @@ class TestExtractIdentifier:
         result = rr.extract_identifier(text)
         assert result["pmid"] == "12345678"
 
+    def test_pmid_space_before_colon(self):
+        # Recall regression: a PMID with whitespace BEFORE the colon
+        # ("PMID : 12345").  The old local extractor r'PMID:?\s*(\d+)' MISSED
+        # this (after "PMID", the optional ':' could not match the space and the
+        # following ':' was not a digit).  Routing through the recall-superset
+        # owner textpatterns.extract_pmids (PMID_RE = r'(?:PubMed\s+PMID|PMID)
+        # \s*:?\s*(\d+)') catches it.  Has teeth: fails on the pre-route code.
+        text = "Cohen AL et al. PMID : 26980150. Nat Neurosci 2016."
+        result = rr.extract_identifier(text)
+        assert result["pmid"] == "26980150"
+
     def test_arxiv_extracted(self):
         text = "arXiv: 2301.01234 — a preprint on deep learning."
         result = rr.extract_identifier(text)

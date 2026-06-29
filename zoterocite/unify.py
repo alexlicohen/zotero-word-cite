@@ -643,6 +643,7 @@ def apply_unification(
     out,
     add_missing: bool = True,
     track: bool = True,
+    author: Optional[str] = None,
     source_label: Optional[str] = None,
     attach_pdfs: bool = False,
 ) -> dict:
@@ -689,6 +690,13 @@ def apply_unification(
     accept = set(decisions.get("accept", []))
     ph_resolutions = decisions.get("placeholder_resolutions", {}) or {}
     source_label = source_label or Path(path).name
+    # Tracked-change author: the CLI passes the CONFIGURED author (cmd_unify_refs ->
+    # `a.author or AUTHOR`), which flows through to the inserted Zotero fields. A
+    # library caller that leaves author=None falls through to zoterofield's own
+    # "zotero-word-cite" default (pass it only when set). unify is a brand-only SYNCED
+    # module — it must NOT import zotero-word-cite config (zoterocite has none); resolution
+    # lives at the zotero-word-cite CLI boundary, never here.
+    _author_kw = {} if author is None else {"author": author}
 
     auto = set(plan.get("auto", []))
     references = plan.get("references", [])
@@ -966,6 +974,13 @@ def apply_unification(
 
     doc = zoterofield.Docx(rewrite_src)
     root = doc.read_tree(zoterofield.DOCUMENT)
+    # One anchor index for every uniqueness check below: each placement would
+    # otherwise re-walk the whole document (O(placements*doc)). Each conversion
+    # replaces only its own marker text with a "({key})" field render that contains
+    # no other (distinct) marker, so the snapshot stays valid across placements; the
+    # per-occurrence splice in replace_text_with_zotero_field still reads live text.
+    from .paras import ParaIndex
+    _para_index = ParaIndex(root)
 
     # (b) Plain-text in-text cites + resolved placeholders → live Zotero fields.
     #     We anchor each insertion at a uniquely-locatable marker; if the anchor
@@ -989,8 +1004,7 @@ def apply_unification(
         intext_by_text.setdefault(_m["text"], []).append(_m)
 
     def _anchor_is_unique(anchor: str) -> bool:
-        from .paras import find_paragraphs
-        return len(find_paragraphs(root, anchor)) == 1
+        return len(_para_index.find_all(anchor)) == 1
 
     # Rendered text of citations that are ALREADY live Zotero fields. refextract
     # reads markers from rendered text, so a field rendering "(1,2)" is indistinguishable
@@ -1030,7 +1044,7 @@ def apply_unification(
                 zoterofield.replace_text_with_zotero_field(
                     doc, anchor, [key],
                     itemdata=[idata], uris=[uri],
-                    rendered=f"({key})", track=track,
+                    rendered=f"({key})", track=track, **_author_kw,
                 )
                 report["replaced"] += 1
             except Exception as exc:  # noqa: BLE001 — best-effort, never fail the run
@@ -1062,7 +1076,7 @@ def apply_unification(
             zoterofield.replace_text_with_zotero_field(
                 doc, anchor, [key],
                 itemdata=[idata], uris=[uri],
-                rendered=f"({key})", track=track,
+                rendered=f"({key})", track=track, **_author_kw,
             )
             report["replaced"] += 1
         except Exception as exc:  # noqa: BLE001
