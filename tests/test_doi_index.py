@@ -614,3 +614,83 @@ class TestUnifyUsesIndex:
         assert call_count["n"] == 1, (
             f"apply_unification must call library_index exactly once; got {call_count['n']}"
         )
+
+
+# ---------------------------------------------------------------------------
+# resolve_doi_item — offline / cache-only mode (single-DOI O(1) across processes)
+# ---------------------------------------------------------------------------
+
+class TestResolveDoiItemOffline:
+    """The single-DOI owner must be O(1)/no-network in offline mode, and keep the
+    refresh-on-miss safety by default. (Residual: a fresh subprocess was doing a
+    full ~90s refresh on any cache MISS.)"""
+
+    def _write_disk_cache(self, index):
+        # Write to the fixture-redirected _DOI_INDEX_CACHE (a tmp path).
+        zotero_mod._DOI_INDEX_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        with zotero_mod._DOI_INDEX_CACHE.open("w", encoding="utf-8") as fh:
+            json.dump({"fetched_at": time.time(), "index": index}, fh)
+
+    def test_offline_hit_is_cache_only_no_network(self, monkeypatch):
+        """refresh_on_miss=False: a HIT reads the on-disk DOI index and never fetches.
+
+        TEETH: guarded by the ``if not refresh_on_miss:`` gate in resolve_doi_item;
+        flipping it to the live path routes through fetch_all/library_doi_index → the
+        AssertionError booms fire (RED)."""
+        self._write_disk_cache({"10.1234/alpha": "KEY1"})
+
+        def boom(**kw):
+            raise AssertionError("offline resolve must not hit the network")
+
+        monkeypatch.setattr(zotero_mod, "fetch_all", boom)
+        monkeypatch.setattr(
+            zotero_mod, "library_doi_index",
+            lambda **kw: (_ for _ in ()).throw(AssertionError("no live index build offline")),
+        )
+        assert zotero_mod.resolve_doi_item("10.1234/alpha", refresh_on_miss=False) == {"key": "KEY1"}
+
+    def test_offline_miss_returns_none_without_refresh(self, monkeypatch):
+        """refresh_on_miss=False: a MISS returns None WITHOUT the full-library refresh."""
+        self._write_disk_cache({"10.1234/alpha": "KEY1"})
+
+        def boom(**kw):
+            raise AssertionError("offline miss must not trigger a refresh/fetch")
+
+        monkeypatch.setattr(zotero_mod, "fetch_all", boom)
+        monkeypatch.setattr(
+            zotero_mod, "library_doi_index",
+            lambda **kw: (_ for _ in ()).throw(AssertionError("no refresh offline")),
+        )
+        assert zotero_mod.resolve_doi_item("10.9999/absent", refresh_on_miss=False) is None
+
+    def test_offline_no_cache_returns_none(self, monkeypatch):
+        """No disk cache at all → offline returns None, still no network."""
+        def boom(**kw):
+            raise AssertionError("offline must not fetch even with a cold cache")
+
+        monkeypatch.setattr(zotero_mod, "fetch_all", boom)
+        assert zotero_mod.resolve_doi_item("10.1234/alpha", refresh_on_miss=False) is None
+
+    def test_default_refreshes_on_miss(self, monkeypatch):
+        """Default (refresh_on_miss=True): a cached-index MISS triggers ONE refresh."""
+        calls = {"n": 0}
+
+        def counting_fetch(**kw):
+            calls["n"] += 1
+            return CANNED_ITEMS  # no entry matches the absent DOI
+
+        monkeypatch.setattr(zotero_mod, "fetch_all", counting_fetch)
+        assert zotero_mod.resolve_doi_item("10.9999/absent") is None
+        assert calls["n"] == 2, "default must refresh once on a miss (build + refresh)"
+
+    def test_default_hit_does_not_refresh(self, monkeypatch):
+        """Default: a HIT in the first cached index does NOT refresh (single fetch)."""
+        calls = {"n": 0}
+
+        def counting_fetch(**kw):
+            calls["n"] += 1
+            return CANNED_ITEMS
+
+        monkeypatch.setattr(zotero_mod, "fetch_all", counting_fetch)
+        assert zotero_mod.resolve_doi_item("10.1234/alpha") == {"key": "KEY1"}
+        assert calls["n"] == 1, "a hit must not trigger the refresh"

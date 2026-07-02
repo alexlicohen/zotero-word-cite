@@ -483,13 +483,24 @@ def get_item_by_doi(
     return None
 
 
-def resolve_doi_item(doi: str) -> Optional[dict]:
+def resolve_doi_item(doi: str, *, refresh_on_miss: bool = True) -> Optional[dict]:
     """Resolve a single DOI to its item (a minimal ``{"key": ...}`` stub) via the CACHED
     ``{doi: key}`` index — O(1), NOT :func:`get_item_by_doi`'s full-library ``fetch_all``
-    scan (which hung ~25 s on a 3,259-item group library). On a cached-index MISS, refresh
-    the index ONCE (so a just-added item is still found) before giving up. THE single owner
-    for INTERACTIVE single-DOI lookups (``zotero --doi``, ``cite-into --doi``); the BATCH
-    dedup path passes its own pre-built ``doi_index`` to :func:`get_item_by_doi` directly."""
+    scan (which hung ~25 s on a 3,259-item group library). THE single owner for INTERACTIVE
+    single-DOI lookups (``zotero --doi``, ``cite-into --doi``); the BATCH dedup path passes
+    its own pre-built ``doi_index`` to :func:`get_item_by_doi` directly.
+
+    ``refresh_on_miss`` (default ``True``): on a cached-index MISS, refresh the index ONCE
+    (a full re-fetch) so a JUST-ADDED item is still found before giving up — the safe default
+    for interactive/cite flows. Set ``False`` for **cache-only** membership (the ``--offline``
+    path): a miss returns ``None`` WITHOUT the full refresh, reading only the on-disk DOI
+    index (``_load_doi_cache_only``, ignoring TTL) and never touching the network — so a warm
+    cache (e.g. right after ``library-coverage``) makes single-DOI membership instant ACROSS
+    process boundaries. Cache-only may be stale (a genuinely just-added item can read as
+    absent); that is the explicit offline trade-off, matching ``library-coverage --offline``."""
+    if not refresh_on_miss:
+        # Cache-only: the on-disk DOI index, ignoring TTL, never a network fetch.
+        return get_item_by_doi(doi, doi_index=_load_doi_cache_only() or {})
     item = get_item_by_doi(doi, doi_index=library_doi_index())
     if item is None:
         item = get_item_by_doi(doi, doi_index=library_doi_index(refresh=True))
