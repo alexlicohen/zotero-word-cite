@@ -290,8 +290,29 @@ def ensure_retraction_db(*, max_age_days: int = RW_MAX_AGE_DAYS,
         )
 
 
+# In-process parse cache for the Retraction Watch CSV (~62 MB). Several features
+# screen retractions in one run (cite-check, unify, endnote, validate), and EVERY
+# call used to re-read + re-parse the whole CSV — O(features × 62 MB). Cache the
+# parsed map keyed by (resolved path, mtime_ns, size): a stale cache is impossible
+# because a refresh (:func:`refresh_retraction_db`) rewrites the file, changing
+# mtime/size → cache miss → reparse. The cached dict is SHARED (not copied —
+# copying 62 MB defeats the point); every consumer treats it READ-ONLY
+# (is_retraction / check_retractions only look up). Cleared via
+# :func:`_reset_retraction_cache` (tests).
+_RW_DB_CACHE: Dict[tuple, Dict[str, dict]] = {}
+
+
+def _reset_retraction_cache() -> None:
+    """Drop the in-process Retraction Watch parse cache (test hook)."""
+    _RW_DB_CACHE.clear()
+
+
 def load_retraction_db(csv_path: Union[str, Path]) -> Dict[str, dict]:
     """Load the Retraction Watch CSV into a normalised DOI → record mapping.
+
+    Result is cached in-process per (path, mtime, size) — repeat calls within a
+    run reuse the parsed map; a refreshed CSV (new mtime) reparses. The returned
+    dict is shared and must be treated READ-ONLY.
 
     The CSV (Crossref-distributed) has at minimum the columns:
         OriginalPaperDOI, RetractionDOI, RetractionNature, Title, RetractionDate
@@ -309,6 +330,18 @@ def load_retraction_db(csv_path: Union[str, Path]) -> Dict[str, dict]:
         "retraction_doi": str,
     }
     """
+    # Cache probe: key on (resolved path, mtime, size); a rewrite (refresh) or a
+    # different dest misses and reparses. stat failure => key=None => parse (and
+    # let open() raise as before, so the caller's degrade path is unchanged).
+    _key = None
+    try:
+        _st = Path(csv_path).stat()
+        _key = (str(Path(csv_path).resolve()), _st.st_mtime_ns, _st.st_size)
+        if _key in _RW_DB_CACHE:
+            return _RW_DB_CACHE[_key]
+    except OSError:
+        _key = None
+
     db: Dict[str, dict] = {}
     with open(csv_path, newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
@@ -341,6 +374,8 @@ def load_retraction_db(csv_path: Union[str, Path]) -> Dict[str, dict]:
                     existing["nature"] = nature
                     existing["date"] = date
                     existing["retraction_doi"] = ret_doi
+    if _key is not None:
+        _RW_DB_CACHE[_key] = db
     return db
 
 
