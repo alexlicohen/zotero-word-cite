@@ -34,6 +34,7 @@ import json
 import os
 import re
 import secrets
+import sys
 import time
 import unicodedata
 import urllib.error
@@ -43,6 +44,7 @@ import warnings
 from pathlib import Path
 from typing import Any, Optional
 
+from . import _http
 from . import cite
 from . import citecheck
 
@@ -105,6 +107,69 @@ _DEFAULT_RETRY_WAIT = 1.0
 _retry_sleep = time.sleep
 
 
+def _effective_timeout(timeout: float) -> float:
+    """Clamp *timeout* to the shared ``ZOTERO_WORD_CITE_HTTP_TIMEOUT`` ceiling, if set.
+
+    The authenticated Zotero read/write path does NOT route through
+    :func:`zoterocite._http.http_get`, so it historically ignored the
+    process-wide timeout ceiling that the unauthenticated public-API clients
+    (entrez/icite/orcid/…) already honour.  This applies the SAME ceiling (owned
+    by :func:`_http._timeout_ceiling`) so a deployment can bound every Zotero
+    socket read/write the way it already bounds those clients.  With no env var
+    set the ceiling is ``None`` and *timeout* is returned unchanged
+    (byte-identical default behaviour).
+    """
+    ceiling = _http._timeout_ceiling()
+    if ceiling is not None and ceiling < timeout:
+        return ceiling
+    return timeout
+
+
+def _progress(msg: str) -> None:
+    """Emit a progress heartbeat to STDERR (never stdout).
+
+    Long-running network loops (``fetch_all`` pagination; the per-entry
+    reference-resolution loops in :mod:`unify`, which reuse this helper) print
+    liveness here so a multi-minute run is visibly alive rather than an opaque
+    hang.  STDERR only — ``--json`` consumers read stdout, which must stay a
+    clean JSON document.  Best-effort: a broken/closed stderr never raises.
+    """
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001 — a heartbeat must never break the caller
+        pass
+
+
+# Overall wall-clock budget (seconds) for a full paginated ``fetch_all``.  A cold
+# library-index build fetches the WHOLE group (thousands of items); without an
+# overall deadline a stalled or very large fetch runs unbounded until an external
+# kill, leaving the index uncached.  Read at call time from
+# ``ZOTERO_WORD_CITE_ZOTERO_FETCH_BUDGET``; a too-small value is floored (never
+# sub-second) so a typo cannot abort every fetch instantly — mirrors
+# :func:`refresolve.resolve_timeout`'s clamp.
+_DEFAULT_FETCH_BUDGET = 120.0
+_MIN_FETCH_BUDGET = 5.0
+
+
+def _fetch_budget() -> float:
+    """Overall ``fetch_all`` wall-clock budget in seconds, read at CALL time.
+
+    Honours ``ZOTERO_WORD_CITE_ZOTERO_FETCH_BUDGET``; a malformed/absent/non-positive
+    value yields :data:`_DEFAULT_FETCH_BUDGET`, and a too-small positive value is
+    clamped up to :data:`_MIN_FETCH_BUDGET`.
+    """
+    raw = os.environ.get("ZOTERO_WORD_CITE_ZOTERO_FETCH_BUDGET")
+    if not raw:
+        return _DEFAULT_FETCH_BUDGET
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_FETCH_BUDGET
+    if val <= 0:
+        return _DEFAULT_FETCH_BUDGET
+    return max(val, _MIN_FETCH_BUDGET)
+
+
 def _parse_retry_wait(value: Optional[str]) -> float:
     """Seconds to wait per a ``Retry-After`` / ``Backoff`` header, clamped.
 
@@ -158,6 +223,7 @@ def _urlopen_retrying(
     """
     sleep = _sleep if _sleep is not None else _retry_sleep
     attempts = max(0, int(retries)) + 1  # original + retries
+    timeout = _effective_timeout(timeout)  # honour ZOTERO_WORD_CITE_HTTP_TIMEOUT ceiling
     for attempt in range(attempts):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (trusted host)
@@ -241,14 +307,16 @@ def build_request(
     )
 
 
-def _get_json(req: urllib.request.Request, timeout: float = 30.0) -> Any:
+def _get_json(req: urllib.request.Request, timeout: float = 15.0) -> Any:
     """Perform ``req`` (one bounded retry on a transient 429/5xx) and parse the
     JSON body.  A 404 (and any non-transient error) propagates unchanged, so
-    ``get_item`` can still catch it."""
+    ``get_item`` can still catch it.  The per-call default is 15 s; a configured
+    ``ZOTERO_WORD_CITE_HTTP_TIMEOUT`` ceiling clamps it further (via
+    :func:`_urlopen_retrying`)."""
     return json.loads(_urlopen_retrying(req, timeout=timeout).decode("utf-8"))
 
 
-def _get_json_headers(req: urllib.request.Request, timeout: float = 30.0):
+def _get_json_headers(req: urllib.request.Request, timeout: float = 15.0):
     """Perform ``req``; return ``(parsed_json, headers_dict)`` — for pagination.
 
     Retries once on a transient 429/5xx so a rate-limit hiccup mid-``fetch_all``
@@ -260,6 +328,7 @@ def _get_json_headers(req: urllib.request.Request, timeout: float = 30.0):
     rather than via :func:`_urlopen_retrying`.
     """
     attempts = 2  # original + one retry
+    timeout = _effective_timeout(timeout)  # honour ZOTERO_WORD_CITE_HTTP_TIMEOUT ceiling
     for attempt in range(attempts):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
@@ -301,10 +370,31 @@ def fetch_all(query: Optional[str] = None, qmode: Optional[str] = None,
 
     Pages with ``limit=100`` and ``start`` until ``Total-Results`` is exhausted
     (or ``max_items`` is reached). ``top=True`` excludes child notes/attachments.
+
+    Bounded by an OVERALL wall-clock budget (``ZOTERO_WORD_CITE_ZOTERO_FETCH_BUDGET``,
+    default 120 s): a cold-cache index build fetches the whole group, and without
+    a deadline a stalled or very large paginated fetch would run unbounded until
+    an external kill.  On exceeding the budget it raises
+    :class:`LibraryUnavailableError` — the SAME degraded-read signal any fetch
+    failure raises — so :func:`library_doi_index` / :func:`library_index` fall
+    back to the disk cache or fail closed, never mistaking a timed-out partial
+    fetch for a complete (or empty) library.  A throttled progress heartbeat is
+    emitted to STDERR after each page (never stdout, so ``--json`` stays clean).
     """
     out: list[dict] = []
     start = 0
+    budget = _fetch_budget()
+    deadline_start = time.time()
     while True:
+        # Overall deadline check BETWEEN pages: bound the total fetch, not just
+        # each socket read.  Raising the degraded-read exception routes the index
+        # builders to their cache fallback / fail-closed path (see docstring).
+        if time.time() - deadline_start > budget:
+            raise LibraryUnavailableError(
+                f"Zotero fetch exceeded its {budget:.0f}s budget "
+                f"(ZOTERO_WORD_CITE_ZOTERO_FETCH_BUDGET) after {len(out)} item(s); "
+                "treating as a degraded read (cache fallback / fail-closed)."
+            )
         params: dict[str, Any] = {"format": "json", "limit": "100", "start": str(start)}
         if query:
             params["q"] = query
@@ -315,9 +405,11 @@ def fetch_all(query: Optional[str] = None, qmode: Optional[str] = None,
             break
         out.extend(data)
         start += len(data)
+        total = headers.get("Total-Results", len(out))
+        _progress(f"zotero: fetched {len(out)}/{total} items…")
         if max_items is not None and len(out) >= max_items:
             return out[:max_items]
-        if start >= int(headers.get("Total-Results", len(out))):
+        if start >= int(total):
             break
     return out
 
@@ -1121,7 +1213,7 @@ def _post_json(
     body: Any,
     *,
     extra_headers: Optional[dict[str, str]] = None,
-    timeout: float = 30.0,
+    timeout: float = 15.0,
 ) -> Any:
     """POST ``body`` (serialised to JSON) to a library path; return parsed JSON.
 
@@ -1384,6 +1476,7 @@ def create_items(
     doi_index: Optional[dict[str, str]] = None,
     pmid_index: Optional[dict[str, str]] = None,
     attach_pdfs: bool = False,
+    index_degraded: bool = False,
 ) -> dict:
     """Batch-create Zotero items from CSL-JSON-ish metadata dicts.
 
@@ -1421,13 +1514,28 @@ def create_items(
         attach reuses THIS call's write gate (no second permission check) and is
         best-effort: a fetch/upload failure is recorded under ``pdf_skipped`` and
         never demotes a successful create.
+    index_degraded:
+        Fail-closed dedup safety (default ``False`` — existing behaviour
+        unchanged).  When ``True`` AND ``dedup`` is on, the pre-built index the
+        caller passed came from a DEGRADED/unverifiable library read, so an
+        ``absent`` verdict cannot be trusted: an item the index reports as absent
+        is NOT created — it is routed to ``skipped_degraded_read`` instead of
+        being POSTed, so we never risk a duplicate write to the shared group on
+        an uncertain read.  Items the index POSITIVELY matches (by DOI/PMID) still
+        go to ``skipped_existing``.  Belt-and-suspenders with the caller's own
+        degraded-read guard (``unify.apply_unification`` already fails closed on
+        the ``LibraryUnavailableError`` raise).
 
     Returns
     -------
     dict with keys:
-        ``"created"``          list of ``{title, key, doi}``
-        ``"skipped_existing"`` list of ``{title, existing_key}``
-        ``"failed"``           list of ``{title, reason}``
+        ``"created"``               list of ``{title, key, doi}``
+        ``"skipped_existing"``      list of ``{title, existing_key}``
+        ``"failed"``                list of ``{title, reason}``
+        ``"skipped_degraded_read"`` list of ``{title, reason}`` — items refused
+            because the library index was degraded/unverifiable and could not
+            confirm the item is absent (only ever non-empty when
+            ``index_degraded=True``).
 
     When ``attach_pdfs=True``, two more keys are present:
         ``"pdf_attached"``     list of ``{key, source_url}``
@@ -1437,7 +1545,10 @@ def create_items(
     A :data:`False` result from :func:`key_can_write` causes the entire call to
     return with all items in ``"failed"`` (no POST attempted).
     """
-    result: dict[str, list] = {"created": [], "skipped_existing": [], "failed": []}
+    result: dict[str, list] = {
+        "created": [], "skipped_existing": [], "failed": [],
+        "skipped_degraded_read": [],
+    }
 
     if not metas:
         return result
@@ -1507,6 +1618,20 @@ def create_items(
                 # ref upstream false-flagged "missing" (present only by PMID).
                 if existing_key is None and pmid and pmid_index:
                     existing_key = pmid_index.get(pmid)
+                # Fail-closed on a DEGRADED index read: we can trust a POSITIVE
+                # match above (the item is present) but NOT an absence — and the
+                # live ``_title_exists_in_library`` search below is itself a
+                # (degraded) read whose "absent" answer is equally untrustworthy.
+                # Refuse to create rather than risk a duplicate write to the
+                # shared group; the user re-runs once the library is readable.
+                if existing_key is None and index_degraded:
+                    result["skipped_degraded_read"].append({
+                        "title": title,
+                        "reason": ("library index degraded/unverifiable — could not "
+                                   "confirm this item is absent; refused to create "
+                                   "(fail-closed) to avoid a duplicate write."),
+                    })
+                    continue
                 if existing_key is None:
                     existing_key = _title_exists_in_library(title)
 
@@ -1818,7 +1943,7 @@ def attach_pdf_to_item(
                 upload_url, data=put_body, method="POST",
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
             )
-        with urllib.request.urlopen(put_req, timeout=timeout):  # noqa: S310 — Zotero storage endpoint
+        with urllib.request.urlopen(put_req, timeout=_effective_timeout(timeout)):  # noqa: S310 — Zotero storage endpoint
             pass
 
         # 4) Register the upload.  Zotero answers this step with an empty 204,
@@ -1838,7 +1963,7 @@ def attach_pdf_to_item(
                 "If-None-Match": "*",
             },
         )
-        with urllib.request.urlopen(reg_req, timeout=timeout) as reg_resp:  # noqa: S310
+        with urllib.request.urlopen(reg_req, timeout=_effective_timeout(timeout)) as reg_resp:  # noqa: S310
             return 200 <= (getattr(reg_resp, "status", None) or reg_resp.getcode()) < 300
     except Exception:  # noqa: BLE001 — never break the add path on an attach failure
         return False

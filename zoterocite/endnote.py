@@ -857,7 +857,8 @@ def apply_endnote_migration(
     doi_index = lib_index.get("doi") or {}
     pmid_index = lib_index.get("pmid") or {}
 
-    created_report = {"created": [], "skipped_existing": [], "failed": []}
+    created_report = {"created": [], "skipped_existing": [], "failed": [],
+                      "skipped_degraded_read": []}
     if to_create_metas:
         created_report = zotero.create_items(
             to_create_metas,

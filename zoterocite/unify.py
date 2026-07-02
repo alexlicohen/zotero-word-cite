@@ -38,6 +38,7 @@ dedup-hard, tagged, and reversible. Tests monkeypatch every network call.
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -51,6 +52,21 @@ from . import zoterofield
 # The dedicated collection + tag every added item gets (confirmed design).
 IMPORTED_COLLECTION = "Imported — review"
 ADDED_TAG = "added-by:zotero-word-cite"
+
+
+def _resolution_heartbeat(prefix: str, done: int, total: int, state: dict) -> None:
+    """Throttled STDERR liveness tick for a per-entry resolution/placement loop.
+
+    Each entry can trigger a live Crossref/PubMed lookup, so a long reflist would
+    otherwise look like an opaque multi-minute hang.  Emits via
+    :func:`zotero._progress` (STDERR only — never in ``--json`` stdout) at most
+    once per ~10 entries or ~2 s, plus a final tick at completion.  ``state`` is a
+    per-loop mutable dict the caller seeds as ``{}``; kept cheap and non-fragile
+    (tests do not assert stderr)."""
+    now = time.time()
+    if done >= total or done % 10 == 0 or now - state.get("t", 0.0) >= 2.0:
+        state["t"] = now
+        zotero._progress(f"{prefix}: resolved {done}/{total} references…")
 
 # How a confidence level maps to a tier bucket.
 _TIER_BY_CONFIDENCE = {
@@ -346,8 +362,10 @@ def plan_unification(
     n_retracted = 0
     tier_counts = {"high": 0, "medium": 0, "low": 0}
 
-    for entry in reflist:
+    _hb: dict = {}
+    for _n, entry in enumerate(reflist, 1):
         resolved = refresolve.resolve_reference(entry["text"], fetch=fetch)
+        _resolution_heartbeat("unify", _n, len(reflist), _hb)
         meta = resolved.get("metadata")
         confidence = resolved.get("confidence") or "none"
         tier = _TIER_BY_CONFIDENCE.get(confidence, "low")
@@ -404,8 +422,10 @@ def plan_unification(
 
     # ---- resolve each placeholder -----------------------------------------
     placeholders: List[dict] = []
+    _hb_ph: dict = {}
     for ph_idx, ph in enumerate(raw_placeholders):
         resolved = refresolve.resolve_reference(ph["text"], fetch=fetch)
+        _resolution_heartbeat("unify placeholders", ph_idx + 1, len(raw_placeholders), _hb_ph)
         suggestion = resolved.get("metadata") or _top_candidate(resolved)
         placeholders.append({
             "ph_index": ph_idx,
@@ -710,8 +730,15 @@ def apply_unification(
     # strict=True (explicit): the WRITE path NEVER serves a stale DOI-only
     # fallback — a stale cache could miss recently-added items and mass-duplicate
     # the shared group. A degraded read here MUST raise so we fail closed.
+    # Use the status-aware entry point so we can thread the degraded flag into
+    # create_items as belt-and-suspenders. Under strict=True a degraded read
+    # RAISES (→ lib_index=None → fail closed below), so index_degraded is False on
+    # the success path; capturing it defends against any future change that lets
+    # strict=True return a degraded index instead of raising.
+    index_degraded = False
     try:
-        lib_index = zotero.library_index(strict=True)
+        lib_index, _apply_status = zotero.library_index_status(strict=True)
+        index_degraded = bool(_apply_status.get("degraded"))
     except zotero.LibraryUnavailableError:
         lib_index = None
     # Back-compat: step 4 / create_items take a flat DOI→key map. ``None`` is the
@@ -727,6 +754,9 @@ def apply_unification(
         "needs_input": [],
         "retracted_flagged": [],
         "unresolved_in_doc": [],
+        # Surfaced by the CLI so a "added 0" is never silently ambiguous.
+        "create_failed": [],
+        "skipped_degraded_read": [],
     }
 
     # -----------------------------------------------------------------------
@@ -782,7 +812,9 @@ def apply_unification(
     to_create_metas: List[dict] = []         # metas needing creation
     to_create_back: List[dict] = []          # placement entries aligned w/ to_create_metas
 
-    for ref in accepted_refs:
+    _hb_place: dict = {}
+    for _pn, ref in enumerate(accepted_refs, 1):
+        _resolution_heartbeat("unify apply", _pn, len(accepted_refs), _hb_place)
         meta = _strip_score(ref.get("metadata"))
         # An accepted ref that resolved to NO usable metadata (refresolve miss) has
         # nothing to create from and no key to cite — it must be SURFACED with a
@@ -905,7 +937,12 @@ def apply_unification(
                 doi_index=doi_index,
                 pmid_index=(lib_index.get("pmid") if lib_index else None),
                 attach_pdfs=attach_pdfs,
+                index_degraded=index_degraded,
             )
+            # Surface the raw create failures / degraded-read refusals so a
+            # "added 0" is never silently ambiguous (the CLI prints these).
+            report["create_failed"] = list(created.get("failed", []))
+            report["skipped_degraded_read"] = list(created.get("skipped_degraded_read", []))
             # Map created/skipped results back to placements by DOI then title.
             created_by_doi: Dict[str, str] = {}
             created_by_title: Dict[str, str] = {}
@@ -920,6 +957,13 @@ def apply_unification(
                     skipped_by_title[s["title"].strip().lower()] = s.get("existing_key", "")
             failed_titles = {
                 (f.get("title") or "").strip().lower() for f in created.get("failed", [])
+            }
+            # Items refused because the library read was degraded (fail-closed):
+            # route them to needs_input with the true reason rather than the
+            # misleading "could not map a key" fallthrough below.
+            degraded_titles = {
+                (s.get("title") or "").strip().lower()
+                for s in created.get("skipped_degraded_read", [])
             }
 
             for pl in to_create_back:
@@ -937,6 +981,15 @@ def apply_unification(
                         pl["key"] = sk
                         report["matched"].append({"title": pl["title"], "key": sk})
                         continue
+                if key is None and (meta_title_l in degraded_titles or title_l in degraded_titles):
+                    report["needs_input"].append({
+                        "title": pl["title"],
+                        "doi": doi,
+                        "reason": "Zotero library read was degraded — refused to create "
+                                  "(fail-closed) to avoid a duplicate write; re-run when "
+                                  "the library is reachable.",
+                    })
+                    continue
                 if key is None and (meta_title_l in failed_titles or title_l in failed_titles):
                     report["needs_input"].append({
                         "title": pl["title"],

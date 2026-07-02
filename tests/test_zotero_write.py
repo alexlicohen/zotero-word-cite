@@ -579,7 +579,7 @@ class TestCreateItems:
             result = zotero.create_items([], dedup=True)
 
         mock_urlopen.assert_not_called()
-        assert result == {"created": [], "skipped_existing": [], "failed": []}
+        assert result == {"created": [], "skipped_existing": [], "failed": [], "skipped_degraded_read": []}
 
     def test_failed_item_recorded_not_raised(self, monkeypatch):
         """A POST failure for one item should be recorded, not raised."""
@@ -776,7 +776,7 @@ class TestCreateItemsDoiIndex:
         with patch("urllib.request.urlopen", side_effect=boom):
             result = zotero.create_items([None, None], dedup=True)
 
-        assert result == {"created": [], "skipped_existing": [], "failed": []}
+        assert result == {"created": [], "skipped_existing": [], "failed": [], "skipped_degraded_read": []}
 
     def test_pmid_index_dedups_present_by_pmid(self, monkeypatch):
         """Bug 2 defense-in-depth: a meta carrying a PMID present in ``pmid_index``

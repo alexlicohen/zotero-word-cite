@@ -546,7 +546,7 @@ def apply_patches(patched_network, monkeypatch):
     replace_text_with_zotero_field."""
     calls = {"create": [], "insert": []}
 
-    def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, pmid_index=None, attach_pdfs=False):
+    def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, pmid_index=None, attach_pdfs=False, index_degraded=False):
         calls["create"].append({"metas": metas, "collection": collection, "tags": tags,
                                 "dedup": dedup, "doi_index": doi_index})
         created = []
@@ -860,7 +860,8 @@ class TestIdempotency:
         created_log = []
 
         def dynamic_create(metas, *, collection=None, tags=None, dedup=True,
-                           doi_index=None, pmid_index=None, attach_pdfs=False):
+                           doi_index=None, pmid_index=None, attach_pdfs=False,
+                           index_degraded=False):
             # Mirror real dedup: skip any meta whose DOI is already in the index;
             # create the rest and ADD them to the shared index (so a re-read sees them).
             out = {"created": [], "skipped_existing": [], "failed": []}
