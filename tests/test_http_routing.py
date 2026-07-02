@@ -25,11 +25,13 @@ def _recorder(return_value):
     """A fake http_get that records each call's (url, timeout, headers)."""
     calls: list[dict] = []
 
-    def fake(url, *, timeout, headers=None, retries=1, _sleep=None):
+    def fake(url, *, timeout, headers=None, retries=1, cache_ttl=None,
+             refresh=False, _sleep=None):
         calls.append({
             "url": url,
             "timeout": timeout,
             "headers": headers or {},
+            "cache_ttl": cache_ttl,
         })
         return return_value
 

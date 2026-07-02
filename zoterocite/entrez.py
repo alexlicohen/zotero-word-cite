@@ -50,6 +50,12 @@ _BATCH = 100
 _SLEEP_NO_KEY = 0.34
 _SLEEP_WITH_KEY = 0.11
 _TIMEOUT = 30.0
+# Opt-in response-cache TTL (seconds) for EFetch PubMed metadata reads. A PMID's
+# title/abstract/authors are effectively immutable, so a two-week window lets a
+# re-run reuse the prior fetch instead of re-hitting NCBI per PMID. Passed to
+# ``_http.http_get`` as ``cache_ttl`` by ``efetch_pubmed`` only; the more volatile
+# ESearch / ID-Converter reads stay uncached. Only successful bodies are cached.
+_RESOLVE_CACHE_TTL = 14 * 24 * 3600.0  # 14 days
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +108,12 @@ def _build_url(base: str, params: dict) -> str:
     return f"{base}?{urllib.parse.urlencode(q)}"
 
 
-def _http_get(url: str, timeout: float = _TIMEOUT) -> Optional[bytes]:
+def _http_get(
+    url: str,
+    timeout: float = _TIMEOUT,
+    *,
+    cache_ttl: Optional[float] = None,
+) -> Optional[bytes]:
     """GET ``url`` and return the raw body, or ``None`` on ANY failure.
 
     Thin wrapper over :func:`zoterocite._http.http_get` (the one shared GET
@@ -112,11 +123,21 @@ def _http_get(url: str, timeout: float = _TIMEOUT) -> Optional[bytes]:
     through this name keeps that seam intact while the GET logic lives once in
     ``_http``.  On failure we deliberately do NOT surface ``url`` (it may carry
     the api_key) — :func:`_http.http_get` returns ``None`` and never raises.
+
+    ``cache_ttl`` (default ``None`` = no caching, back-compatible) is threaded to
+    the shared primitive so an EFetch metadata read can opt into the disk-backed
+    response cache; the shared owner strips any ``api_key`` before keying, so the
+    key is never written to the cache. It is forwarded ONLY when set, so the
+    default (uncached) call is byte-identical to the pre-cache signature — the
+    idconv / esearch fetchers and tests that mock ``_http.http_get`` with the old
+    signature keep working.
     """
+    extra = {"cache_ttl": cache_ttl} if cache_ttl is not None else {}
     return _http.http_get(
         url,
         timeout=timeout,
         headers={"User-Agent": f"{_TOOL}/1.0 (mailto:{_email()})"},
+        **extra,
     )
 
 
@@ -593,7 +614,9 @@ def efetch_pubmed_status(pmids: list[str]) -> tuple[dict[str, dict], dict]:
                 "email": _email(),
             },
         )
-        body = _http_get(url)
+        # Opt into the shared response cache: EFetch metadata for a PMID is
+        # immutable, so a re-run reuses the prior body instead of re-fetching.
+        body = _http_get(url, cache_ttl=_RESOLVE_CACHE_TTL)
         if body is not None:
             try:
                 root = etree.fromstring(body)

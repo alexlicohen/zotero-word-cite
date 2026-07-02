@@ -44,6 +44,12 @@ from . import textpatterns
 # ---------------------------------------------------------------------------
 
 _CROSSREF_WORKS = "https://api.crossref.org/works"
+# Opt-in response-cache TTL (seconds) for Crossref resolution reads. Bibliographic
+# metadata for a fixed DOI/query is effectively immutable, so a two-week window
+# lets a re-run (or a retry of a batch of ~100 references) reuse the prior fetch
+# instead of re-hitting Crossref per reference. Passed to ``_http.http_get`` as
+# ``cache_ttl``; only SUCCESSFUL responses are cached (a failed lookup re-tries).
+_RESOLVE_CACHE_TTL = 14 * 24 * 3600.0  # 14 days
 # The polite-pool User-Agent + contact email (the ``mailto`` query param) are
 # owned by :mod:`zoterocite._http`; call ``_http.user_agent()`` /
 # ``_http.contact_email()`` at request time instead of carrying our own copy.
@@ -282,7 +288,12 @@ def check_preprint_status(doi: str, *, fetch: bool = True) -> dict:
     # we need the raw ``relation`` field not surfaced by _parse_crossref_item).
     safe_doi = urllib.parse.quote(doi_clean, safe="/")
     url = f"{_CROSSREF_WORKS}/{safe_doi}"
-    body = _http.http_get(url, timeout=resolve_timeout(), headers={"Accept": "application/json"})
+    body = _http.http_get(
+        url,
+        timeout=resolve_timeout(),
+        headers={"Accept": "application/json"},
+        cache_ttl=_RESOLVE_CACHE_TTL,
+    )
     if body is None:
         return base_result
 
@@ -451,7 +462,12 @@ def crossref_bibliographic(query: str, *, rows: int = 5) -> list[dict]:
         "mailto": _http.contact_email(),
     })
     url = f"{_CROSSREF_WORKS}?{params}"
-    body = _http.http_get(url, timeout=resolve_timeout(), headers={"Accept": "application/json"})
+    body = _http.http_get(
+        url,
+        timeout=resolve_timeout(),
+        headers={"Accept": "application/json"},
+        cache_ttl=_RESOLVE_CACHE_TTL,
+    )
     if body is None:
         return []
 
@@ -768,7 +784,12 @@ def _crossref_doi_fetch(doi: str) -> Optional[dict]:
     """Fetch a single work by DOI from Crossref. Returns parsed item or None."""
     safe_doi = urllib.parse.quote(doi, safe="/")
     url = f"{_CROSSREF_WORKS}/{safe_doi}"
-    body = _http.http_get(url, timeout=resolve_timeout(), headers={"Accept": "application/json"})
+    body = _http.http_get(
+        url,
+        timeout=resolve_timeout(),
+        headers={"Accept": "application/json"},
+        cache_ttl=_RESOLVE_CACHE_TTL,
+    )
     if body is None:
         return None
     try:

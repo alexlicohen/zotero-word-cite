@@ -61,7 +61,7 @@ SAMPLE_PAYLOAD = {
 
 def _patch_http(monkeypatch, payload_by_url=None, single=None):
     """Monkeypatch icite._http_get to return JSON bytes (no network)."""
-    def fake_get(url, timeout=icite._TIMEOUT):
+    def fake_get(url, timeout=icite._TIMEOUT, **_kw):
         if single is not None:
             return json.dumps(single).encode("utf-8")
         return json.dumps(payload_by_url(url)).encode("utf-8")
@@ -100,7 +100,7 @@ def test_fetch_icite_batches_across_chunk_boundary(monkeypatch):
     monkeypatch.setattr(icite, "_sleep_between_batches", lambda: None)
     calls = []
 
-    def fake_get(url, timeout=icite._TIMEOUT):
+    def fake_get(url, timeout=icite._TIMEOUT, **_kw):
         # Parse the pmids back out of the (url-encoded) query string.
         ids = _pmids_from_url(url)
         calls.append(ids)
@@ -129,7 +129,7 @@ def test_fetch_icite_sleeps_between_batches(monkeypatch):
     monkeypatch.setattr(icite, "_sleep_between_batches",
                         lambda: sleeps.__setitem__("n", sleeps["n"] + 1))
 
-    def fake_get(url, timeout=icite._TIMEOUT):
+    def fake_get(url, timeout=icite._TIMEOUT, **_kw):
         ids = _pmids_from_url(url)
         data = [{"pmid": int(p), "relative_citation_ratio": 1.0,
                  "citation_count": 1, "nih_percentile": 1.0, "year": 2020,
@@ -166,26 +166,26 @@ def test_fetch_icite_non_numeric_pmids_dropped(monkeypatch):
 
 def test_fetch_icite_network_error_returns_empty(monkeypatch):
     """_http_get returns None on any failure => {}."""
-    monkeypatch.setattr(icite, "_http_get", lambda url, timeout=icite._TIMEOUT: None)
+    monkeypatch.setattr(icite, "_http_get", lambda url, timeout=icite._TIMEOUT, **_kw: None)
     assert icite.fetch_icite(["123", "456"]) == {}
 
 
 def test_fetch_icite_bad_json_returns_empty(monkeypatch):
     monkeypatch.setattr(icite, "_http_get",
-                        lambda url, timeout=icite._TIMEOUT: b"<html>not json</html>")
+                        lambda url, timeout=icite._TIMEOUT, **_kw: b"<html>not json</html>")
     assert icite.fetch_icite(["123"]) == {}
 
 
 def test_fetch_icite_missing_data_key_returns_empty(monkeypatch):
     monkeypatch.setattr(icite, "_http_get",
-                        lambda url, timeout=icite._TIMEOUT: json.dumps({"meta": {}}).encode())
+                        lambda url, timeout=icite._TIMEOUT, **_kw: json.dumps({"meta": {}}).encode())
     assert icite.fetch_icite(["123"]) == {}
 
 
 def test_fetch_icite_record_without_pmid_skipped(monkeypatch):
     payload = {"data": [{"relative_citation_ratio": 2.0}, {"pmid": 999, "relative_citation_ratio": 1.5}]}
     monkeypatch.setattr(icite, "_http_get",
-                        lambda url, timeout=icite._TIMEOUT: json.dumps(payload).encode())
+                        lambda url, timeout=icite._TIMEOUT, **_kw: json.dumps(payload).encode())
     out = icite.fetch_icite(["999"])
     assert set(out) == {"999"}
     assert out["999"]["rcr"] == 1.5
@@ -195,7 +195,7 @@ def test_fetch_icite_string_authors_fallback(monkeypatch):
     """Older/odd iCite shape: authors as a comma-separated string."""
     payload = {"data": [{"pmid": 7, "authors": "Alexander L Cohen, Michael D Fox"}]}
     monkeypatch.setattr(icite, "_http_get",
-                        lambda url, timeout=icite._TIMEOUT: json.dumps(payload).encode())
+                        lambda url, timeout=icite._TIMEOUT, **_kw: json.dumps(payload).encode())
     out = icite.fetch_icite(["7"])
     auths = out["7"]["authors"]
     assert len(auths) == 2
@@ -207,7 +207,7 @@ def test_fetch_icite_partial_batch_failure_keeps_good(monkeypatch):
     monkeypatch.setattr(icite, "_BATCH", 1)
     monkeypatch.setattr(icite, "_sleep_between_batches", lambda: None)
 
-    def fake_get(url, timeout=icite._TIMEOUT):
+    def fake_get(url, timeout=icite._TIMEOUT, **_kw):
         if "pmids=2" in url:
             return None  # simulate failure for the 2nd batch
         return json.dumps({"data": [{"pmid": 1, "relative_citation_ratio": 4.0}]}).encode()
@@ -225,7 +225,7 @@ def test_fetch_icite_partial_batch_failure_keeps_good(monkeypatch):
 @pytest.mark.parametrize("body", [b"[]", b"null", b'"x"', b"123"])
 def test_fetch_icite_non_dict_json_returns_empty(monkeypatch, body):
     """Valid-but-non-dict JSON (bare array, null, string, int) must return {}."""
-    monkeypatch.setattr(icite, "_http_get", lambda url, timeout=icite._TIMEOUT: body)
+    monkeypatch.setattr(icite, "_http_get", lambda url, timeout=icite._TIMEOUT, **_kw: body)
     result = icite.fetch_icite(["123"])
     assert result == {}, f"expected {{}} for body={body!r}, got {result!r}"
 
@@ -253,7 +253,7 @@ def test_fetch_icite_status_partial_batch_failure_is_degraded(monkeypatch):
     monkeypatch.setattr(icite, "_BATCH", 2)
     monkeypatch.setattr(icite, "_sleep_between_batches", lambda: None)
 
-    def fake_get(url, timeout=icite._TIMEOUT):
+    def fake_get(url, timeout=icite._TIMEOUT, **_kw):
         ids = _pmids_from_url(url)
         if "3" in ids or "4" in ids:
             return None  # second batch fetch failed

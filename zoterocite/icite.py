@@ -35,6 +35,11 @@ _BASE_URL = "https://icite.od.nih.gov/api/pubs"
 # length sane and stay polite. ~200 pmids/call is comfortable.
 _BATCH = 200
 _TIMEOUT = 15.0
+# Opt-in response-cache TTL (seconds) for iCite bibliometric reads. RCR / citation
+# counts drift only slowly, so a two-week window lets a re-run reuse the prior
+# fetch instead of re-hitting iCite per PMID batch. Passed to ``_http.http_get``
+# as ``cache_ttl`` by ``fetch_icite``; only successful bodies are cached.
+_RESOLVE_CACHE_TTL = 14 * 24 * 3600.0  # 14 days
 # Small courtesy pause between consecutive batches so a multi-batch fetch does
 # not hammer the unauthenticated iCite endpoint (and risk a 429). iCite has no
 # API-key tier, so this is a single fixed value rather than entrez's key-gated
@@ -48,7 +53,12 @@ def _sleep_between_batches() -> None:
     time.sleep(_SLEEP_BETWEEN_BATCHES)
 
 
-def _http_get(url: str, timeout: float = _TIMEOUT) -> Optional[bytes]:
+def _http_get(
+    url: str,
+    timeout: float = _TIMEOUT,
+    *,
+    cache_ttl: Optional[float] = None,
+) -> Optional[bytes]:
     """GET ``url`` and return the raw body, or ``None`` on ANY failure.
 
     Thin wrapper over :func:`zoterocite._http.http_get` (the one shared GET
@@ -56,7 +66,14 @@ def _http_get(url: str, timeout: float = _TIMEOUT) -> Optional[bytes]:
     module's tests reference ``icite._http_get`` directly.  Sets
     ``Accept: application/json``; the never-raise / retry / Retry-After
     behaviour lives in ``_http``.
+
+    ``cache_ttl`` (default ``None`` = no caching, back-compatible) is threaded to
+    the shared primitive so :func:`fetch_icite` can opt into the disk-backed
+    response cache. It is forwarded ONLY when set, so the default (uncached) call
+    is byte-identical to the pre-cache signature — tests that mock
+    ``_http.http_get`` with the old signature keep working.
     """
+    extra = {"cache_ttl": cache_ttl} if cache_ttl is not None else {}
     return _http.http_get(
         url,
         timeout=timeout,
@@ -64,6 +81,7 @@ def _http_get(url: str, timeout: float = _TIMEOUT) -> Optional[bytes]:
             "Accept": "application/json",
             "User-Agent": _http.user_agent(),
         },
+        **extra,
     )
 
 
@@ -205,7 +223,9 @@ def fetch_icite_status(pmids, *, timeout: float = _TIMEOUT) -> tuple[dict[str, d
         batch = clean[i:i + _BATCH]
         q = urllib.parse.urlencode({"pmids": ",".join(batch)})
         url = f"{_BASE_URL}?{q}"
-        body = _http_get(url, timeout=timeout)
+        # Opt into the shared response cache: iCite metrics for a PMID batch drift
+        # slowly, so a re-run reuses the prior body instead of re-fetching.
+        body = _http_get(url, timeout=timeout, cache_ttl=_RESOLVE_CACHE_TTL)
         if body is None:
             n_failed += 1
             continue  # partial result; keep going with remaining batches

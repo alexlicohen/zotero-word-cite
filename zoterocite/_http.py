@@ -25,11 +25,14 @@ NCBI ``api_key`` query param.  On failure we just return ``None``.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Optional
 
 
@@ -127,12 +130,221 @@ def _parse_retry_after(value: Optional[str]) -> float:
     return min(secs, _MAX_RETRY_WAIT)
 
 
+# ---------------------------------------------------------------------------
+# Opt-in disk-backed response cache (public read-only GETs only)
+# ---------------------------------------------------------------------------
+# A per-call, opt-in cache so a repeated resolution run does not re-fetch every
+# reference from Crossref/PubMed/iCite. It is OFF by default (``cache_ttl=None``)
+# → byte-identical historical behaviour. When a caller opts in, a successful body
+# is stored keyed by a stable hash of the sanitized request; a later call within
+# the TTL is served without touching the network.
+#
+# Two layers, mirroring the library-index caches: a process-level in-memory dict
+# lazily seeded from a gitignored disk file. Disk read/write is best-effort —
+# a corrupt or unwritable cache degrades to a live fetch, never raises.
+#
+# INVARIANTS
+#   * Only a SUCCESSFUL body (non-None) is ever stored — a failure (None) must
+#     NOT be cached, so a later retry re-attempts rather than serving a poisoned
+#     empty. This is the key correctness invariant.
+#   * The request may carry an ``api_key`` query param (NCBI). It is STRIPPED
+#     before the key is hashed and is NEVER written to disk (only the hash and
+#     the response body are stored, and the body does not echo the key).
+#
+# The cache path is a module attribute (tests redirect it to a tmp file).
+_HTTP_CACHE_PATH = Path(__file__).parent.parent / "data" / "http_response_cache.json"
+
+# Process-level in-memory layer. ``None`` = not yet loaded from disk (seeded
+# lazily on first access); a dict maps ``key_hash -> {"body": text, "ts": unix}``.
+_http_cache_mem: Optional[dict] = None
+
+
+def _reset_http_cache() -> None:
+    """Test hook: drop the in-memory layer so the next access reloads from disk.
+
+    Does not touch the disk file (tests redirect ``_HTTP_CACHE_PATH`` to a tmp
+    path). Monkeypatch-friendly: pair with a redirected ``_HTTP_CACHE_PATH`` to
+    isolate a test from the real cache.
+    """
+    global _http_cache_mem
+    _http_cache_mem = None
+
+
+def _cache_enabled(cache_ttl) -> bool:
+    """Whether an opt-in cache TTL is a usable positive number.
+
+    A non-number / ``None`` / non-positive value means "no caching" and is
+    swallowed here (never raises) so the never-raise contract of :func:`http_get`
+    holds even for a malformed ``cache_ttl``.
+    """
+    try:
+        return cache_ttl is not None and float(cache_ttl) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _sanitize_url_for_cache(url: str) -> Optional[str]:
+    """Return *url* with any ``api_key`` query param removed, or ``None``.
+
+    The api_key is stripped BEFORE the cache key is computed so (a) a rotated /
+    absent key never busts the cache and (b) the secret never enters the key or
+    the on-disk file. Returns ``None`` if the URL cannot be parsed cleanly — the
+    caller then declines to cache rather than risk a lossy key.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+        pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    except Exception:  # noqa: BLE001 — unparseable URL: caller declines to cache
+        return None
+    kept = [(k, v) for (k, v) in pairs if k.lower() != "api_key"]
+    clean_query = urllib.parse.urlencode(kept)
+    return urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, clean_query, parts.fragment)
+    )
+
+
+def _cache_key(url: str, accept: Optional[str]) -> Optional[str]:
+    """Stable sha256 hex key over ``(GET, sanitized_url, Accept)``, or ``None``.
+
+    ``None`` when the URL cannot be sanitized — the caller then does not cache
+    (the api_key must never leak into the key).
+    """
+    sanitized = _sanitize_url_for_cache(url)
+    if sanitized is None:
+        return None
+    basis = "GET\n" + sanitized + "\n" + (accept or "")
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
+def _load_disk_cache() -> dict:
+    """Best-effort load of the disk cache into a dict; ``{}`` on any problem."""
+    try:
+        with open(_HTTP_CACHE_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            return data
+    except Exception:  # noqa: BLE001 — missing/corrupt cache: degrade to empty
+        pass
+    return {}
+
+
+def _save_disk_cache(cache: dict) -> None:
+    """Best-effort write of the whole cache dict; never raises."""
+    try:
+        _HTTP_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_HTTP_CACHE_PATH, "w", encoding="utf-8") as fh:
+            json.dump(cache, fh)
+    except Exception:  # noqa: BLE001 — unwritable cache: skip silently
+        pass
+
+
+def _fresh_entry_body(entry, now: float, ttl: float) -> Optional[bytes]:
+    """Return the cached body bytes if *entry* is present and within *ttl*.
+
+    ``None`` when the entry is malformed, has no body, or is stale — the caller
+    then treats it as a miss and re-fetches (never-serve-stale on any doubt).
+    """
+    try:
+        ts = float(entry.get("ts", 0))
+        body = entry.get("body")
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if body is None:
+        return None
+    if now - ts >= ttl:
+        return None
+    try:
+        return body.encode("utf-8")
+    except (AttributeError, UnicodeEncodeError):
+        return None
+
+
+def _cache_lookup(key: str, ttl: float) -> Optional[bytes]:
+    """Return a fresh cached body for *key*, or ``None`` (miss / stale)."""
+    global _http_cache_mem
+    if _http_cache_mem is None:
+        _http_cache_mem = _load_disk_cache()
+    entry = _http_cache_mem.get(key)
+    if entry is None:
+        return None
+    return _fresh_entry_body(entry, time.time(), ttl)
+
+
+def _cache_store(key: str, body) -> None:
+    """Store a successful *body* under *key* (in memory + disk).
+
+    Only a bytes body that round-trips cleanly as UTF-8 is cached (all the public
+    APIs return UTF-8 text). A non-bytes body is stored as an empty string so a
+    caller that (incorrectly) reaches here with a failure result produces an
+    OBSERVABLE poisoned entry rather than a silent no-op — the never-cache-failure
+    gate lives in :func:`http_get`, and this shape keeps that guard testable.
+    """
+    global _http_cache_mem
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            text = bytes(body).decode("utf-8")
+        except UnicodeDecodeError:
+            return  # non-UTF-8 body: cannot round-trip losslessly → do not cache
+    else:
+        text = ""
+    if _http_cache_mem is None:
+        _http_cache_mem = _load_disk_cache()
+    _http_cache_mem[key] = {"body": text, "ts": time.time()}
+    _save_disk_cache(_http_cache_mem)
+
+
+def _do_fetch(
+    url: str,
+    timeout: float,
+    req_headers: dict,
+    retries: int,
+    _sleep,
+) -> Optional[bytes]:
+    """The live network GET (retry/Retry-After loop). ``None`` on ANY failure.
+
+    Extracted from :func:`http_get` so the cache read/write can wrap it without
+    changing the historical fetch behaviour (all existing tests exercise this
+    path unchanged).
+    """
+    attempts = max(0, int(retries)) + 1  # original + retries
+    last_was_retryable = False
+    for attempt in range(attempts):
+        req = urllib.request.Request(url, method="GET", headers=req_headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+                return resp.read()
+        except urllib.error.HTTPError as exc:  # noqa: PERF203
+            # Retry only transient statuses, and only if attempts remain.
+            status = getattr(exc, "code", None)
+            last_was_retryable = status in _RETRY_STATUSES
+            if not last_was_retryable or attempt + 1 >= attempts:
+                return None
+            retry_after = None
+            try:
+                # HTTPError carries the response headers.
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            except Exception:  # noqa: BLE001 — header access must never raise here
+                retry_after = None
+            wait = _parse_retry_after(retry_after)
+            if wait > 0:
+                _sleep(wait)
+            continue
+        except Exception:  # noqa: BLE001 — network resilience: never propagate
+            # URLError, socket timeout, OSError, etc. — not retried (we can't
+            # tell a transient blip from a hard failure, and a second blind
+            # attempt rarely helps for these). Return None per the contract.
+            return None
+    return None
+
+
 def http_get(
     url: str,
     *,
     timeout: float,
     headers: Optional[dict] = None,
     retries: int = 1,
+    cache_ttl: Optional[float] = None,
+    refresh: bool = False,
     _sleep=time.sleep,
 ) -> Optional[bytes]:
     """GET ``url`` and return the raw body, or ``None`` on ANY failure.
@@ -159,6 +371,20 @@ def http_get(
         Maximum number of *retries* (not total attempts) on a 429 / 5xx.
         ``1`` (default) means: original attempt + at most one retry.  ``0``
         disables retrying.
+    cache_ttl:
+        OPT-IN response cache. ``None`` (default) or a non-positive value means
+        NO caching — behaviour is byte-identical to before this parameter
+        existed. A positive number of SECONDS enables a disk-backed cache: a
+        successful body is stored keyed by a hash of the sanitized request, and
+        a later call within ``cache_ttl`` seconds is served without any network
+        call. Only successful (non-``None``) bodies are ever cached — a failure
+        is never stored, so a retry re-attempts rather than serving a poisoned
+        empty. Caching is public-read-only; never enable it for authenticated /
+        write requests.
+    refresh:
+        When ``True`` (and caching is enabled), skip the cache READ and force a
+        live fetch, then rewrite the cache with the fresh body. A stale/absent
+        cache is untouched on failure.
     _sleep:
         Injection seam for the back-off sleep — tests pass a no-op so the
         retry path runs without really sleeping.  Not part of the public
@@ -191,32 +417,25 @@ def http_get(
     if urllib.parse.urlparse(url).scheme.lower() not in ("http", "https"):
         return None
 
-    attempts = max(0, int(retries)) + 1  # original + retries
-    last_was_retryable = False
-    for attempt in range(attempts):
-        req = urllib.request.Request(url, method="GET", headers=req_headers)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-                return resp.read()
-        except urllib.error.HTTPError as exc:  # noqa: PERF203
-            # Retry only transient statuses, and only if attempts remain.
-            status = getattr(exc, "code", None)
-            last_was_retryable = status in _RETRY_STATUSES
-            if not last_was_retryable or attempt + 1 >= attempts:
-                return None
-            retry_after = None
-            try:
-                # HTTPError carries the response headers.
-                retry_after = exc.headers.get("Retry-After") if exc.headers else None
-            except Exception:  # noqa: BLE001 — header access must never raise here
-                retry_after = None
-            wait = _parse_retry_after(retry_after)
-            if wait > 0:
-                _sleep(wait)
-            continue
-        except Exception:  # noqa: BLE001 — network resilience: never propagate
-            # URLError, socket timeout, OSError, etc. — not retried (we can't
-            # tell a transient blip from a hard failure, and a second blind
-            # attempt rarely helps for these). Return None per the contract.
-            return None
-    return None
+    # Opt-in response cache. Disabled (the default) → straight to the live fetch,
+    # byte-identical to the historical path. When enabled, the key is a hash of
+    # the api_key-stripped request; a fresh hit short-circuits the network.
+    caching = _cache_enabled(cache_ttl)
+    cache_key: Optional[str] = None
+    if caching:
+        cache_key = _cache_key(url, req_headers.get("Accept"))
+        if cache_key is None:
+            caching = False  # unsanitizable URL: decline to cache this call
+        elif not refresh:
+            hit = _cache_lookup(cache_key, float(cache_ttl))
+            if hit is not None:
+                return hit
+
+    body = _do_fetch(url, timeout, req_headers, retries, _sleep)
+
+    # Cache ONLY a successful response. A ``None`` (4xx/5xx/timeout/OS error)
+    # result is NEVER written, so a later retry re-attempts instead of serving a
+    # poisoned empty. THIS IS THE KEY CORRECTNESS INVARIANT (guarded by test).
+    if caching and body is not None:
+        _cache_store(cache_key, body)
+    return body
