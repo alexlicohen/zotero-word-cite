@@ -796,6 +796,16 @@ def _match_in_library(
        :class:`zotero.LibraryUnavailableError` — is CAUGHT and treated as "no
        match" (returns ``None``). An unmatched ref is left unconverted upstream;
        NOTHING is ever created here. The matching is read-only either way.
+
+    PERF (the ``get_item_by_doi`` fetch_all leak): the live DOI scan is
+    ``O(library size)`` — an unindexed ``search_items`` + full ``fetch_all`` walk
+    (Zotero has no server-side DOI filter). It is therefore run ONLY when NO
+    offline index is available (``lib_index`` is falsy). When ``lib_index`` is
+    present, step 1's ``lookup_index_key`` has ALREADY resolved DOI presence
+    against the whole-library index, so a live rescan is redundant — and in a
+    per-ref loop it was ``O(N·M)`` (the leak). Skipping it when the index answered
+    is safe: the AUTHORITATIVE pre-write dedup is re-done in ``zotero.create_items``
+    (its own ``doi_index`` + degraded-read refusal) before anything is created.
     """
     doi = _normalize_doi(meta.get("doi", ""))
     title = meta.get("title", "")
@@ -808,8 +818,10 @@ def _match_in_library(
         if key:
             return {"key": key, "data": {"key": key}}
 
-    # (2) Live fallback — only when reachable, and never allowed to crash.
-    if doi:
+    # (2) Live DOI fallback — ONLY when there is no offline index (else step 1
+    # already answered DOI presence; a live O(library) fetch_all rescan per ref is
+    # the redundant slow-path leak). Reachable-only, never allowed to crash.
+    if doi and not lib_index:
         try:
             item = zotero.get_item_by_doi(doi)
         except (RuntimeError, OSError):

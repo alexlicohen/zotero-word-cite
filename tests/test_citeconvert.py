@@ -233,6 +233,19 @@ def fake_zotero(monkeypatch):
     def formatted_citations(keys, style="vancouver", kind="bib", strip=True):
         return [f"({k})" for k in keys]
 
+    # Production builds a real offline library_index (citeconvert line ~950) and
+    # matches against it FIRST; the live get_item_by_doi scan is only a no-index
+    # fallback. Model that: derive the fake's index from the SAME FAKE_LIB so the
+    # matched SET is identical, just resolved via the offline index (step 1) rather
+    # than the per-ref live scan (which production skips once the index answered).
+    def library_index(strict=False, **_k):
+        return {
+            "doi": {kk[4:]: v for kk, v in FAKE_LIB.items() if kk.startswith("doi:")},
+            "pmid": {},
+            "title": {kk[6:]: v for kk, v in FAKE_LIB.items() if kk.startswith("title:")},
+        }
+
+    monkeypatch.setattr(zotero, "library_index", library_index)
     monkeypatch.setattr(zotero, "get_item_by_doi", get_item_by_doi)
     monkeypatch.setattr(zotero, "search_items", search_items)
     monkeypatch.setattr(zotero, "csljson", csljson)
@@ -443,19 +456,26 @@ class TestConvert:
         assert validate(res["out"]).ok
 
     def test_dedup_same_doi_to_one_item(self, tmp_path, fake_zotero, monkeypatch):
-        # Two Mendeley citations to the SAME DOI -> one library lookup, dedup>=1.
+        # Two Mendeley citations to the SAME DOI -> resolved by ONE library lookup
+        # (the match_cache prevents a second), dedup>=1, both cite the one item.
+        # Matching now resolves via the offline index (lookup_index_key), so the
+        # "resolved exactly once" guard counts THAT — not the live get_item_by_doi.
         path = build_mixed_doc(tmp_path, with_dup=True, with_word=False,
                                with_zotero=False, with_manual=False)
         out = tmp_path / "d.docx"
         calls = []
-        orig = fake_zotero.get_item_by_doi
-        monkeypatch.setattr(fake_zotero, "get_item_by_doi",
-                            lambda doi: (calls.append(doi) or orig(doi)))
+        orig = fake_zotero.lookup_index_key
+
+        def _counting(idx, *, doi=None, pmid=None, title=None):
+            if doi and "widgets.2001" in doi.lower():
+                calls.append(doi)
+            return orig(idx, doi=doi, pmid=pmid, title=title)
+        monkeypatch.setattr(fake_zotero, "lookup_index_key", _counting)
 
         res = convert_to_zotero(path, out=out, managers=("mendeley",))
         assert res["deduped"] >= 1
-        # the widgets DOI was looked up exactly once despite two citations
-        assert calls.count("10.1000/widgets.2001") == 1
+        # the widgets DOI was resolved exactly once despite two citations (match_cache)
+        assert len(calls) == 1
         # both Mendeley cites now reference the single MENKEY1 item
         keys = [it["key"] for cit in scan_citations(res["out"]) for it in cit["items"]]
         assert keys.count("MENKEY1") == 2
@@ -1128,6 +1148,51 @@ class TestOfflineMatchFailClosed:
                                 managers=("mendeley",), add_missing=True)
         assert res["converted"] == []
         assert any(u["manager"] == "mendeley" for u in res["unmatched"])
+
+    # (e) PERF/leak guard (citeconvert:814): an index that is PRESENT but MISSES
+    # the DOI must NOT trigger the live O(library) get_item_by_doi fetch_all scan —
+    # step 1 already answered DOI presence against the whole-library index, so a
+    # per-ref live rescan is the redundant slow-path (O(N·M) in the loop).
+    # TEETH: drop the `and not lib_index` guard -> get_item_by_doi runs -> RED.
+    def test_index_present_miss_skips_live_doi_scan(self, tmp_path, monkeypatch):
+        from zoterocite import zotero
+        monkeypatch.setattr(zotero, "library_index", lambda **k: {
+            "doi": {"10.9/other": "OTHERKEY"}, "pmid": {}, "title": {}})
+
+        def _must_not_scan(*_a, **_k):
+            raise AssertionError("live get_item_by_doi fetch_all scan must NOT run "
+                                 "when an offline index already answered DOI presence")
+        monkeypatch.setattr(zotero, "get_item_by_doi", _must_not_scan)
+        monkeypatch.setattr(zotero, "search_items", lambda *a, **k: [])  # title miss, degrade-safe
+
+        out = tmp_path / "idxmiss.docx"
+        res = convert_to_zotero(self._mendeley_only_doc(tmp_path), out=out,
+                                managers=("mendeley",))
+        assert res["converted"] == []
+        assert any(u["manager"] == "mendeley" for u in res["unmatched"])
+
+    # (f) When there is NO offline index at all (a hard library_index failure ->
+    # lib_index is None), the live get_item_by_doi scan IS the sole DOI matcher and
+    # must still resolve — the guard preserves it exactly there.
+    def test_no_index_uses_live_doi_scan(self, tmp_path, monkeypatch):
+        from zoterocite import zotero
+
+        def _no_index(**_k):
+            raise RuntimeError("index unavailable")  # -> lib_index None (caught in convert)
+        monkeypatch.setattr(zotero, "library_index", _no_index)
+        monkeypatch.setattr(zotero, "get_item_by_doi",
+                            lambda doi, **k: {"key": "MENKEY1", "data": {"key": "MENKEY1"}}
+                            if "widgets.2001" in doi else None)
+        # degrade-safe post-match calls (a matched ref still writes its field offline)
+        monkeypatch.setattr(zotero, "csljson", _unavailable_search)
+        monkeypatch.setattr(zotero, "item_uri", _unavailable_search)
+        monkeypatch.setattr(zotero, "formatted_citations", _unavailable_search)
+
+        out = tmp_path / "noindex.docx"
+        res = convert_to_zotero(self._mendeley_only_doc(tmp_path), out=out,
+                                managers=("mendeley",))
+        keys = {it["key"] for cit in scan_citations(res["out"]) for it in cit["items"]}
+        assert "MENKEY1" in keys, "live DOI scan must resolve when no offline index exists"
 
     # Regression guard: lookup_index_key is the single owner — DOI -> PMID -> title.
     def test_lookup_index_key_precedence_offline(self):
