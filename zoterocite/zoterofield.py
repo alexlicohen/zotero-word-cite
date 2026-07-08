@@ -983,16 +983,20 @@ def replace_all_text_with_zotero_field(
     """
     if not anchor:
         return 0
-    if anchor in (rendered or ""):
+    _effective_rendered = rendered or ""
+    if rendered_html:
+        _effective_rendered = _strip_html(rendered_html) or _effective_rendered
+    if anchor in _effective_rendered:
         # SAFETY: the inserted field's result run is itself <w:t>-bearing text.
-        # If ``rendered`` contains ``anchor``, the per-paragraph rescan would
-        # re-isolate the field's OWN result and splice a nested field — a runaway
-        # that double-converts (one spurious nest per occurrence). Refuse loudly
-        # rather than corrupt; callers pass a NEUTRAL token (e.g. "(citation)").
+        # If ``rendered`` (or the plain-text form of ``rendered_html``) contains
+        # ``anchor``, the per-paragraph rescan would re-isolate the field's OWN
+        # result and splice a nested field — a runaway that double-converts (one
+        # spurious nest per occurrence). Refuse loudly rather than corrupt;
+        # callers pass a NEUTRAL token (e.g. "(citation)").
         raise ValueError(
-            f"rendered text {rendered!r} contains the anchor {anchor!r}: the "
-            "field's own result run would be re-isolated on rescan. Pass a "
-            "neutral rendered token (e.g. '(citation)')."
+            f"rendered text {_effective_rendered!r} contains the anchor "
+            f"{anchor!r}: the field's own result run would be re-isolated on "
+            "rescan. Pass a neutral rendered token (e.g. '(citation)')."
         )
     date = date or now_iso()
     root = doc.tree(DOCUMENT)

@@ -12,9 +12,11 @@ from zoterocite.citecheck import (
     check_retractions,
     cite_check,
     default_rw_path,
+    is_retraction,
     load_retraction_db,
     reconcile_citations,
     _normalise_doi,
+    _reset_retraction_cache,
 )
 from zoterocite.findings import Finding
 
@@ -232,6 +234,25 @@ class TestNormaliseDoi:
     def test_clean_doi_unchanged(self):
         assert _normalise_doi("10.1038/nature12373") == "10.1038/nature12373"
 
+    # A trailing ) or ] that is BALANCED (has a matching opener) is part of the DOI
+    # and must be PRESERVED — only an unbalanced trailing closer (stray prose) peels.
+    @pytest.mark.parametrize("raw,expected", [
+        # real DOI legitimately ending in a balanced closing paren
+        ("10.1130/2013.2500(04)", "10.1130/2013.2500(04)"),
+        # URL-form + trailing sentence period: period peels, balanced ) stays
+        ("https://doi.org/10.1130/2013.2500(04).", "10.1130/2013.2500(04)"),
+        ("10.1130/2013.2500(04).", "10.1130/2013.2500(04)"),
+        # balanced brackets preserved
+        ("10.5555/a[b]", "10.5555/a[b]"),
+        # UNBALANCED trailing closer is stray prose -> stripped
+        ("10.1038/nature12373)", "10.1038/nature12373"),
+        ("10.5555/foo]", "10.5555/foo"),
+        # a stray unbalanced closer hidden behind a period peels both
+        ("10.1/x).", "10.1/x"),
+    ])
+    def test_balanced_trailing_bracket_preserved(self, raw, expected):
+        assert _normalise_doi(raw) == expected
+
 
 # ---------------------------------------------------------------------------
 # F2: _extract_cited_dois dedup on normalized key
@@ -396,6 +417,75 @@ class TestCheckRetractions:
     def test_source_field(self, db):
         findings = check_retractions(["10.1234/retracted"], db)
         assert findings[0].source == "Retraction Watch (Crossref-distributed)"
+
+
+# ---------------------------------------------------------------------------
+# reinstatement chronology — a later Reinstatement supersedes a Retraction
+# ---------------------------------------------------------------------------
+
+class TestReinstatementChronology:
+    """A Retraction with a LATER Reinstatement row is currently reinstated and must
+    NOT be reported RETRACTED. Resolution is by RetractionDate chronology, not
+    severity; a reinstated-then-re-retracted paper stays retracted; missing dates
+    default to reinstatement (RW only records a Reinstatement after a retraction)."""
+
+    def _db(self, tmp_path, rows):
+        _reset_retraction_cache()
+        csv_path = _write_rw_csv(tmp_path / f"rw_{abs(hash(str(rows)))}.csv", rows)
+        return load_retraction_db(csv_path)
+
+    def test_retraction_then_later_reinstatement_not_retracted(self, tmp_path):
+        db = self._db(tmp_path, [
+            {"OriginalPaperDOI": "10.1/rr", "RetractionNature": "Retraction",
+             "RetractionDate": "2020-01-01"},
+            {"OriginalPaperDOI": "10.1/rr", "RetractionNature": "Reinstatement",
+             "RetractionDate": "2022-01-01"},
+        ])
+        assert db["10.1/rr"]["nature"] == "Reinstatement"
+        assert db["10.1/rr"]["date"] == "2022-01-01"      # date follows the reinstatement
+        assert is_retraction("10.1/rr", db) is False
+        assert check_retractions(["10.1/rr"], db) == []   # no ERROR finding
+
+    def test_retraction_only_is_retracted(self, tmp_path):
+        db = self._db(tmp_path, [
+            {"OriginalPaperDOI": "10.1/r", "RetractionNature": "Retraction",
+             "RetractionDate": "2020-01-01"},
+        ])
+        assert is_retraction("10.1/r", db) is True
+        assert check_retractions(["10.1/r"], db)[0].severity == "ERROR"
+
+    def test_reinstated_then_re_retracted_stays_retracted(self, tmp_path):
+        db = self._db(tmp_path, [
+            {"OriginalPaperDOI": "10.1/rre", "RetractionNature": "Retraction",
+             "RetractionDate": "2019-01-01"},
+            {"OriginalPaperDOI": "10.1/rre", "RetractionNature": "Reinstatement",
+             "RetractionDate": "2020-01-01"},
+            {"OriginalPaperDOI": "10.1/rre", "RetractionNature": "Retraction",
+             "RetractionDate": "2021-01-01"},
+        ])
+        assert db["10.1/rre"]["nature"] == "Retraction"
+        assert is_retraction("10.1/rre", db) is True
+
+    def test_missing_dates_reinstatement_wins(self, tmp_path):
+        db = self._db(tmp_path, [
+            {"OriginalPaperDOI": "10.1/md", "RetractionNature": "Retraction",
+             "RetractionDate": ""},
+            {"OriginalPaperDOI": "10.1/md", "RetractionNature": "Reinstatement",
+             "RetractionDate": ""},
+        ])
+        assert db["10.1/md"]["nature"] == "Reinstatement"
+        assert is_retraction("10.1/md", db) is False
+
+    def test_record_shape_has_no_private_date_lists(self, tmp_path):
+        """The per-nature date lists used for the reconcile are dropped after the
+        post-pass, so the returned record shape is unchanged for consumers."""
+        db = self._db(tmp_path, [
+            {"OriginalPaperDOI": "10.1/shape", "RetractionNature": "Retraction",
+             "RetractionDate": "2020-01-01"},
+        ])
+        rec = db["10.1/shape"]
+        assert "_ret_dates" not in rec and "_reinst_dates" not in rec
+        assert set(rec) == {"nature", "all_natures", "date", "title", "retraction_doi"}
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +693,47 @@ class TestCiteCheck:
         unavail = [f for f in findings if f.check == "CITE-EXISTENCE-UNAVAIL"]
         assert len(unavail) == 1
         assert unavail[0].severity == "INFO"
+
+    def test_existence_aborts_after_first_transport_down(self, tmp_path, monkeypatch):
+        """When the transport is DOWN (every call raises), the existence pass must
+        make exactly ONE call and STOP — not one ~10s-timeout call per DOI (~N×10s).
+        A genuine 404 returns False and does NOT raise; a raise means "could not
+        check", and every remaining DOI would hit the same dead transport, so we
+        emit ONE INFO and break."""
+        import zoterocite.citecheck as cc
+        import urllib.error
+
+        calls = []
+
+        def fail_exists(doi):
+            calls.append(doi)
+            raise urllib.error.URLError("no network")
+
+        monkeypatch.setattr(cc, "_check_doi_exists", fail_exists)
+
+        src = tmp_path / "src.docx"
+        new_doc(src, ["A here.", "B here.", "C here.", "D here.", "E here."])
+        doc = Docx(src)
+        for i, (anchor, key, doi) in enumerate([
+            ("A here", "KA", "10.1/a"), ("B here", "KB", "10.1/b"),
+            ("C here", "KC", "10.1/c"), ("D here", "KD", "10.1/d"),
+            ("E here", "KE", "10.1/e")]):
+            insert_citation(
+                doc, anchor, [key],
+                itemdata=[_make_itemdata(key, doi=doi)],
+                uris=[GROUP_BASE + key],
+                rendered=f"({i + 1})",
+                add_bibliography=(i == 4),
+            )
+        out = tmp_path / "out.docx"
+        doc.save(out)
+
+        findings = cite_check(out, check_existence=True, rw_csv=Path("/nonexistent/rw.csv"))
+        assert len(calls) == 1, f"expected 1 existence call, got {len(calls)}: {calls}"
+        unavail = [f for f in findings if f.check == "CITE-EXISTENCE-UNAVAIL"]
+        assert len(unavail) == 1 and unavail[0].severity == "INFO"
+        # no bogus not-found for the DOIs that were never checked
+        assert not any(f.check == "CITE-NOT-FOUND" for f in findings)
 
     def test_no_rw_csv_no_retraction_findings(self, tmp_path):
         """If no rw_csv and default path absent, no retraction findings produced."""

@@ -43,6 +43,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Union
 
@@ -67,6 +68,13 @@ RETRACTION_WATCH_URL = (
 # natures: higher index = more severe; keep the most severe per DOI.
 # Keys are LOWERCASE so lookups use .lower() — the real Crossref/RW feed emits
 # "Expression of concern" (lowercase 'of concern'), not title-case.
+#
+# EXCEPTION — the retraction<->reinstatement pair is resolved by CHRONOLOGY, not
+# severity (see ``_resolve_reinstatement``): a Retraction followed by a LATER
+# Reinstatement is currently reinstated (the retraction was reversed), so it must
+# NOT be reported RETRACTED even though "retraction" outranks "reinstatement"
+# here. Severity still governs every other combination (Retraction vs EoC vs
+# Correction).
 _NATURE_SEVERITY = {
     "reinstatement": 0,
     "correction": 1,
@@ -81,13 +89,34 @@ _NATURE_SEVERITY = {
 
 def _normalise_doi(doi: str) -> str:
     """Lowercase, strip whitespace, leading https://doi.org/ (or dx.doi.org/), and
-    trailing prose punctuation.  A DOI never legitimately ends in . , ; : ) or ],
-    so stripping them is always safe and avoids false mismatches when a DOI appears
-    at the end of a sentence."""
+    trailing prose punctuation.
+
+    Trailing ``.`` ``,`` ``;`` ``:`` are always stripped — a DOI never legitimately
+    ends in one, and they cling when a DOI closes a sentence. A trailing ``)`` or
+    ``]`` is stripped ONLY when it is *unbalanced* (has no matching opener inside
+    the DOI): some real DOIs legitimately end in a closing bracket, e.g.
+    ``10.1130/2013.2500(04)`` — unconditionally stripping that would corrupt the
+    identifier and cause a false mismatch."""
     doi = (doi or "").strip()
     doi = re.sub(r"^https?://(dx\.)?doi\.org/", "", doi, flags=re.IGNORECASE)
     doi = doi.strip().lower()
-    doi = re.sub(r"[.,;:)\]]+$", "", doi)
+    # Peel trailing prose punctuation right-to-left. Sentence punctuation always
+    # goes; a closing ) or ] goes only when it lacks a matching opener (i.e. it is
+    # stray prose from the surrounding sentence, not part of the DOI). Checking
+    # balance after each peel handles a stray closer hidden behind a period,
+    # e.g. "10.1/x)." -> "10.1/x".
+    while doi:
+        ch = doi[-1]
+        if ch in ".,;:":
+            doi = doi[:-1]
+            continue
+        if ch == ")" and doi.count(")") > doi.count("("):
+            doi = doi[:-1]
+            continue
+        if ch == "]" and doi.count("]") > doi.count("["):
+            doi = doi[:-1]
+            continue
+        break
     return doi
 
 
@@ -115,7 +144,7 @@ def reconcile_citations(path) -> dict:
     Note
     ----
     The ZOTERO_BIBL field code itself does not embed item keys — those are only
-    known to Zotero at render time. Grant-forge detects the *presence* of the
+    known to Zotero at render time. Zotero-word-cite detects the *presence* of the
     bibliography field and treats the bibliography key-set as equal to the cited
     key-set (which is how Zotero populates the bibliography by default), unless
     the document has been manually customised (uncited/omitted/custom arrays in
@@ -307,6 +336,79 @@ def _reset_retraction_cache() -> None:
     _RW_DB_CACHE.clear()
 
 
+# Formats seen in the Retraction Watch ``RetractionDate`` column across the
+# GitLab/Crossref distributions (ISO in the shipped fixtures; ``M/D/YYYY H:MM``
+# in the historical Labs feed). ``strptime`` accepts non-zero-padded fields, so
+# "1/5/2021 0:00" parses under "%m/%d/%Y %H:%M".
+_RW_DATE_FORMATS = (
+    "%Y-%m-%d",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%m/%d/%Y %H:%M",
+    "%m/%d/%Y",
+)
+
+
+def _parse_rw_date(value: str) -> Optional[datetime]:
+    """Parse a Retraction Watch date string into a ``datetime`` for chronology
+    comparison. Returns ``None`` for an empty or unrecognised value — callers
+    treat that as "chronology unknown" rather than raising."""
+    s = (value or "").strip()
+    if not s:
+        return None
+    s = s[:-1] if s.endswith("Z") else s  # tolerate a trailing ISO 'Z'
+    for fmt in _RW_DATE_FORMATS:
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _resolve_reinstatement(record: dict) -> None:
+    """Let CHRONOLOGY (not severity) decide the retraction<->reinstatement pair.
+
+    Retraction Watch can carry a later ``Reinstatement`` row for a DOI that was
+    previously retracted (the retraction was reversed). The *current* status is
+    whichever of the two events is chronologically last: a Retraction followed by
+    a later Reinstatement is NOT a retraction, while a paper that was reinstated
+    and then retracted AGAIN stays retracted. Only this pair is governed here —
+    the severity ranking still selects the displayed nature for every other
+    combination.
+
+    Chronology is read from ``RetractionDate``. When the reinstatement cannot be
+    shown to pre-date the retraction (a date is missing/unparseable on either
+    side), the reinstatement wins: RW only records a Reinstatement AFTER a
+    retraction, so its presence means the paper is currently back in good
+    standing — and defaulting the ambiguous case to "retracted" is exactly the
+    false verdict this resolves. Mutates ``record`` in place."""
+    # Presence keys off ``all_natures`` (populated regardless of date) so a
+    # reinstatement with a blank RetractionDate is still detected; the date lists
+    # below are used ONLY for the chronology comparison.
+    natures_lower = [(n or "").strip().lower() for n in record.get("all_natures") or []]
+    if "reinstatement" not in natures_lower:
+        return  # no reinstatement row -> nothing to reconcile
+    if (record.get("nature") or "").strip().lower() != "retraction":
+        return  # severity winner isn't a retraction -> not the governed pair
+    reinst_dates = record.get("_reinst_dates") or []
+    ret_parsed = [d for d in (_parse_rw_date(x) for x in record.get("_ret_dates") or []) if d]
+    reinst_parsed = [d for d in (_parse_rw_date(x) for x in reinst_dates) if d]
+    if ret_parsed and reinst_parsed and max(reinst_parsed) < max(ret_parsed):
+        return  # the retraction is the LATEST status -> stays retracted
+    # Reinstatement is the latest known status (or chronology is indeterminate).
+    record["nature"] = "Reinstatement"
+    best_str, best_dt = "", None
+    for s in reinst_dates:
+        dt = _parse_rw_date(s)
+        if dt is not None and (best_dt is None or dt > best_dt):
+            best_dt, best_str = dt, s
+    if best_str:
+        record["date"] = best_str
+    elif reinst_dates:
+        record["date"] = reinst_dates[-1]
+    # else: no reinstatement date available -> leave the existing date as-is.
+
+
 def load_retraction_db(csv_path: Union[str, Path]) -> Dict[str, dict]:
     """Load the Retraction Watch CSV into a normalised DOI → record mapping.
 
@@ -321,6 +423,11 @@ def load_retraction_db(csv_path: Union[str, Path]) -> Dict[str, dict]:
     When a DOI appears multiple times, the most severe ``RetractionNature`` wins
     (Retraction > Expression of Concern > Correction > Reinstatement); all
     natures for that DOI are collected in ``all_natures``.
+
+    The one exception to severity: the retraction<->reinstatement pair is decided
+    by DATE, not severity — a Retraction with a *later* Reinstatement resolves to
+    ``nature == "Reinstatement"`` (the paper is currently reinstated), so it is
+    not reported as retracted. See :func:`_resolve_reinstatement`.
 
     Returns a dict mapping normalised DOI → {
         "nature": str,         # most severe nature
@@ -361,6 +468,11 @@ def load_retraction_db(csv_path: Union[str, Path]) -> Dict[str, dict]:
                     "date": date,
                     "title": title,
                     "retraction_doi": ret_doi,
+                    # Per-nature dates for the retraction<->reinstatement
+                    # chronology reconcile below; dropped after the post-pass so
+                    # the returned record shape is unchanged.
+                    "_ret_dates": [],
+                    "_reinst_dates": [],
                 }
             else:
                 existing = db[doi]
@@ -374,6 +486,23 @@ def load_retraction_db(csv_path: Union[str, Path]) -> Dict[str, dict]:
                     existing["nature"] = nature
                     existing["date"] = date
                     existing["retraction_doi"] = ret_doi
+
+            # Record retraction/reinstatement dates from EVERY row (incl. the
+            # first insert, whose nature didn't go through the else-branch) so a
+            # later Reinstatement can be compared against the Retraction by date.
+            nl = nature.lower()
+            if date and nl == "retraction":
+                db[doi]["_ret_dates"].append(date)
+            elif date and nl == "reinstatement":
+                db[doi]["_reinst_dates"].append(date)
+
+    # Post-pass: a later Reinstatement supersedes an earlier Retraction (LATEST
+    # status wins over most-severe), then drop the private per-nature date lists.
+    for record in db.values():
+        _resolve_reinstatement(record)
+        record.pop("_ret_dates", None)
+        record.pop("_reinst_dates", None)
+
     if _key is not None:
         _RW_DB_CACHE[_key] = db
     return db
@@ -1096,26 +1225,30 @@ def cite_check(
 
     # Step 4: existence check (optional, network)
     if check_existence and cited_dois:
-        unavailable_note_added = False
         for doi in cited_dois:
             try:
                 exists = _check_doi_exists(doi)
-                if not exists:
-                    findings.append(Finding(
-                        check="CITE-NOT-FOUND",
-                        severity="WARN",
-                        message=f"DOI {doi!r} could not be found in Crossref.",
-                        source="Crossref",
-                    ))
             except Exception:
-                if not unavailable_note_added:
-                    findings.append(Finding(
-                        check="CITE-EXISTENCE-UNAVAIL",
-                        severity="INFO",
-                        message="DOI existence check via Crossref is currently unavailable.",
-                        source="Crossref",
-                    ))
-                    unavailable_note_added = True
+                # The transport is down / Crossref is unreachable — a genuine 404
+                # returns False (it does NOT raise), so a raise here means we
+                # could not check. Every remaining DOI would hit the same dead
+                # transport and stall the full 10s timeout each (~N×10s), so emit
+                # ONE advisory note and STOP; the rest are simply unchecked this
+                # pass.
+                findings.append(Finding(
+                    check="CITE-EXISTENCE-UNAVAIL",
+                    severity="INFO",
+                    message="DOI existence check via Crossref is currently unavailable.",
+                    source="Crossref",
+                ))
+                break
+            if not exists:
+                findings.append(Finding(
+                    check="CITE-NOT-FOUND",
+                    severity="WARN",
+                    message=f"DOI {doi!r} could not be found in Crossref.",
+                    source="Crossref",
+                ))
 
     # Step 5: DOI<->metadata identity + author cross-check (network, opt-in).
     # Behind the same check_existence gate as step 4 because both fetch Crossref

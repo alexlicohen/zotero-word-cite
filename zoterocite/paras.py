@@ -76,16 +76,22 @@ def paragraph_text(p: etree._Element) -> str:
     out = []
     t_tag = qn("w:t")
     del_tag = qn("w:del")
+    move_from_tag = qn("w:moveFrom")
     fallback_tag = qn("mc:Fallback")
     tab_tag = qn("w:tab")
     br_tags = (qn("w:br"), qn("w:cr"))
 
     def _drop(node, *, also_del: bool) -> bool:
         # True if this node lives under an mc:Fallback (duplicate of the Choice we
-        # already read) or, when *also_del*, under a tracked w:del (accepted view).
+        # already read) or, when *also_del*, under a tracked w:del OR w:moveFrom — both
+        # are excluded from the accepted view, mirroring views._extract's <w:t> handling
+        # (deletions gone; the tracked-move SOURCE gone, since moveFrom uses ordinary
+        # <w:t> and would otherwise double the moved text at source AND destination).
         anc = node.getparent()
         while anc is not None and anc is not p:
-            if anc.tag == fallback_tag or (also_del and anc.tag == del_tag):
+            if anc.tag == fallback_tag or (
+                also_del and anc.tag in (del_tag, move_from_tag)
+            ):
                 return True
             anc = anc.getparent()
         return False

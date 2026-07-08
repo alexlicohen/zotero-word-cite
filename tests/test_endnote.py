@@ -270,6 +270,49 @@ class TestParseRIS:
         assert r1["year"] == "2019"                                # Y1 with ///
         assert r1["doi"] == "10.1093/brain/awz123"
 
+    def test_ris_ID_tag_is_not_a_pmid(self, tmp_path):
+        """TEETH: the RIS ``ID`` tag is EndNote's arbitrary internal Reference-ID
+        (record number), NOT a PMID. Mis-parsing it as a pmid fabricates a
+        high-confidence PubMed resolution to an UNRELATED paper (record numbers
+        routinely land in the thousands, colliding with real low PMIDs) which
+        then gets written into the shared Zotero group.
+
+        RED before the fix (``ID`` populated ``pmid`` = "8412"); GREEN after
+        (``ID`` is ignored → ``pmid`` is None, and the refresolve query carries
+        no fabricated ``PMID:`` token)."""
+        ris = (
+            "TY  - JOUR\n"
+            "AU  - Smith, J\n"
+            "TI  - Some paper\n"
+            "PY  - 2019\n"
+            "ID  - 8412\n"
+            "ER  -\n"
+        )
+        p = _write(tmp_path, "recnum.ris", ris)
+        recs = parse_endnote_library(p)
+        assert len(recs) == 1
+        rec = recs[0]
+        # The record number MUST NOT become a pmid.
+        assert rec["pmid"] is None, "RIS ID (record number) must not be used as a PMID"
+        # And it must not leak into the refresolve query as a PMID token, which is
+        # what would drive the wrong high-confidence PubMed fetch/write.
+        assert "PMID" not in en._record_query(rec)
+
+    def test_ris_C2_still_carries_pmid(self, tmp_path):
+        """Guard the KEPT branch: a legitimate PMID carried in ``C2`` is still
+        parsed (only the ``ID`` record-number branch was removed)."""
+        ris = (
+            "TY  - JOUR\n"
+            "AU  - Smith, J\n"
+            "TI  - Some paper\n"
+            "PY  - 2019\n"
+            "C2  - 34567890\n"
+            "ER  -\n"
+        )
+        p = _write(tmp_path, "withc2.ris", ris)
+        recs = parse_endnote_library(p)
+        assert recs[0]["pmid"] == "34567890"
+
 
 # ===========================================================================
 # 1. parse_endnote_library — tolerance

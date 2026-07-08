@@ -361,7 +361,23 @@ def count_items(query: Optional[str] = None, qmode: Optional[str] = None,
     if qmode:
         params["qmode"] = qmode
     _, headers = _get_json_headers(build_request("items/top" if top else "items", params))
-    return int(headers.get("Total-Results", 0))
+    raw_total = headers.get("Total-Results")
+    if raw_total is None:
+        # A missing header is a DEGRADED read, not an empty library. Defaulting
+        # to 0 would fail OPEN (report "no items" for an unreadable count and
+        # invite blind writes), so fail CLOSED with the standard degraded-read
+        # signal instead — same posture as :func:`fetch_all`.
+        raise LibraryUnavailableError(
+            "Zotero response is missing the Total-Results header; cannot read the "
+            "item count. Treating as a degraded read (fail-closed)."
+        )
+    try:
+        return int(raw_total)
+    except (TypeError, ValueError):
+        raise LibraryUnavailableError(
+            "Zotero returned an unparseable Total-Results header; cannot read the "
+            "item count. Treating as a degraded read (fail-closed)."
+        )
 
 
 def fetch_all(query: Optional[str] = None, qmode: Optional[str] = None,
@@ -385,6 +401,16 @@ def fetch_all(query: Optional[str] = None, qmode: Optional[str] = None,
     start = 0
     budget = _fetch_budget()
     deadline_start = time.time()
+    # AUTHORITATIVE completeness signal: Zotero's ``Total-Results`` header. Its
+    # ABSENCE (a proxy stripped it, or a degraded response) means we CANNOT
+    # confirm the whole library was fetched. Treating a partial list as complete
+    # is a fail-OPEN: a strict write path (``library_index(strict=True)`` →
+    # ``create_items``) then sees the un-fetched items as absent and RE-CREATES
+    # them, mass-duplicating the shared group. So this loop fails CLOSED —
+    # raising :class:`LibraryUnavailableError` (the same degraded-read signal a
+    # fetch failure raises, routing index builders to cache fallback / refuse)
+    # rather than silently truncating. ``None`` = not yet known / unparseable.
+    expected_total: Optional[int] = None
     while True:
         # Overall deadline check BETWEEN pages: bound the total fetch, not just
         # each socket read.  Raising the degraded-read exception routes the index
@@ -401,16 +427,69 @@ def fetch_all(query: Optional[str] = None, qmode: Optional[str] = None,
         if qmode:
             params["qmode"] = qmode
         data, headers = _get_json_headers(build_request("items/top" if top else "items", params))
-        if not isinstance(data, list) or not data:
+
+        # Read the authoritative count for THIS page. Present+parseable updates
+        # ``expected_total``; absent/unparseable leaves ``header_ok`` False so the
+        # completeness checks below fail closed instead of defaulting to
+        # "len-so-far == complete" (the silent-truncation bug).
+        raw_total = headers.get("Total-Results")
+        header_ok = False
+        if raw_total is not None:
+            try:
+                expected_total = int(raw_total)
+                header_ok = True
+            except (TypeError, ValueError):
+                header_ok = False
+
+        if not isinstance(data, list):
+            # Malformed (non-list) response — a degraded read, not an empty
+            # library. Fail closed rather than returning a truncated result.
+            raise LibraryUnavailableError(
+                "Zotero returned a non-list items response; treating as a "
+                "degraded read (fail-closed) rather than a complete library."
+            )
+        if not data:
             break
         out.extend(data)
         start += len(data)
-        total = headers.get("Total-Results", len(out))
-        _progress(f"zotero: fetched {len(out)}/{total} items…")
+        disp_total = expected_total if expected_total is not None else "?"
+        _progress(f"zotero: fetched {len(out)}/{disp_total} items…")
+
+        # A bounded read (explicit ``max_items``) is a deliberate partial fetch,
+        # not a whole-library completeness claim — return what was asked for.
         if max_items is not None and len(out) >= max_items:
             return out[:max_items]
-        if start >= int(total):
+
+        if not header_ok:
+            # No authoritative count on this page → cannot page safely and cannot
+            # confirm completeness. Fail closed rather than break-and-truncate.
+            raise LibraryUnavailableError(
+                "Zotero response is missing/invalid the Total-Results header; "
+                "cannot confirm the library was fully fetched. Treating as a "
+                "degraded read (fail-closed) to avoid duplicate writes from a "
+                "partial index."
+            )
+        if start >= expected_total:
             break
+
+    # Positively confirm completeness before returning a list callers treat as
+    # the WHOLE library. (Bounded ``max_items`` reads already returned above.)
+    if expected_total is None:
+        # Reached only when the FIRST page was empty AND carried no valid
+        # Total-Results — an empty library reports ``Total-Results: 0``, so a
+        # header-less empty response is a degraded read, not an empty library.
+        raise LibraryUnavailableError(
+            "Zotero response is missing the Total-Results header; cannot confirm "
+            "the library was fully fetched (fail-closed)."
+        )
+    if len(out) != expected_total:
+        # A page returned empty (or short) mid-pagination — we have fewer items
+        # than the library holds. Fail closed to avoid a partial index.
+        raise LibraryUnavailableError(
+            f"Zotero fetch is incomplete: got {len(out)} of {expected_total} "
+            "item(s) (a page truncated mid-pagination). Treating as a degraded "
+            "read (fail-closed) to avoid duplicate writes from a partial index."
+        )
     return out
 
 

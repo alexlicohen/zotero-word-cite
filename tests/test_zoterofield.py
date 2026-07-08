@@ -81,6 +81,25 @@ def test_replace_all_refuses_rendered_echo(tmp_path):
     assert n == 2
 
 
+def test_replace_all_refuses_rendered_html_echo(tmp_path):
+    """REGRESSION: the runaway guard must also check the EFFECTIVE text derived
+    from ``rendered_html`` (stripped of tags), not just ``rendered`` verbatim.
+    Pre-fix, a caller could pass a ``rendered`` that looks neutral (e.g. an
+    empty/placeholder string) alongside a ``rendered_html`` whose plain-text
+    form echoes the anchor, and the guard would miss it — a latent nested-field
+    runaway with no current caller triggering it, but a real hazard for anyone
+    who does pass rendered_html without a matching neutral ``rendered``."""
+    src = tmp_path / "src.docx"
+    new_doc(src, ["See (12) here."])
+    doc = Docx(src)
+    with pytest.raises(ValueError, match="neutral rendered token"):
+        zoterofield.replace_all_text_with_zotero_field(
+            doc, "(12)", ["X8ISWWQ2"], itemdata=[ITEMDATA], uris=[URI],
+            rendered="",
+            rendered_html="<sup>(12)</sup>",  # plain-text form echoes the anchor
+        )
+
+
 def test_pref_added_only_once(tmp_path):
     src = tmp_path / "s.docx"
     new_doc(src, ["First spot here.", "Second spot here."])

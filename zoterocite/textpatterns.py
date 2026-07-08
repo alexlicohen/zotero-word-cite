@@ -128,8 +128,16 @@ TABLE_REF_RE = re.compile(
 # got consumed, hiding the "and 3" continuation).  The lookahead lets the
 # expander tell a bare figure number from a quantity modifying a noun
 # ("23 patients", "100 cells") without disturbing the scan.
+#
+# Also recognizes the worded range/list separators "to" / "through" / "or"
+# (matching _REF_NUM_TAIL's lead-token tail below), so a worded figure range
+# like "Figures 1 to 3" is captured by the lead regex AND actually expanded
+# here — previously only the dash/","/"and" separators were recognized, so
+# "1 to 3"/"1 through 3"/"1 or 3" under-expanded to just {1}, producing false
+# M2 figure-reference-orphan INFO findings for Figures 2/3.
 _NUM_CONT_RE = re.compile(
-    r"(?:,|\band\b|[-–])\s*(\d+)(?=\s*(?P<word>[A-Za-z]+)|)", re.IGNORECASE
+    r"(?:,|\band\b|\bor\b|\bto\b|\bthrough\b|[-–])\s*(\d+)(?=\s*(?P<word>[A-Za-z]+)|)",
+    re.IGNORECASE,
 )
 
 # Words that may follow a figure number and still leave it a figure number
@@ -188,9 +196,13 @@ def _expand_ref_numbers(text: str) -> set:
         # ranges/lists from the last real figure number).
         if trailing_word and trailing_word not in _REF_CONNECTIVES:
             continue
-        # Determine if this is a range continuation (dash/en-dash) or a list item
+        # Determine if this is a range continuation (dash/en-dash, or the
+        # worded range separators "to"/"through") or a list item (","/"and"/"or").
         sep = m.group(0).lstrip()
-        if sep and sep[0] in "-–":
+        sep_lower = sep.lower()
+        is_dash_range = bool(sep) and sep[0] in "-–"
+        is_worded_range = sep_lower.startswith("to") or sep_lower.startswith("through")
+        if is_dash_range or is_worded_range:
             # Range: expand from prev+1 to val
             lo, hi = (min(prev, val), max(prev, val))
             nums.update(range(lo, hi + 1))

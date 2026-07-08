@@ -245,3 +245,58 @@ def test_paraindex_excludes_textbox_inner_paragraphs():
     hits = idx.find_all("Figure caption alpha")
     assert hits == [paras["textbox"]]
     assert idx.find("Figure caption alpha") is paras["textbox"]
+
+
+def test_tracked_move_source_excluded():
+    # A tracked-move SOURCE (<w:moveFrom>) uses ordinary <w:t>, so the moved text
+    # would otherwise appear at BOTH source and destination. The accepted view drops
+    # the source (it moved away); paragraph_text must mirror views._extract and
+    # exclude it. A moveTo DESTINATION is kept (survives in the accepted view).
+    p = etree.Element(qn("w:p"))
+    _run(p, "before ")
+    mf = etree.SubElement(p, qn("w:moveFrom"))
+    mf.set(qn("w:id"), "1")
+    mf.set(qn("w:author"), "Collaborator, A.")
+    mf.set(qn("w:date"), "2026-06-20T10:00:00Z")
+    mr = etree.SubElement(mf, qn("w:r"))
+    etree.SubElement(mr, qn("w:t")).text = "MOVEDSOURCE "
+    _run(p, "after")
+    assert paragraph_text(p) == "before after"
+
+
+def test_tracked_move_destination_kept():
+    # A moveTo DESTINATION is part of the accepted view -> kept by paragraph_text.
+    p = etree.Element(qn("w:p"))
+    _run(p, "here is ")
+    mt = etree.SubElement(p, qn("w:moveTo"))
+    mt.set(qn("w:id"), "2")
+    mr = etree.SubElement(mt, qn("w:r"))
+    etree.SubElement(mr, qn("w:t")).text = "the moved text"
+    assert paragraph_text(p) == "here is the moved text"
+
+
+def test_move_source_excluded_matches_read_views(tmp_path):
+    # End-to-end: paragraph_text of a moveFrom-bearing paragraph equals the
+    # read_views accepted content (the single-owner accepted-view rendering).
+    from docx import Document
+
+    doc = Document()
+    para = doc.add_paragraph()
+    para.add_run("before ")
+    p_el = para._p
+    mf = etree.SubElement(p_el, qn("w:moveFrom"))
+    mf.set(qn("w:id"), "1")
+    mf.set(qn("w:author"), "Collaborator, A.")
+    mf.set(qn("w:date"), "2026-06-20T10:00:00Z")
+    mr = etree.SubElement(mf, qn("w:r"))
+    etree.SubElement(mr, qn("w:t")).text = "MOVED "
+    para.add_run("after")
+    out = tmp_path / "mv.docx"
+    doc.save(str(out))
+
+    from zoterocite.docxio import Docx, DOCUMENT
+
+    root = Docx(str(out)).read_tree(DOCUMENT)
+    body_paras = [p for p in iter_paragraphs(root) if paragraph_text(p)]
+    assert body_paras and paragraph_text(body_paras[0]) == "before after"
+    assert read_views(str(out))["accepted"] == "before after"

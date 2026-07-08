@@ -1143,3 +1143,144 @@ class TestYearFromDate:
     def test_empty_and_none_yield_none(self):
         assert zotero._year_from_date("") is None
         assert zotero._year_from_date(None) is None
+
+
+# ---------------------------------------------------------------------------
+# fetch_all — completeness / fail-CLOSED on a missing Total-Results header
+# ---------------------------------------------------------------------------
+# A missing (proxy-stripped) or truncated ``Total-Results`` must NOT be treated
+# as "the whole library" — a partial index returned as complete makes the strict
+# write path (library_index → create_items) see un-fetched items as absent and
+# RE-CREATE them, mass-duplicating the shared group. fetch_all fails CLOSED:
+# raising LibraryUnavailableError (the degraded-read signal) instead.
+class TestFetchAllCompleteness:
+    def _setenv(self, monkeypatch):
+        monkeypatch.setenv("ZOTERO_API_KEY", "k")
+        monkeypatch.setenv("ZOTERO_GROUP_ID", "2504198")
+        monkeypatch.delenv("ZOTERO_USER_ID", raising=False)
+        monkeypatch.delenv("ZOTERO_WORD_CITE_ZOTERO_FETCH_BUDGET", raising=False)
+
+    def test_missing_total_results_header_fails_closed(self, monkeypatch):
+        """TEETH: first page is a FULL page (100 items) with NO Total-Results
+        header. Before the fix ``total`` defaulted to len(out) → loop broke →
+        the first 100 items were returned AS the complete library (silent
+        truncation of a e.g. 3000-item group). After: it raises
+        LibraryUnavailableError so a strict write cannot proceed on a partial
+        index.
+
+        Mutation check: restoring ``total = headers.get('Total-Results', len(out))``
+        + ``if start >= int(total): break`` makes this return 100 items (no raise)
+        → RED."""
+        self._setenv(monkeypatch)
+
+        def fake_headers(req, timeout=15.0):
+            # A brimming page with the completeness header STRIPPED.
+            return ([{"key": f"K{i}", "data": {}} for i in range(100)], {})
+
+        monkeypatch.setattr(zotero, "_get_json_headers", fake_headers)
+
+        with pytest.raises(zotero.LibraryUnavailableError):
+            zotero.fetch_all()
+
+    def test_empty_page_without_header_fails_closed(self, monkeypatch):
+        """An empty first page with NO Total-Results is a degraded read, not an
+        empty library (an empty library reports ``Total-Results: 0``). Fail
+        closed rather than returning [] as 'the whole (empty) library'."""
+        self._setenv(monkeypatch)
+        monkeypatch.setattr(
+            zotero, "_get_json_headers",
+            lambda req, timeout=15.0: ([], {}),
+        )
+        with pytest.raises(zotero.LibraryUnavailableError):
+            zotero.fetch_all()
+
+    def test_truncated_mid_pagination_fails_closed(self, monkeypatch):
+        """Total-Results says 150 but page 2 comes back empty (proxy hiccup):
+        we have only 100 of 150. Fail closed instead of returning a partial
+        library as complete."""
+        self._setenv(monkeypatch)
+        pages = {"n": 0}
+        seq = [
+            ([{"key": f"K{i}", "data": {}} for i in range(100)], {"Total-Results": "150"}),
+            ([], {"Total-Results": "150"}),  # short/empty page mid-pagination
+        ]
+
+        def fake_headers(req, timeout=15.0):
+            i = pages["n"]; pages["n"] += 1
+            return seq[i]
+
+        monkeypatch.setattr(zotero, "_get_json_headers", fake_headers)
+        with pytest.raises(zotero.LibraryUnavailableError):
+            zotero.fetch_all()
+
+    def test_complete_paginated_fetch_still_succeeds(self, monkeypatch):
+        """The happy path is unchanged: a normal paginated fetch whose pages all
+        carry a consistent Total-Results returns the whole library."""
+        self._setenv(monkeypatch)
+        pages = {"n": 0}
+        seq = [
+            ([{"key": f"K{i}", "data": {}} for i in range(100)], {"Total-Results": "150"}),
+            ([{"key": f"K{i}", "data": {}} for i in range(100, 150)], {"Total-Results": "150"}),
+        ]
+
+        def fake_headers(req, timeout=15.0):
+            i = pages["n"]; pages["n"] += 1
+            return seq[i]
+
+        monkeypatch.setattr(zotero, "_get_json_headers", fake_headers)
+        out = zotero.fetch_all()
+        assert len(out) == 150 and pages["n"] == 2
+
+    def test_empty_library_with_header_returns_empty(self, monkeypatch):
+        """A genuinely empty library (``Total-Results: 0``) still returns [] —
+        the fail-closed path must not misfire on a real empty library (callers
+        may safely create)."""
+        self._setenv(monkeypatch)
+        monkeypatch.setattr(
+            zotero, "_get_json_headers",
+            lambda req, timeout=15.0: ([], {"Total-Results": "0"}),
+        )
+        assert zotero.fetch_all() == []
+
+    def test_bounded_max_items_returns_partial_without_completeness_claim(self, monkeypatch):
+        """A bounded ``max_items`` read is a deliberate partial fetch, not a
+        whole-library claim — it returns the cap even without a completeness
+        cross-check (and even if the header were absent)."""
+        self._setenv(monkeypatch)
+        monkeypatch.setattr(
+            zotero, "_get_json_headers",
+            lambda req, timeout=15.0: (
+                [{"key": f"K{i}", "data": {}} for i in range(100)], {},
+            ),
+        )
+        out = zotero.fetch_all(max_items=10)
+        assert len(out) == 10
+
+
+# ---------------------------------------------------------------------------
+# count_items — fail-CLOSED on a missing Total-Results header
+# ---------------------------------------------------------------------------
+class TestCountItemsFailClosed:
+    def _setenv(self, monkeypatch):
+        monkeypatch.setenv("ZOTERO_API_KEY", "k")
+        monkeypatch.setenv("ZOTERO_GROUP_ID", "2504198")
+        monkeypatch.delenv("ZOTERO_USER_ID", raising=False)
+
+    def test_missing_header_raises_not_zero(self, monkeypatch):
+        """Before: a missing Total-Results defaulted to 0 (fail-open: 'no items'
+        for an unreadable count). After: raises the degraded-read signal."""
+        self._setenv(monkeypatch)
+        monkeypatch.setattr(
+            zotero, "_get_json_headers",
+            lambda req, timeout=15.0: ([], {}),
+        )
+        with pytest.raises(zotero.LibraryUnavailableError):
+            zotero.count_items()
+
+    def test_present_header_still_read(self, monkeypatch):
+        self._setenv(monkeypatch)
+        monkeypatch.setattr(
+            zotero, "_get_json_headers",
+            lambda req, timeout=15.0: ([], {"Total-Results": "137"}),
+        )
+        assert zotero.count_items() == 137

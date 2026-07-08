@@ -321,6 +321,58 @@ def test_insertion_before_citation_field_lands_before_it(tmp_path):
     _field_intact(_xml(out), "(7)")
 
 
+# -- regression: insertion FLUSH-AFTER a citation render lands AFTER it --------
+def test_insertion_flush_after_citation_render_lands_after_it(tmp_path):
+    """A char inserted immediately AFTER a live citation render, with NO intervening
+    unchanged word, must land AFTER the field ("shown(1). and more"), not before it
+    ("shown.(1) and more") and must NOT be refused.
+
+    The plain-offset model collapses both sides of an immovable render to ONE plain
+    offset, so without a side-of-render signal the flush-after insertion was owned by
+    the run ENDING at that offset (before the field). And because the whole-text diff
+    coalesces the render into the changed opcode span, the un-narrowed field-touch
+    guard wrongly REFUSED the edit. The narrowed-span guard + 'after' ownership fix
+    both: the struck span (empty here) never touches the render, and the <w:ins> is
+    owned by the run STARTING at the offset (after the field)."""
+    src = _make_cited(tmp_path, "shown", "(1)", " and more")
+    old = read_views(src)["accepted"]
+    assert old == "shown(1) and more"
+    new = "shown(1). and more"          # insert "." flush-AFTER the render
+
+    doc = Docx(src)
+    tracked_replace_paragraphs(doc, {0: new}, author=AC, scope="word")
+    assert doc.skipped_field_paras == []          # applied, NOT refused
+    out = tmp_path / "out.docx"; doc.save(out)
+    body = _xml(out)
+
+    # the field render is physically untouched, the "." inserted as a tracked <w:ins>
+    assert "(1)" not in "".join(_deltexts(body))
+    assert "(1)" not in "".join(_instexts(body))  # render NOT re-inserted as literal
+    assert "".join(_instexts(body)) == "."        # exactly the "." inserted
+    assert read_views(out)["accepted"] == new     # "." AFTER the citation
+    assert read_views(out)["rejected"] == old     # reject view byte-identical
+    _field_intact(body, "(1)")
+    assert validate(out).ok
+
+    # OOXML round-trip: after accept_all the live field survives byte-identical and the
+    # accepted text is exactly the intended flush-after result.
+    da = Docx(out); accept_all(da); acc = tmp_path / "acc.docx"; da.save(acc)
+    _field_intact(_xml(acc), "(1)")
+    assert read_views(acc)["accepted"] == new
+
+    # OOXML round-trip: after reject_all the original (incl. live field) is restored.
+    dr = Docx(out); reject_all(dr); rej = tmp_path / "rej.docx"; dr.save(rej)
+    _field_intact(_xml(rej), "(1)")
+    assert read_views(rej)["accepted"] == old
+
+    # The inserted "." physically follows the field END marker (after the render), not
+    # the prefix run — i.e. it is spliced into the run STARTING after the field.
+    end_pos = body.find('w:fldCharType="end"')
+    ins_pos = body.find("<w:ins ")
+    assert end_pos != -1 and ins_pos != -1 and ins_pos > end_pos, (
+        "the flush-after insertion must be spliced AFTER the field end marker")
+
+
 # -- reject of a tracked CITATION CONVERSION restores a LIVE field ------------
 def _foreign_field_doc(tmp_path, lead, instr_code, rendered, tail, *, name="fc.docx"):
     """A one-paragraph doc carrying a real FOREIGN complex citation field

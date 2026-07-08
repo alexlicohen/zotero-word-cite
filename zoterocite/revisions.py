@@ -584,7 +584,14 @@ def _apply_inplace_plain_edits(p, edits, plain_runs, ids, author, date) -> bool:
         # pure insertion whose boundary pa is strictly inside (s < pa < e) OR sits at
         # the run's start/end (assigned to the run on whose side it falls — start goes
         # to this run when this is the first run owning that boundary).
-        for (pa, pb, new_sub, anchor_rpr) in edits:
+        for ed in edits:
+            # Each edit is (pa, pb, new_sub, anchor_rpr[, side]). ``side`` is OPTIONAL
+            # for backward compatibility with 4-tuple callers (default 'before' = the
+            # historical run-ENDING-at-pa ownership). Only a pure insertion flush-AFTER a
+            # field render needs 'after' (own the run STARTING at pa). Unpacking ed[:4]
+            # keeps every existing 4-tuple caller unaffected.
+            pa, pb, new_sub, anchor_rpr = ed[:4]
+            side = ed[4] if len(ed) > 4 else "before"
             if pb > pa:                               # replacement/deletion
                 if pa >= e or pb <= s:
                     continue                          # no overlap with this run
@@ -603,15 +610,26 @@ def _apply_inplace_plain_edits(p, edits, plain_runs, ids, author, date) -> bool:
                                        _make_run(new_sub, anchor_rpr)))
                 cursor = lb
             else:                                     # pure insertion at boundary pa
-                # Own the boundary on the run ENDING at pa (the previous run) plus
-                # any strictly-interior point; the global-start boundary (pa == 0,
-                # which no run ends at) is owned by the first run. Attaching to the
-                # run that ENDS at pa places the inserted text at that run's end —
-                # i.e. BEFORE any following complex field — so an insertion at a
-                # prose|field seam lands before the citation, not after it. Exactly
-                # one run owns each seam, so the <w:ins> is never dropped (the old
-                # pair of deferral rules left an internal seam owned by neither).
-                owns = (s < pa <= e) or (pa == s and ri == 0)
+                # Two runs meet at a plain boundary pa: the one ENDING at pa (the
+                # previous run) and the one STARTING at pa. When an immovable field
+                # render sits between them in document order, BOTH map to the SAME
+                # plain offset pa (the render contributes 0 plain chars), so the plain
+                # offset alone cannot say which SIDE of the field the insertion belongs
+                # on. The caller disambiguates with ``side``:
+                #   'before' (default): own on the run ENDING at pa (its end is BEFORE
+                #     any following field), plus any strictly-interior point; the global
+                #     -start boundary (pa == 0, which no run ends at) is owned by the
+                #     first run. This is the flush-BEFORE-a-following-field placement and
+                #     preserves the historical behaviour for every non-'after' edit.
+                #   'after': own on the run STARTING at pa (which sits AFTER any preceding
+                #     field), so a segment-leading insertion flush-AFTER a render lands
+                #     after the citation, not before it.
+                # Exactly one run owns each edit either way, so the <w:ins> is never
+                # dropped or emitted twice.
+                if side == "after":
+                    owns = (pa == s)
+                else:
+                    owns = (s < pa <= e) or (pa == s and ri == 0)
                 if not owns:
                     continue
                 if pa > cursor:
@@ -721,26 +739,42 @@ def _surgical_in_cited_para(p, new_text: str, ids: _Ids, author: str, date: str)
     for t in old_toks:
         old_off.append(old_off[-1] + len(t))
 
+    def _flush_after(fo):
+        """True iff a zero-width insertion at FULL-text offset ``fo`` sits flush-AFTER
+        an immovable render (the char immediately before it belongs to the field
+        render) AND a plain run actually STARTS at the mapped plain offset — so
+        ``side='after'`` has a run to own the ``<w:ins>`` and it is never silently
+        dropped. Expressed in whole-text space: the previous char being non-plain means
+        the boundary is the leading edge of a plain run that FOLLOWS a render (the
+        segment-leading-edge case)."""
+        if fo < 1 or plain_flags[fo - 1]:
+            return False
+        po = plain_before[fo]
+        return any(s == po for (_r, s, _e, _rpr) in plain_runs)
+
     # Build every edit BEFORE mutating (all-or-nothing). Each entry is
-    # (pa, pb, new_sub, anchor_rpr) in plain-text offset space.
+    # (pa, pb, new_sub, anchor_rpr, side) in plain-text offset space.
     edits = []
     for tag, i1, i2, j1, j2 in opcodes:
         if tag == "equal":
             continue
         a, b = old_off[i1], old_off[i2]               # FULL-text span of old side
-        if any(not plain_flags[k2] for k2 in range(a, b)):
-            return False                              # edit touches the citation render -> refuse
         old_seg = full_text[a:b]
         new_seg = "".join(new_toks[j1:j2])
         if tag == "insert":
-            # Pure insertion: i1 == i2 so a == b. Anchor at the plain offset of the
-            # boundary. No old side, no token-borrowing, no uniqueness needed (W1-4).
+            # Pure insertion: i1 == i2 so a == b -> old side is EMPTY, nothing is struck,
+            # so no render char can be touched (no field-touch check needed). Anchor at
+            # the plain offset of the boundary. SIDE picks which side of an immovable
+            # render the text lands on when the boundary coincides with a field seam
+            # (both sides share the plain offset): flush-AFTER a render -> 'after' so it
+            # lands after the citation, not before it.
             pa = pb = plain_before[a]
             if new_seg:
-                edits.append((pa, pb, new_seg, rpr_at_plain(pa)))
+                side = "after" if _flush_after(a) else "before"
+                edits.append((pa, pb, new_seg, rpr_at_plain(pa), side))
             continue
-        # Replace/delete: narrow to the minimal changed sub-span so only the truly
-        # changed characters are struck (preserves the minimal-redline shape the
+        # Replace/delete: narrow to the minimal changed sub-span FIRST, so only the
+        # truly changed characters are struck (preserves the minimal-redline shape the
         # existing field-safety tests assert, e.g. "(1)" plain "1"->"2" strikes just
         # "1"). The shared prefix/suffix stay untouched in their original runs.
         md = _minimal_diff(old_seg, new_seg)
@@ -755,9 +789,25 @@ def _surgical_in_cited_para(p, new_text: str, ids: _Ids, author: str, date: str)
             shared_pre += 1
         fa = a + shared_pre                           # FULL-text start of the changed span
         fb = fa + len(old_mid)                        # FULL-text end of the changed span
+        # FIELD-TOUCH guard on the STRUCK span ONLY (post-narrowing) — not the whole
+        # coalesced opcode span. The old un-narrowed [a,b) check refused a legitimate
+        # plain edit flush-against a render (e.g. inserting "." right after "(1)") because
+        # the coalesced opcode span crossed the render even though the actually-struck
+        # span does not. Guarding [fa,fb) — the exact characters wrapped in <w:del> —
+        # refuses only when the strike itself would hit the render (the genuine
+        # "you're rewriting the citation" case), while allowing an edit whose unchanged
+        # shared prefix/suffix merely contains the render.
+        if any(not plain_flags[k2] for k2 in range(fa, fb)):
+            return False                              # the struck span touches the render -> refuse
         pa = plain_before[fa]
         pb = plain_before[fb]
-        edits.append((pa, pb, new_mid, rpr_at_plain(pa)))
+        # _minimal_diff can reduce a 'replace' opcode to a PURE INSERTION (old_mid empty
+        # -> fb == fa -> pb == pa) — e.g. prepending "." to an otherwise unchanged
+        # " and more" tokenizes as a replace of the leading token yet narrows to a bare
+        # insert. Such an insertion needs the SAME side-of-render disambiguation as an
+        # 'insert' opcode. A non-empty struck span pins its own runs -> side unused.
+        side = "after" if (fb == fa and _flush_after(fa)) else "before"
+        edits.append((pa, pb, new_mid, rpr_at_plain(pa), side))
 
     if not edits:
         return True

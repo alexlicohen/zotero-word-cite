@@ -135,6 +135,16 @@ _CIT_ID_RE: Pattern = re.compile(
     r"PMC\d+|PMID:\s*\d+|doi\.org/|10\.\d{4,9}/", re.IGNORECASE
 )
 
+# A WHOLE inline-identifier token (URL / DOI / PMID / PMCID incl. its suffix) —
+# used to blank out identifiers before looking for a publication YEAR, so a
+# year-shaped run buried inside a DOI ("10.1016/j.neuroimage.2019.5678" -> "2019")
+# is NOT mistaken for a bibliographic date.  Unlike ``_CIT_ID_RE`` (which anchors
+# only the identifier PREFIX), this consumes the trailing ``\S+`` of the token.
+_IDENTIFIER_TOKEN_RE: Pattern = re.compile(
+    r"https?://\S+|(?:doi\.org/)?10\.\d{4,9}/\S+|PMC\d+|PMID:\s*\d+",
+    re.IGNORECASE,
+)
+
 # --- Author-head building blocks (aligned with refextract.py) --------------
 # The genuinely-identical fragments (``AUTHOR_PARTICLE`` / ``AUTHOR_INITIALS`` /
 # ``REF_SECTION_LABEL`` / ``CAP_WORD`` / ``ALLCAPS_TOKEN``) now live in the shared
@@ -777,6 +787,23 @@ def _looks_like_numbered_citation(p: str) -> bool:
     return is_citation_line(body)
 
 
+def _has_reference_signal(text: str) -> bool:
+    """True when *text* carries a genuine bibliographic signal beyond a bare inline
+    identifier: an author-BYLINE shape at the entry start, or a real publication
+    YEAR that is not merely a year-shaped run buried inside an inline identifier.
+
+    A paragraph whose ONLY citation signal is an inline DOI/PMID (body prose citing
+    a URL — no byline, no bibliographic date) has NEITHER, so it must not, on its
+    own, mark the start of a heading-less reference list.  The year check blanks out
+    whole identifier tokens (:data:`_IDENTIFIER_TOKEN_RE`) first, so a DOI such as
+    ``10.1016/j.neuroimage.2019.5678`` does not contribute a false "2019".
+    """
+    s = text.strip()
+    if _AUTHOR_HEAD_RE.match(s) or _AUTHOR_HEAD_SINGLE_RE.match(s):
+        return True
+    return bool(_YEAR_RE.search(_IDENTIFIER_TOKEN_RE.sub(" ", s)))
+
+
 def _looks_like_reference_entry(p: str) -> bool:
     """A paragraph that looks like a heading-less reference-list entry.
 
@@ -788,14 +815,25 @@ def _looks_like_reference_entry(p: str) -> bool:
       ``"Cohen AL. Title. Journal. Year"`` that carries no enumerator and no
       inline PMID/DOI.
 
-    The per-line signal is intentionally permissive; the precision that keeps a
-    short in-body enumeration (or a stray reference-shaped sentence) from being
-    read as the bibliography comes from the >= :data:`MIN_HEADINGLESS_REF_RUN`
-    *consecutive* run requirement in :func:`references_idx` (a body list of
-    "1) First step / 2) Second step" is neither numbered-citation nor bare-citation
-    shaped, and prose rarely produces three reference-shaped lines in a row).
+    In BOTH forms the entry must ALSO carry a real bibliographic signal — an author
+    byline and/or a publication year (:func:`_has_reference_signal`) — not merely an
+    inline identifier.  Without this, three consecutive BODY paragraphs that each
+    just *mention* an inline DOI/PMID (``is_citation_line`` returns True on the bare
+    identifier alone) were misdetected as the reference section, under-counting the
+    body page-span / A4 scan (a fail-open).  The byline/year requirement excludes
+    that prose while keeping a genuine authors-plus-year bibliography.
+
+    The per-line signal is still deliberately permissive beyond that; the further
+    precision that keeps a short in-body enumeration (or a stray reference-shaped
+    sentence) from being read as the bibliography comes from the >=
+    :data:`MIN_HEADINGLESS_REF_RUN` *consecutive* run requirement in
+    :func:`references_idx`.
     """
-    return _looks_like_numbered_citation(p) or is_citation_line(p)
+    if _looks_like_numbered_citation(p):
+        # Test the signal on the entry BODY (after the enumerator) so a leading
+        # "1." does not hide the byline.
+        return _has_reference_signal(_REF_ENUMERATOR_RE.sub("", p, count=1))
+    return is_citation_line(p) and _has_reference_signal(p)
 
 
 def references_idx(paras: Sequence[str]) -> Optional[int]:

@@ -264,10 +264,15 @@ def _parse_ris(text: str) -> List[dict]:
                 cur["pages"] = (f"{cur['pages']}-{value}" if cur["pages"] else value)
             elif tag == "DO":
                 cur["doi"] = _clean_doi(value) or cur["doi"]
-            elif tag in ("ID",) and value.isdigit() and not cur["pmid"]:
-                cur["pmid"] = value
             elif tag == "C2" and value.isdigit() and not cur["pmid"]:
                 # PubMed Central / PMID often stored in C2 by some exporters.
+                # NOTE: the RIS ``ID`` tag is EndNote's arbitrary internal
+                # Reference-ID (record number), NOT a PMID — it is deliberately
+                # NOT used as a pmid. Record numbers routinely land in the
+                # thousands and would collide with real low PMIDs, fabricating a
+                # high-confidence resolution to an UNRELATED PubMed paper that
+                # then gets written into the shared Zotero group. A PMID must come
+                # only from an explicit PMID-typed carrier (here, ``C2``).
                 cur["pmid"] = value
         except Exception:  # noqa: BLE001 — never fail the whole file on one bad line
             continue
