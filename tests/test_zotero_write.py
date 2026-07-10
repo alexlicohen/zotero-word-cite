@@ -8,7 +8,6 @@ from __future__ import annotations
 import io
 import json
 import secrets
-from typing import Any
 from unittest.mock import MagicMock, patch
 import urllib.error
 import urllib.parse
@@ -16,22 +15,13 @@ import urllib.parse
 import pytest
 
 from zoterocite import zotero
+# Shared canned-urlopen mock (single source, also used by test_dedup.py).
+from _zotero_http_helpers import fake_response as _fake_response
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _fake_response(body: Any, headers: dict | None = None, status: int = 200):
-    """Return a context-manager mock that mimics ``urllib.request.urlopen``."""
-    raw = json.dumps(body).encode("utf-8")
-    mock_resp = MagicMock()
-    mock_resp.read.return_value = raw
-    mock_resp.headers = headers or {}
-    mock_resp.__enter__ = lambda s: s
-    mock_resp.__exit__ = MagicMock(return_value=False)
-    return mock_resp
-
 
 def _make_urlopen_side_effect(*responses):
     """Return a side_effect callable that yields successive canned responses.

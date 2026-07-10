@@ -274,13 +274,19 @@ def _missing_env() -> list[str]:
 
 
 def build_request(
-    path: str, params: Optional[dict[str, Any]] = None
+    path: str,
+    params: Optional[dict[str, Any]] = None,
+    *,
+    extra_headers: Optional[dict[str, str]] = None,
 ) -> urllib.request.Request:
     """Build a signed GET :class:`urllib.request.Request` — *pure*, no network.
 
     The URL is ``{API_BASE}/{groups|users}/{id}/{path}?{params}`` and carries the
     ``Zotero-API-Key`` and ``Zotero-API-Version`` headers. ``params`` values are
-    URL-encoded.
+    URL-encoded.  ``extra_headers`` (optional) are merged in AFTER the auth
+    headers — used to carry a conditional-read precondition such as
+    ``If-Modified-Since-Version`` on the delta-sync fast path; the default of
+    ``None`` leaves the request byte-identical to the two-arg form.
 
     Raises :class:`RuntimeError` naming the missing env vars if credentials are
     not configured, so tests can construct/inspect requests without networking.
@@ -297,14 +303,13 @@ def build_request(
     query = urllib.parse.urlencode(params or {})
     url = f"{base}?{query}" if query else base
 
-    return urllib.request.Request(
-        url,
-        method="GET",
-        headers={
-            "Zotero-API-Key": cfg["api_key"],
-            "Zotero-API-Version": API_VERSION,
-        },
-    )
+    headers: dict[str, str] = {
+        "Zotero-API-Key": cfg["api_key"],
+        "Zotero-API-Version": API_VERSION,
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    return urllib.request.Request(url, method="GET", headers=headers)
 
 
 def _get_json(req: urllib.request.Request, timeout: float = 15.0) -> Any:
@@ -316,25 +321,38 @@ def _get_json(req: urllib.request.Request, timeout: float = 15.0) -> Any:
     return json.loads(_urlopen_retrying(req, timeout=timeout).decode("utf-8"))
 
 
-def _get_json_headers(req: urllib.request.Request, timeout: float = 15.0):
-    """Perform ``req``; return ``(parsed_json, headers_dict)`` — for pagination.
+def _urlopen_with_headers_retrying(
+    req: urllib.request.Request,
+    *,
+    timeout: float,
+    retries: int = 1,
+    _sleep=None,
+) -> tuple[bytes, dict]:
+    """``urlopen(req)`` returning ``(raw_body, headers_dict)`` with ONE bounded
+    retry on a transient 429/5xx, honouring a ``Retry-After`` / ``Backoff`` header.
 
-    Retries once on a transient 429/5xx so a rate-limit hiccup mid-``fetch_all``
-    does not raise an unhandled traceback.  The response headers (incl.
-    ``Total-Results``) are read from a SECOND, deliberately separate request only
-    when a retry happened; on the common (no-retry) path the original response's
-    headers are returned without re-fetching.  To keep both the body and the
-    headers from the *same* successful response, we open the connection here
-    rather than via :func:`_urlopen_retrying`.
+    The SINGLE retry-loop shared by BOTH the header-reading read path
+    (:func:`_get_json_headers`, which parses the body as JSON) and the
+    version-checked write path (:func:`_urlopen_write_with_headers`, which needs
+    the raw body + response headers) — so a future retry-policy change lives in
+    ONE place and cannot silently diverge between the two paths.  Body and headers
+    are read from the *same* successful response (the connection is opened here).
+    A retried request is SAFE for a version-checked write: it still carries the
+    original ``If-Unmodified-Since-Version`` precondition, so a lost-response retry
+    fails CLOSED on 412 rather than double-applying.  Non-transient errors (incl.
+    412/409) propagate to the caller for classification.  ``_sleep`` is a test
+    injection seam; when ``None`` the module-level ``_retry_sleep`` is used.  The
+    request URL/headers (which carry the API key) are never logged or surfaced.
     """
-    attempts = 2  # original + one retry
+    sleep = _sleep if _sleep is not None else _retry_sleep
+    attempts = max(0, int(retries)) + 1  # original + retries
     timeout = _effective_timeout(timeout)  # honour ZOTERO_WORD_CITE_HTTP_TIMEOUT ceiling
     for attempt in range(attempts):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
                 body = resp.read()
                 headers = {k: v for k, v in resp.headers.items()}
-            return json.loads(body.decode("utf-8")), headers
+                return body, headers
         except urllib.error.HTTPError as exc:
             status = getattr(exc, "code", None)
             if status not in _RETRY_STATUSES or attempt + 1 >= attempts:
@@ -343,41 +361,78 @@ def _get_json_headers(req: urllib.request.Request, timeout: float = 15.0):
                 _retry_after_from_headers(getattr(exc, "headers", None))
             )
             if wait > 0:
-                _retry_sleep(wait)
+                sleep(wait)
             continue
     raise RuntimeError("zotero retry loop exited without a result")  # pragma: no cover
 
 
-def count_items(query: Optional[str] = None, qmode: Optional[str] = None,
-                top: bool = True) -> int:
-    """Total number of (top-level) items in the library, or matching ``query``.
+def _get_json_headers(req: urllib.request.Request, timeout: float = 15.0):
+    """Perform ``req``; return ``(parsed_json, headers_dict)`` — for pagination.
 
-    Reads Zotero's ``Total-Results`` header (the authoritative count), so it is
-    not limited by the 25-item default page size.
+    Retries once on a transient 429/5xx (via the shared
+    :func:`_urlopen_with_headers_retrying` loop) so a rate-limit hiccup
+    mid-``fetch_all`` does not raise an unhandled traceback.  Both the body and
+    the response headers (incl. ``Total-Results``) come from the *same* successful
+    response.
+    """
+    body, headers = _urlopen_with_headers_retrying(req, timeout=timeout, retries=1)
+    return json.loads(body.decode("utf-8")), headers
+
+
+def _probe_items(
+    *, top: bool = True, query: Optional[str] = None, qmode: Optional[str] = None
+) -> tuple[Optional[int], Optional[int]]:
+    """One cheap ``limit=1`` GET → ``(total_results, last_modified_version)``.
+
+    The item COUNT (``Total-Results``) and the library VERSION
+    (``Last-Modified-Version``) live in the headers of the SAME minimal response,
+    so a caller that needs either reads ONE request, not two.  This is the single
+    owner of that probe — :func:`count_items` and :func:`_read_library_version`
+    both delegate here rather than each hand-building the byte-identical request
+    and reading a different header off it.  Each element is ``None`` when its
+    header is absent/unparseable; the caller decides how to fail (``count_items``
+    fails closed on a missing count, the delta sync declines to persist a
+    watermark on a missing version).
     """
     params: dict[str, Any] = {"format": "json", "limit": "1"}
     if query:
         params["q"] = query
     if qmode:
         params["qmode"] = qmode
-    _, headers = _get_json_headers(build_request("items/top" if top else "items", params))
+    _data, headers = _get_json_headers(
+        build_request("items/top" if top else "items", params)
+    )
     raw_total = headers.get("Total-Results")
-    if raw_total is None:
-        # A missing header is a DEGRADED read, not an empty library. Defaulting
-        # to 0 would fail OPEN (report "no items" for an unreadable count and
-        # invite blind writes), so fail CLOSED with the standard degraded-read
-        # signal instead — same posture as :func:`fetch_all`.
+    total: Optional[int] = None
+    if raw_total is not None:
+        try:
+            total = int(raw_total)
+        except (TypeError, ValueError):
+            total = None
+    version = _version_from_headers(headers, fallback=None)
+    return total, version
+
+
+def count_items(query: Optional[str] = None, qmode: Optional[str] = None,
+                top: bool = True) -> int:
+    """Total number of (top-level) items in the library, or matching ``query``.
+
+    Reads Zotero's ``Total-Results`` header (the authoritative count) via the
+    shared :func:`_probe_items` probe, so it is not limited by the 25-item
+    default page size.
+    """
+    total, _version = _probe_items(top=top, query=query, qmode=qmode)
+    if total is None:
+        # A missing/unparseable header is a DEGRADED read, not an empty library.
+        # Defaulting to 0 would fail OPEN (report "no items" for an unreadable
+        # count and invite blind writes), so fail CLOSED with the standard
+        # degraded-read signal instead — same posture as :func:`fetch_all`.
         raise LibraryUnavailableError(
-            "Zotero response is missing the Total-Results header; cannot read the "
-            "item count. Treating as a degraded read (fail-closed)."
+            "Zotero response is missing or has an unparseable Total-Results "
+            "header; cannot read the item count. Treating as a degraded read "
+            "(fail-closed)."
         )
-    try:
-        return int(raw_total)
-    except (TypeError, ValueError):
-        raise LibraryUnavailableError(
-            "Zotero returned an unparseable Total-Results header; cannot read the "
-            "item count. Treating as a degraded read (fail-closed)."
-        )
+    return total
 
 
 def fetch_all(query: Optional[str] = None, qmode: Optional[str] = None,
@@ -491,6 +546,433 @@ def fetch_all(query: Optional[str] = None, qmode: Optional[str] = None,
             "read (fail-closed) to avoid duplicate writes from a partial index."
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Incremental (delta) sync — a cached, cheap-to-refresh whole-library read
+# ---------------------------------------------------------------------------
+#
+# ``fetch_all`` re-walks the ENTIRE library on every call (~2 min for a few
+# thousand items) even when almost nothing changed.  :func:`synced_fetch_all` is
+# an ADDITIVE wrapper that keeps a local disk cache (the full item list + a
+# ``last_synced_version`` watermark) and, on each call, asks the server only for
+# what changed since that watermark — the documented Web-API delta protocol:
+#
+#   1. Fast no-op: the discovery request carries ``If-Modified-Since-Version``;
+#      a ``304 Not Modified`` means nothing changed library-wide → serve the
+#      cached list with ZERO further calls.
+#   2. Changed-key discovery: ``items[/top]?since=<v>&format=versions&
+#      includeTrashed=1`` returns ``{itemKey: version}`` for only the changed
+#      items (``format=versions`` has no default/max limit, so the whole delta
+#      arrives in one object; a ``Total-Results`` that ever exceeds it is treated
+#      as a partial read and fails closed).
+#   3. Full data for changed keys: ``items?itemKey=k1,...`` in batches of ≤50.
+#   4. Deletions: ``deleted?since=<v>`` — purged keys removed from the cache.
+#
+# The merged result is a DROP-IN for ``fetch_all``'s live-item set: a change
+# that TRASHES an item is only visible with ``includeTrashed=1`` (the plain
+# listing hides it), so the cache holds a superset and trashed items are filtered
+# OUT of the returned list — exactly what a plain ``fetch_all`` would omit.
+#
+# FAIL CLOSED, matching ``fetch_all``/``get_item_children``: if any step of the
+# delta path is unexpected/unparseable/incomplete (missing version header,
+# non-dict/non-list response, a changed key neither fetched nor deleted, a
+# ``Total-Results`` mismatch), we do NOT serve a half-merged cache — we fall back
+# to a full :func:`fetch_all` from scratch (which itself raises
+# :class:`LibraryUnavailableError` on a degraded read).  A stale-and-wrong merge
+# is never returned as if it were current.
+#
+# ``fetch_all`` itself is UNTOUCHED — existing callers (``library_doi_index``,
+# ``library_index``, ``export_backup``) keep their exact behaviour.
+
+# Disk caches for the delta sync — gitignored ``data/`` (same convention as the
+# DOI/library-index caches above).  Kept per SCOPE (top-level vs all items),
+# because the two are different item sets and must not share a watermark.
+_SYNC_CACHE_TOP = Path(__file__).parent.parent / "data" / "zotero_sync_cache_top.json"
+_SYNC_CACHE_ALL = Path(__file__).parent.parent / "data" / "zotero_sync_cache_all.json"
+
+
+def _default_sync_cache_path(top: bool) -> Path:
+    """The default gitignored cache file for the requested item scope."""
+    return _SYNC_CACHE_TOP if top else _SYNC_CACHE_ALL
+
+
+def _atomic_write_json(path: Path, payload: Any, *, default=str) -> None:
+    """Serialise ``payload`` to ``path`` as JSON via a temp-file atomic replace.
+
+    The SINGLE owner of the "mkdir parent → write ``<path>.tmp`` → ``os``-atomic
+    ``replace``" pattern shared by the disk caches and the pre-write backup
+    (previously hand-rolled in four places).  ``default=str`` mirrors the backup
+    export's tolerant serialisation.  This primitive RAISES on any IO/serialise
+    failure — best-effort callers (the caches) wrap it in ``try/except`` and
+    swallow, while the pre-write backup lets it propagate so a failed backup
+    aborts the apply.  Never writes an API key (the caller controls the payload).
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, default=default)
+    tmp.replace(path)
+
+
+def has_sync_cache(top: bool = True) -> bool:
+    """True only if a USABLE warm delta-sync cache exists for the given scope.
+
+    Routes through the SAME validation :func:`synced_fetch_all` uses
+    (:func:`_load_sync_cache`) rather than a bare ``path.exists()``: a corrupt,
+    stale, scope-mismatched, or wrong-library cache file exists on disk but is
+    NOT usable — ``synced_fetch_all`` would silently fall back to a slow cold
+    :func:`fetch_all` for it.  Reporting such a file as "warm" would suppress the
+    cold-fetch budget hint exactly when the slow path is about to run (the bug the
+    hint exists to prevent, reached through a different door).  So the answer
+    tracks what the fetch will actually do.  Never raises — an unexpected probe
+    error degrades to "not warm" (eligible for the hint), the fail-safe direction.
+    """
+    try:
+        return _load_sync_cache(_default_sync_cache_path(top), top=top) is not None
+    except Exception:  # noqa: BLE001 — a warm-cache probe must never abort a caller
+        return False
+
+
+def _is_trashed(item: Any) -> bool:
+    """True if a Zotero item is in the trash (``data.deleted`` truthy).
+
+    A plain (non-``includeTrashed``) listing omits these, so the delta merge
+    filters them out of the returned list to mirror :func:`fetch_all`.
+    """
+    data = item.get("data") if isinstance(item, dict) else None
+    return bool(data.get("deleted")) if isinstance(data, dict) else False
+
+
+def _live_items(items: list[dict]) -> list[dict]:
+    """The non-trashed subset — the set a plain :func:`fetch_all` would return."""
+    return [it for it in items if not _is_trashed(it)]
+
+
+def _read_library_version(*, top: bool = True) -> Optional[int]:
+    """Current library version via a cheap ``limit=1`` GET (``Last-Modified-Version``).
+
+    Delegates to the shared :func:`_probe_items` probe (same request
+    :func:`count_items` issues).  Used to seed/advance the sync watermark.
+    Returns the int version, or ``None`` if the header is absent/unparseable (the
+    caller then declines to persist a watermark rather than guess one).
+    """
+    return _probe_items(top=top)[1]
+
+
+def _cache_library_identity() -> tuple[Optional[str], Optional[str]]:
+    """The ``(library_type, library_id)`` a cache is bound to, from the env config.
+
+    A delta-sync cache belongs to exactly ONE Zotero library.  Capturing the
+    configured identity lets :func:`_load_sync_cache` refuse a cache whose library
+    changed between runs (switched group, or a multi-user setup) rather than
+    merge one library's items with another's delta.  Returns ``(None, None)`` when
+    credentials are unconfigured — a cache written with no identity is treated as
+    unverifiable and rejected on load (fail closed).
+    """
+    cfg = zotero_config()
+    return cfg.get("library_type"), cfg.get("library_id")
+
+
+def _load_sync_cache(path: Path, *, top: bool) -> Optional[dict]:
+    """Load a delta-sync cache file, or ``None`` if absent/corrupt/mismatched.
+
+    Returns ``{"version": int, "items": list}`` only when the file is a well-
+    formed cache whose ``top`` scope AND library identity match the current
+    request/config; anything else (missing file, unparseable JSON, non-int
+    version, non-list items, wrong scope, different or absent library binding)
+    yields ``None`` so the caller does a cold full resync rather than trust a bad
+    or cross-library cache.
+    """
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            cached = json.load(fh)
+    except Exception:  # noqa: BLE001 — corrupt/unreadable cache → cold resync
+        return None
+    if not isinstance(cached, dict):
+        return None
+    items = cached.get("items")
+    if not isinstance(items, list):
+        return None
+    try:
+        version = int(cached.get("version"))
+    except (TypeError, ValueError):
+        return None
+    if bool(cached.get("top", True)) != bool(top):
+        return None  # cache is for the other item scope — do not cross-use it
+    # Library-identity binding: a cache tagged for a DIFFERENT library (or a
+    # legacy/untagged cache we cannot confirm belongs to the current one) must not
+    # have its items merged with the current library's delta — that would corrupt
+    # the audit a human reviews before any --apply.  Fail closed (full resync
+    # re-tags it), exactly like the scope mismatch above.
+    want_type, want_id = _cache_library_identity()
+    if cached.get("library_type") != want_type or cached.get("library_id") != want_id:
+        return None
+    return {"version": version, "items": items}
+
+
+def _write_sync_cache(path: Path, *, version: int, top: bool, items: list[dict]) -> None:
+    """Persist the merged item list + watermark + library binding (best-effort).
+
+    A write failure never raises — the caller has already computed a correct
+    result; a missing cache just means the next call re-syncs from scratch. The
+    library identity is stamped so a later run under a DIFFERENT configured
+    library rejects this cache instead of merging across libraries. The API key
+    is never part of the payload.
+    """
+    lib_type, lib_id = _cache_library_identity()
+    payload = {
+        "version": int(version),
+        "top": bool(top),
+        "library_type": lib_type,
+        "library_id": lib_id,
+        "fetched_at": time.time(),
+        "items": items,
+    }
+    try:
+        _atomic_write_json(path, payload)
+    except Exception:  # noqa: BLE001 — cache write is best-effort; never break the read
+        pass
+
+
+def _sync_discovery(last_version: int, *, top: bool):
+    """Changed-key discovery + fast no-op check in ONE conditional request.
+
+    Returns ``(versions_dict, headers)`` where ``versions_dict`` maps changed
+    ``itemKey -> version``, or ``(None, {})`` on a ``304 Not Modified`` (nothing
+    changed since ``last_version``).  Any other HTTP error propagates so the
+    caller fails closed to a full resync.
+    """
+    params = {
+        "since": str(int(last_version)),
+        "format": "versions",
+        "includeTrashed": "1",
+    }
+    req = build_request(
+        "items/top" if top else "items",
+        params,
+        extra_headers={"If-Modified-Since-Version": str(int(last_version))},
+    )
+    try:
+        body, headers = _urlopen_with_headers_retrying(req, timeout=15.0, retries=1)
+    except urllib.error.HTTPError as exc:
+        if getattr(exc, "code", None) == 304:
+            return None, {}  # Not Modified — zero further work
+        raise
+    return json.loads(body.decode("utf-8")), headers
+
+
+def _fetch_items_by_keys(
+    keys: list[str],
+    *,
+    batch_size: int = 50,
+    deadline_start: Optional[float] = None,
+    budget: Optional[float] = None,
+) -> list[dict]:
+    """Full item data for ``keys`` (``items?itemKey=...``), batched at ≤50 keys.
+
+    ``includeTrashed=1`` so a changed key that was TRASHED still returns its data
+    (the merge then filters it from the live view).  A non-list page is a
+    degraded read and raises :class:`LibraryUnavailableError` (the caller catches
+    it and falls back to a full resync).
+
+    Bounded by the SAME overall wall-clock budget :func:`fetch_all` enforces
+    (``ZOTERO_WORD_CITE_ZOTERO_FETCH_BUDGET``, checked BETWEEN batches, not just per
+    socket): a large pending delta (a bulk import, or a long-neglected cache) can
+    span many ``itemKey`` batches, and with only the per-request 15 s timeout it
+    would otherwise run unbounded — none of the protection ``fetch_all`` gives.
+    On exceeding the budget it raises :class:`LibraryUnavailableError` (the same
+    degraded-read signal), which :func:`synced_fetch_all` catches and turns into a
+    safe full resync.  ``deadline_start``/``budget`` default to "now" / the env
+    budget so a direct caller is bounded too; the delta path threads its own.
+    """
+    if budget is None:
+        budget = _fetch_budget()
+    if deadline_start is None:
+        deadline_start = time.time()
+    out: list[dict] = []
+    for i in range(0, len(keys), batch_size):
+        # Overall deadline check BETWEEN batches — bound the total delta fetch,
+        # not just each socket read (mirrors ``fetch_all``'s between-page check).
+        if time.time() - deadline_start > budget:
+            raise LibraryUnavailableError(
+                f"Zotero delta fetch exceeded its {budget:.0f}s budget "
+                f"(ZOTERO_WORD_CITE_ZOTERO_FETCH_BUDGET) after {len(out)} item(s); "
+                "treating as a degraded read (full resync / fail-closed)."
+            )
+        chunk = keys[i:i + batch_size]
+        params: dict[str, Any] = {
+            "itemKey": ",".join(chunk),
+            "format": "json",
+            "includeTrashed": "1",
+            "limit": "100",  # chunk ≤ 50 ≤ 100 → one page returns every match
+        }
+        data, _headers = _get_json_headers(build_request("items", params))
+        if not isinstance(data, list):
+            raise LibraryUnavailableError(
+                "Zotero returned a non-list itemKey response during delta sync; "
+                "treating as a degraded read (fail-closed)."
+            )
+        out.extend(data)
+        _progress(f"zotero: delta-fetched {len(out)}/{len(keys)} changed item(s)…")
+    return out
+
+
+def _fetch_deleted_item_keys(since: int) -> list[str]:
+    """Item keys purged since ``since`` (``deleted?since=<v>`` → its ``items`` list).
+
+    A non-dict response is a degraded read and raises
+    :class:`LibraryUnavailableError`; a well-formed response with no ``items``
+    key yields ``[]`` (nothing purged).
+    """
+    data, _headers = _get_json_headers(build_request("deleted", {"since": str(int(since))}))
+    if not isinstance(data, dict):
+        raise LibraryUnavailableError(
+            "Zotero returned a non-dict deleted response during delta sync; "
+            "treating as a degraded read (fail-closed)."
+        )
+    keys = data.get("items")
+    return [k for k in keys if isinstance(k, str)] if isinstance(keys, list) else []
+
+
+def _full_resync(*, top: bool, cache_path: Path) -> list[dict]:
+    """A cold, from-scratch :func:`fetch_all` that (re)seeds the sync cache.
+
+    Reads the library version BEFORE the (multi-minute) full fetch so the
+    persisted watermark is never AHEAD of the snapshot: if items change during
+    the fetch, the next delta re-fetches them (idempotent replace) rather than
+    skipping them.  ``fetch_all`` stays fail-closed — it raises
+    :class:`LibraryUnavailableError` on a degraded read, so no cache is written
+    for a partial library.  If the version cannot be read, the correct full list
+    is still returned but NOT cached (the next call simply resyncs).
+    """
+    version: Optional[int] = None
+    try:
+        version = _read_library_version(top=top)
+    except Exception:  # noqa: BLE001 — watermark read is best-effort
+        version = None
+    items = fetch_all(top=top)  # fail-closed on a degraded read
+    if version is not None:
+        _write_sync_cache(cache_path, version=version, top=top, items=items)
+    return items
+
+
+def synced_fetch_all(
+    *, top: bool = True, cache_path: Optional[str | Path] = None, fresh: bool = False
+) -> list[dict]:
+    """Whole-library read, refreshed INCREMENTALLY against a local disk cache.
+
+    A drop-in for :func:`fetch_all` (returns the same live-item list) that avoids
+    re-walking the entire library when little changed:
+
+    * **No cache** → a full :func:`fetch_all`, persisting the item list + a
+      ``last_synced_version`` watermark.
+    * **Cache present** → try the ``If-Modified-Since-Version`` fast path; a 304
+      returns the cached list with zero further calls.  Otherwise fetch only the
+      changed items (batched) and the purged keys, MERGE onto the cached list
+      (replace/add by key, drop deleted), persist, and return.
+
+    Fails CLOSED on any anomaly in the delta path (see the module-section note):
+    it falls back to a full :func:`fetch_all` rather than ever serving a
+    stale-and-wrong merged cache.  ``cache_path`` overrides the default gitignored
+    location (used by tests for isolation); ``top`` selects the item scope exactly
+    like :func:`fetch_all``.  ``fresh=True`` skips the cache read and forces a cold
+    full resync that ALSO re-seeds the cache at the fresh watermark (so a repair
+    read leaves a fresh cache behind, not the stale one it was run to fix).  The
+    API key is never written to the cache or a log.
+    """
+    cache = Path(cache_path) if cache_path else _default_sync_cache_path(top)
+    if fresh:
+        # Forced cold read + reseed — ignore whatever is on disk (it may be the
+        # very cache the caller is repairing) and rewrite it at the fresh version.
+        return _full_resync(top=top, cache_path=cache)
+    cached = _load_sync_cache(cache, top=top)
+    if cached is None:
+        return _full_resync(top=top, cache_path=cache)
+
+    last_version = cached["version"]
+    cached_items = cached["items"]
+
+    # 1) Fast no-op + changed-key discovery in one conditional request.
+    try:
+        versions, disc_headers = _sync_discovery(last_version, top=top)
+    except Exception:  # noqa: BLE001 — any discovery failure → safe full resync
+        return _full_resync(top=top, cache_path=cache)
+
+    if versions is None:
+        # 304 Not Modified — nothing changed library-wide since the watermark.
+        return _live_items(cached_items)
+    if not isinstance(versions, dict):
+        return _full_resync(top=top, cache_path=cache)
+
+    # The new watermark comes from the discovery response (the version as of the
+    # delta window).  Without it we cannot advance safely → full resync.
+    new_version = _version_from_headers(disc_headers, fallback=None)
+    if new_version is None:
+        return _full_resync(top=top, cache_path=cache)
+
+    # Defensive completeness of the versions object: format=versions carries the
+    # whole delta (no default/max limit), but if a Total-Results header ever
+    # reports more keys than we received, the delta is partial — fail closed.
+    raw_total = disc_headers.get("Total-Results") if isinstance(disc_headers, dict) else None
+    if raw_total is not None:
+        try:
+            if int(raw_total) > len(versions):
+                return _full_resync(top=top, cache_path=cache)
+        except (TypeError, ValueError):
+            return _full_resync(top=top, cache_path=cache)
+
+    changed_keys = list(versions.keys())
+
+    # 2) Full data for changed keys + 3) purged keys.  The batch loop shares ONE
+    # overall wall-clock budget (the same one ``fetch_all`` uses) so a large
+    # pending delta cannot run unbounded — on exceeding it the loop raises and we
+    # fall back to a full resync (itself budget-bounded / fail-closed).
+    delta_deadline = time.time()
+    delta_budget = _fetch_budget()
+    try:
+        fetched = _fetch_items_by_keys(
+            changed_keys, deadline_start=delta_deadline, budget=delta_budget
+        ) if changed_keys else []
+        deleted = _fetch_deleted_item_keys(last_version)
+    except Exception:  # noqa: BLE001 — any delta-fetch failure → safe full resync
+        return _full_resync(top=top, cache_path=cache)
+
+    fetched_by_key: dict[str, dict] = {}
+    for it in fetched:
+        k = _item_key_of(it)
+        if k:
+            fetched_by_key[k] = it
+    deleted_set = set(deleted)
+
+    # Completeness: every reported-changed key must be accounted for — either its
+    # full data was fetched, or it was purged.  A key in NEITHER means the delta
+    # is incomplete; never serve a half-merged cache — fail closed to a resync.
+    for k in changed_keys:
+        if k not in fetched_by_key and k not in deleted_set:
+            return _full_resync(top=top, cache_path=cache)
+
+    # 4) Merge onto the cached list: replace/add changed, drop purged.
+    merged: dict[str, dict] = {}
+    for it in cached_items:
+        k = _item_key_of(it)
+        if not k:
+            # A cached item with no recoverable key is a corrupt cache. Silently
+            # dropping it would PERMANENTLY purge it from the rewritten cache
+            # (unlike every OTHER anomaly here, which fails closed). Fail closed
+            # to a full resync instead, matching the rest of this function.
+            return _full_resync(top=top, cache_path=cache)
+        merged[k] = it
+    merged.update(fetched_by_key)
+    for k in deleted_set:
+        merged.pop(k, None)
+
+    merged_items = list(merged.values())
+    _write_sync_cache(cache, version=new_version, top=top, items=merged_items)
+    return _live_items(merged_items)
 
 
 def search_items(query: str, qmode: Optional[str] = None) -> list[dict]:
@@ -722,11 +1204,9 @@ def library_doi_index(*, refresh: bool = False, max_age_hours: float = 24.0) -> 
         fetched_at = now
         _doi_index_mem = (idx, fetched_at)
 
-        # Write disk cache (best-effort; never raise)
+        # Write disk cache (best-effort; never raise) via the shared atomic writer.
         try:
-            _DOI_INDEX_CACHE.parent.mkdir(parents=True, exist_ok=True)
-            with _DOI_INDEX_CACHE.open("w", encoding="utf-8") as fh:
-                json.dump({"fetched_at": fetched_at, "index": idx}, fh)
+            _atomic_write_json(_DOI_INDEX_CACHE, {"fetched_at": fetched_at, "index": idx})
         except Exception:  # noqa: BLE001
             pass
 
@@ -881,11 +1361,9 @@ def library_index(
         fetched_at = now
         _lib_index_mem = (idx, fetched_at)
 
-        # Write disk cache (best-effort; never raise)
+        # Write disk cache (best-effort; never raise) via the shared atomic writer.
         try:
-            _LIB_INDEX_CACHE.parent.mkdir(parents=True, exist_ok=True)
-            with _LIB_INDEX_CACHE.open("w", encoding="utf-8") as fh:
-                json.dump({"fetched_at": fetched_at, "index": idx}, fh)
+            _atomic_write_json(_LIB_INDEX_CACHE, {"fetched_at": fetched_at, "index": idx})
         except Exception:  # noqa: BLE001
             pass
 
@@ -2057,3 +2535,284 @@ def attach_pdf_to_item(
             return 200 <= (getattr(reg_resp, "status", None) or reg_resp.getcode()) < 300
     except Exception:  # noqa: BLE001 — never break the add path on an attach failure
         return False
+
+
+# ---------------------------------------------------------------------------
+# Version-checked writes (PATCH / trash) — shared-library-safe update primitives
+# ---------------------------------------------------------------------------
+#
+# The CREATE path above (``create_items`` → ``_post_json``) makes concurrency
+# safe with a per-request ``Zotero-Write-Token`` (an idempotency key: replaying a
+# create cannot double-create).  The UPDATE primitives below instead guard with a
+# VERSION PRECONDITION: every write carries ``If-Unmodified-Since-Version:
+# <version>`` so the server refuses (HTTP 412) the write if the object changed
+# since we read it.  A shared group can be edited by a collaborator between our
+# read and our write, and silently clobbering that edit is exactly what a
+# version-checked write prevents.  A 409 ("target library is locked" — a sync in
+# progress) is treated the same way.  Both surface as :class:`ZoteroWriteConflict`
+# so a caller ABORTS that object rather than retry-and-clobber.
+#
+# These back a relation-preserving library de-duplication merge (the ``dedup``
+# module), whose contract is to reproduce Zotero's native "Duplicate Items" merge
+# over the Web API — recording ``relations["dc:replaces"]`` on a surviving master
+# and TRASHING (never purging) the retired duplicates.
+
+
+class ZoteroWriteConflict(RuntimeError):
+    """A version-checked write was refused because the target changed first.
+
+    Raised on HTTP 412 (an ``If-Unmodified-Since-Version`` precondition failed —
+    the item was modified since we read its version) or HTTP 409 (the target
+    library is locked by another sync).  Either way the caller must ABORT that
+    write rather than retry-and-clobber a concurrent edit in the shared group.
+    The item path is named in the message; the API key never is.
+    """
+
+
+def _urlopen_write_with_headers(
+    req: urllib.request.Request,
+    *,
+    timeout: float,
+    retries: int = 1,
+    _sleep=None,
+) -> tuple[bytes, dict]:
+    """Like :func:`_urlopen_retrying` but returns ``(raw_body, headers)``.
+
+    A version-checked write needs the RESPONSE HEADERS: Zotero answers a
+    successful single-object PATCH with ``204 No Content`` (empty body) and the
+    object's new version in ``Last-Modified-Version``.  A thin delegate over the
+    shared :func:`_urlopen_with_headers_retrying` retry loop (which the header-
+    reading read path also uses), so the retry policy lives in ONE place.  A
+    retried PATCH is SAFE: it still carries the original
+    ``If-Unmodified-Since-Version``, so if the first attempt actually applied (and
+    only its response was lost) the retry hits a 412 and fails CLOSED rather than
+    double-applying.  Non-transient errors (incl. 412/409) propagate to the caller
+    for classification.  The request headers (which carry the API key) are never
+    logged or surfaced here.
+    """
+    return _urlopen_with_headers_retrying(
+        req, timeout=timeout, retries=retries, _sleep=_sleep
+    )
+
+
+def _version_from_headers(headers, *, fallback: Optional[int] = None) -> Optional[int]:
+    """Parse ``Last-Modified-Version`` from a write response's headers.
+
+    Returns the int version Zotero reports for the just-written object, or
+    ``fallback`` when the header is absent/unparseable (some proxies strip it).
+    """
+    if not headers:
+        return fallback
+    try:
+        raw = headers.get("Last-Modified-Version")
+    except Exception:  # noqa: BLE001 — header access must never raise here
+        raw = None
+    if raw is None:
+        return fallback
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _patch_json(
+    path: str,
+    body: Any,
+    *,
+    if_unmodified_since_version: int,
+    extra_headers: Optional[dict[str, str]] = None,
+    timeout: float = 15.0,
+) -> Optional[int]:
+    """PATCH ``body`` (a PARTIAL item update) to a library path, version-checked.
+
+    Zotero supports partial item updates via PATCH: only the fields present in
+    ``body`` are changed (the rest of the item is untouched).  The request carries
+    ``If-Unmodified-Since-Version: <version>`` so Zotero rejects the write with
+    HTTP 412 if the item was modified since that version — never silently
+    clobbering a collaborator's concurrent edit in the shared group.  Returns the
+    object's NEW version (from the ``Last-Modified-Version`` response header; a
+    successful single-object PATCH is a 204 with an empty body), or ``None`` if
+    the header was stripped.  Raises :class:`ZoteroWriteConflict` on 412/409 and
+    propagates any other HTTP error.  Builds the URL and auth headers exactly like
+    :func:`_post_json`; the API key appears only in the ``Zotero-API-Key`` header,
+    never in the URL or an exception message.
+    """
+    cfg = zotero_config()
+    if not cfg:
+        missing = ", ".join(_missing_env())
+        raise RuntimeError(
+            f"Zotero credentials not configured; set env var(s): {missing}"
+        )
+
+    prefix = "groups" if cfg["library_type"] == "group" else "users"
+    url = f"{API_BASE}/{prefix}/{cfg['library_id']}/{path.lstrip('/')}"
+
+    data = json.dumps(body).encode("utf-8")
+    headers: dict[str, str] = {
+        "Zotero-API-Key": cfg["api_key"],
+        "Zotero-API-Version": API_VERSION,
+        "Content-Type": "application/json",
+        "If-Unmodified-Since-Version": str(int(if_unmodified_since_version)),
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+
+    req = urllib.request.Request(url, data=data, method="PATCH", headers=headers)
+    try:
+        _body, resp_headers = _urlopen_write_with_headers(req, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        status = getattr(exc, "code", None)
+        if status in (412, 409):
+            # Do NOT chain the original error (its message could echo the URL);
+            # raise a clean, key-free conflict the caller aborts on.
+            raise ZoteroWriteConflict(
+                f"version-checked write to {path!r} refused (HTTP {status}): the "
+                "target changed since it was read, or the library is locked; "
+                "aborting rather than overwriting a concurrent edit."
+            ) from None
+        raise
+    return _version_from_headers(resp_headers, fallback=None)
+
+
+def item_version(item: Any) -> Optional[int]:
+    """Best-effort read of an item's library *version* from a Zotero API object.
+
+    ``format=json`` items carry a top-level ``version``; some shapes nest it under
+    ``data.version``.  Returns the int version or ``None``.  Used to seed the
+    ``If-Unmodified-Since-Version`` precondition on a subsequent write.
+    """
+    if not isinstance(item, dict):
+        return None
+    for candidate in (item.get("version"), (item.get("data") or {}).get("version")):
+        if candidate is not None:
+            try:
+                return int(candidate)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def get_item_children(key: str) -> list[dict]:
+    """ALL child items (notes + attachments) of ``key`` — GET ``items/<key>/children``.
+
+    Returns the raw Zotero item objects (each carrying its own ``version`` and
+    ``data``), or ``[]`` if the item has none.  Used by the ``dedup`` merge to
+    REPARENT a loser's children onto the surviving master before the loser is
+    trashed, so nothing is orphaned — which makes COMPLETENESS load-bearing: a
+    child left unfetched would be silently destroyed when the loser is trashed
+    (then purged).  So this PAGINATES (``limit=100`` + ``start`` until
+    ``Total-Results`` is exhausted) exactly like :func:`fetch_all`, and FAILS
+    CLOSED — raising :class:`LibraryUnavailableError` (the same degraded-read
+    signal, which the merge treats as "children unreadable → do NOT trash this
+    loser") — when the ``Total-Results`` header is missing/unparseable or a page
+    truncates mid-pagination, rather than returning a partial child list that
+    would orphan the rest.  A 404 (the item is already gone) yields ``[]``; any
+    other HTTP error propagates so the merge fails closed.
+    """
+    out: list[dict] = []
+    start = 0
+    expected_total: Optional[int] = None
+    while True:
+        params: dict[str, Any] = {
+            "format": "json", "limit": "100", "start": str(start),
+        }
+        try:
+            data, headers = _get_json_headers(
+                build_request(f"items/{key}/children", params)
+            )
+        except urllib.error.HTTPError as exc:
+            if getattr(exc, "code", None) == 404:
+                return []  # item already gone — it has no children to reparent
+            raise
+
+        raw_total = headers.get("Total-Results")
+        header_ok = False
+        if raw_total is not None:
+            try:
+                expected_total = int(raw_total)
+                header_ok = True
+            except (TypeError, ValueError):
+                header_ok = False
+
+        if not isinstance(data, list):
+            raise LibraryUnavailableError(
+                "Zotero returned a non-list children response; treating as a "
+                "degraded read (fail-closed) rather than a complete child set."
+            )
+        if not data:
+            break
+        out.extend(data)
+        start += len(data)
+
+        if not header_ok:
+            # No authoritative count → cannot confirm every child was fetched.
+            # Fail closed rather than reparent-and-trash on a partial child set.
+            raise LibraryUnavailableError(
+                "Zotero children response is missing/invalid the Total-Results "
+                "header; cannot confirm all children were fetched. Treating as a "
+                "degraded read (fail-closed) so no child is orphaned on trash."
+            )
+        if start >= expected_total:
+            break
+
+    if expected_total is None:
+        # First page empty AND no valid Total-Results — a degraded read, not a
+        # genuinely child-less item (which reports ``Total-Results: 0``).
+        raise LibraryUnavailableError(
+            "Zotero children response is missing the Total-Results header; "
+            "cannot confirm the child set (fail-closed)."
+        )
+    if len(out) != expected_total:
+        # A page returned short mid-pagination — we hold fewer children than the
+        # item has. Fail closed so the loser is not trashed with children left
+        # behind (which a trash-purge would destroy).
+        raise LibraryUnavailableError(
+            f"Zotero children fetch is incomplete: got {len(out)} of "
+            f"{expected_total} child item(s). Treating as a degraded read "
+            "(fail-closed) so no child is orphaned on trash."
+        )
+    return out
+
+
+def patch_item_fields(
+    key: str, fields: dict, *, version: int, timeout: float = 15.0
+) -> Optional[int]:
+    """Version-checked PARTIAL update of item ``key`` with ``fields``.
+
+    Thin wrapper over :func:`_patch_json` (single-item PATCH).  ``fields`` is a
+    partial item-data dict — only the keys present are changed.  ``version`` is
+    the item's current version (from :func:`get_item` via :func:`item_version`);
+    the write carries it as ``If-Unmodified-Since-Version`` and raises
+    :class:`ZoteroWriteConflict` if the item changed first.  Returns the new
+    version (or ``None`` if the response header was stripped).
+    """
+    return _patch_json(
+        f"items/{key}", fields, if_unmodified_since_version=version, timeout=timeout
+    )
+
+
+def trash_item(key: str, *, version: int, timeout: float = 15.0) -> Optional[int]:
+    """Move item ``key`` to the trash (``deleted: 1``) — REVERSIBLE, not purged.
+
+    A version-checked PATCH, NOT a hard ``DELETE``: the item stays recoverable
+    from Zotero's trash and its URI stays valid (so a ``dc:replaces`` relation
+    pointing at it keeps resolving a merged-away citation to the master).  Raises
+    :class:`ZoteroWriteConflict` on a concurrent edit.  This is how the ``dedup``
+    merge retires a duplicate without destroying it.
+    """
+    return patch_item_fields(key, {"deleted": 1}, version=version, timeout=timeout)
+
+
+def reparent_item(
+    child_key: str, new_parent_key: str, *, version: int, timeout: float = 15.0
+) -> Optional[int]:
+    """Re-attach child item ``child_key`` under a new parent (``parentItem``).
+
+    Version-checked PATCH used by the ``dedup`` merge to move a loser's
+    notes/attachments onto the surviving master BEFORE the loser is trashed, so
+    nothing is orphaned.  Raises :class:`ZoteroWriteConflict` on a concurrent
+    edit.
+    """
+    return patch_item_fields(
+        child_key, {"parentItem": new_parent_key}, version=version, timeout=timeout
+    )
