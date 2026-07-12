@@ -39,7 +39,7 @@ def body(*runs: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
 
     Each positional arg can be:
     - a str  => plain normal run
-    - a dict => run spec with keys ``text``, ``bold``, ``italic``
+    - a dict => run spec with keys ``text``, ``bold``, ``italic``, ``underline``
     """
     run_list: List[Dict[str, Any]] = []
     for r in runs:
@@ -75,7 +75,8 @@ def new_doc(
 
           ``runs``
               List of run dicts, each with ``text`` (required), ``bold``
-              (bool, default False), ``italic`` (bool, default False).
+              (bool, default False), ``italic`` (bool, default False),
+              ``underline`` (bool, default False).
           ``align``
               ``"left"``, ``"center"``, or ``"both"`` / ``"justify"``.
               Defaults to JUSTIFY when *justify* is True.
@@ -166,6 +167,13 @@ def new_doc(
             run = para.add_run(rs.get("text", ""))
             run.bold = rs.get("bold", False)
             run.italic = rs.get("italic", False)
+            # Underline only when requested: python-docx renders ``run.underline = False``
+            # as an explicit ``<w:u w:val="none"/>``, which (unlike bold/italic's
+            # ``w:val="0"``) reads as a real "underline off" override — it would emit a
+            # redundant marker on every plain run AND defeat formatdiff's underline-drop
+            # detection. Absent key -> no ``<w:u>`` at all (byte-identical to the old path).
+            if rs.get("underline"):
+                run.underline = True
             run.font.name = font
             run.font.size = Pt(size_pt)
 
