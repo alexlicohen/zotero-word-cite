@@ -1480,3 +1480,155 @@ class TestNumericRangeExpansion:
         # reversed / absurdly large ranges fall back to endpoints (no explosion)
         assert unify._numeric_marker_targets("[9-2]") == [9, 2]
         assert unify._numeric_marker_targets("[1-9999]") == [1, 9999]
+
+
+# ===========================================================================
+# Grouped co-citation: "[1,2]" cites TWO references — convert ONCE, cite BOTH.
+# ===========================================================================
+
+class TestGroupedMarkerCoCitation:
+    """Regression for the dropped-co-citation bug: a grouped numeric marker like
+    "[1,2]" is carried on BOTH cited references' plan links. The old per-REFERENCE
+    apply loop converted the one physical marker once per co-cited ref — ref1 first
+    replaced "[1,2]" with a field citing ONLY ref1, then ref2's pass found the
+    anchor already gone and its co-citation was silently DROPPED ("[1,2]" became a
+    field citing only [1]). apply_unification must now convert each physical marker
+    ONCE into a single field citing EVERY grouped reference in printed order, and
+    apply citelink's all-or-nothing policy when a member is not accepted/keyed."""
+
+    def _grouped_draft(self, tmp_path):
+        p = tmp_path / "grouped.docx"
+        new_doc(p, [
+            "Tuberous sclerosis is associated with ASD [1,2].",
+            "References",
+            "1. Smith J. Tuberous sclerosis and autism. J Neurol. 2020;10:1-5.",
+            "2. Jones B, et al. Cortical tubers in TSC. Brain. 2019;50:200-210.",
+        ])
+        return p
+
+    def _base_patches(self, monkeypatch):
+        # Smith -> HIGH + in-library (SMITHKEY); Jones -> MEDIUM + missing (created
+        # as NEW_jones2019 when accepted). Real replace_text_with_zotero_field is
+        # left in place so the SEAM is exercised (the field is actually written and
+        # read back), except where a test explicitly records the splice call.
+        monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve)
+        monkeypatch.setattr(
+            unify.zotero, "library_index",
+            lambda **kw: {"doi": {"10.1/smith2020": "SMITHKEY"}, "pmid": {}, "title": {}})
+        monkeypatch.setattr(unify.citecheck, "ensure_retraction_db", lambda **kw: (None, None))
+        monkeypatch.setattr(unify.zotero, "key_can_write_status", lambda: True)
+        monkeypatch.setattr(unify.zotero, "key_can_write", lambda: True)
+        monkeypatch.setattr(unify.zotero, "item_uri",
+                            lambda key: "http://zotero.org/groups/2504198/items/" + key)
+        monkeypatch.setattr(
+            unify.zotero, "create_items",
+            lambda metas, **k: {
+                "created": [{"title": m.get("title", ""),
+                             "key": "NEW_" + (m.get("doi", "") or "").split("/")[-1],
+                             "doi": m.get("doi", "")}
+                            for m in metas if isinstance(m, dict)],
+                "skipped_existing": [], "failed": []})
+
+    # (a) both refs accepted -> ONE field citing BOTH, in printed order, via the
+    #     REAL write seam (read back from the saved docx).
+    def test_grouped_marker_cites_both_refs_in_order(self, tmp_path, monkeypatch):
+        p = self._grouped_draft(tmp_path)
+        self._base_patches(monkeypatch)
+        plan = unify.plan_unification(p)
+        out = tmp_path / "grouped_out.docx"
+        report = unify.apply_unification(
+            p, plan, {"accept": [1], "add_missing": True}, out=out, track=True)
+
+        cites = zoterofield.scan_citations(out)
+        assert len(cites) == 1, f"expected exactly one grouped field, got {cites}"
+        keys = [it["key"] for it in cites[0]["items"]]
+        assert keys == ["SMITHKEY", "NEW_jones2019"], (
+            f"grouped '[1,2]' must cite BOTH refs in printed order [1,2] — got {keys}; "
+            "the old per-ref loop dropped ref 2 and cited only [1]")
+        # Per-marker counting contract: one physical marker == +1 (NOT +2).
+        assert report["replaced"] == 1, (
+            f"replaced must count the physical marker once, got {report['replaced']}")
+        assert report["unresolved_in_doc"] == [], report["unresolved_in_doc"]
+
+    # (b) only ref1 accepted -> all-or-nothing: marker LEFT PLAIN + reported, never
+    #     converted to a lossy field citing only [1].
+    def test_grouped_marker_all_or_nothing_when_member_unaccepted(self, tmp_path, monkeypatch):
+        p = self._grouped_draft(tmp_path)
+        self._base_patches(monkeypatch)
+        plan = unify.plan_unification(p)
+        out = tmp_path / "grouped_partial.docx"
+        # accept=[] -> Smith (high/auto) accepted, Jones (medium) NOT accepted.
+        report = unify.apply_unification(p, plan, {"accept": []}, out=out, track=True)
+
+        assert zoterofield.scan_citations(out) == [], (
+            "grouped '[1,2]' with an unaccepted member must NOT be converted "
+            "(all-or-nothing) — leaving a field citing only [1] would silently "
+            "drop the co-citation")
+        assert report["replaced"] == 0
+        markers = {u.get("marker") for u in report["unresolved_in_doc"]}
+        assert "[1,2]" in markers, (
+            f"the left-plain marker must be reported: {report['unresolved_in_doc']}")
+        reasons = " ".join(u.get("reason", "") for u in report["unresolved_in_doc"])
+        assert "all-or-nothing" in reasons
+
+    # (c) a single "[1]" marker still converts normally.
+    def test_single_numeric_marker_still_converts(self, tmp_path, monkeypatch):
+        p = tmp_path / "single.docx"
+        new_doc(p, [
+            "Prior work supports this model [1].",
+            "References",
+            "1. Smith J. Tuberous sclerosis and autism. J Neurol. 2020;10:1-5.",
+        ])
+        self._base_patches(monkeypatch)
+        plan = unify.plan_unification(p)
+        out = tmp_path / "single_out.docx"
+        report = unify.apply_unification(p, plan, {"accept": []}, out=out, track=True)
+
+        cites = zoterofield.scan_citations(out)
+        assert len(cites) == 1, f"single '[1]' should convert to one field, got {cites}"
+        assert [it["key"] for it in cites[0]["items"]] == ["SMITHKEY"]
+        assert report["replaced"] == 1
+
+    # (d) counting contract, made explicit: one grouped marker == ONE splice call
+    #     carrying BOTH keys == replaced += 1 (never once per cited reference).
+    def test_replaced_counts_markers_not_references(self, tmp_path, monkeypatch):
+        p = self._grouped_draft(tmp_path)
+        self._base_patches(monkeypatch)
+        calls = []
+        monkeypatch.setattr(
+            unify.zoterofield, "replace_text_with_zotero_field",
+            lambda doc, anchor, keys, **kw:
+                calls.append({"anchor": anchor, "keys": list(keys)}) or doc)
+        plan = unify.plan_unification(p)
+        out = tmp_path / "count_out.docx"
+        report = unify.apply_unification(
+            p, plan, {"accept": [1], "add_missing": True}, out=out, track=True)
+
+        assert len(calls) == 1, (
+            f"a grouped marker must splice EXACTLY ONCE (one field), got {calls}")
+        assert calls[0]["anchor"] == "[1,2]"
+        assert calls[0]["keys"] == ["SMITHKEY", "NEW_jones2019"], (
+            f"the single field must carry BOTH refs in order, got {calls[0]['keys']}")
+        assert report["replaced"] == 1, (
+            f"replaced counts the marker once, not once per reference: "
+            f"{report['replaced']}")
+
+    # (e) BACK-COMPAT: an old/serialized plan carries no printed_number. The
+    #     apply pass falls back to reflist order (== printed order for a standard
+    #     ascending bibliography) and keeps the all-or-nothing count guard.
+    def test_grouped_marker_legacy_plan_without_printed_number(self, tmp_path, monkeypatch):
+        p = self._grouped_draft(tmp_path)
+        self._base_patches(monkeypatch)
+        plan = unify.plan_unification(p)
+        # Simulate a plan produced BEFORE printed_number existed.
+        for r in plan["references"]:
+            r.pop("printed_number", None)
+        out = tmp_path / "legacy_out.docx"
+        report = unify.apply_unification(
+            p, plan, {"accept": [1], "add_missing": True}, out=out, track=True)
+
+        cites = zoterofield.scan_citations(out)
+        assert len(cites) == 1, f"expected one grouped field, got {cites}"
+        assert [it["key"] for it in cites[0]["items"]] == ["SMITHKEY", "NEW_jones2019"], (
+            "legacy plan (no printed_number) must still cite BOTH refs, in reflist order")
+        assert report["replaced"] == 1

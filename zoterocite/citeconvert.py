@@ -925,10 +925,19 @@ def convert_to_zotero(
       ``unmatched`` with ``would_add=True``.
     * Manual/plain-text references are never auto-converted (unreliable); they are
       reported in ``manual_skipped``.
+    * Grouped field, partial match → ALL-OR-NOTHING. A single foreign field that
+      co-cites several works is converted only when EVERY member matches. If any
+      co-cited member is unmatched, the WHOLE field is left foreign (so the
+      co-citation is not silently thinned — '(A,B)' never becomes '(A)') and the
+      field is recorded in ``left_unconverted`` with reason
+      ``"left unconverted: co-cited member unmatched"``; the missing member(s)
+      also appear in ``unmatched``. This mirrors the grouped-marker policy of
+      :func:`citelink.apply_cite_link`. Add the missing member to the library and
+      re-run to convert the group.
 
-    Returns ``{out, converted, unmatched, manual_skipped, deduped, classification}``
-    and writes the converted doc to ``out`` (nothing is saved when ``out`` is None
-    → dry-run/report only).
+    Returns ``{out, converted, unmatched, left_unconverted, manual_skipped,
+    deduped, classification}`` and writes the converted doc to ``out`` (nothing is
+    saved when ``out`` is None → dry-run/report only).
     """
     from . import zotero
     from .zoterofield import DEFAULT_STYLE
@@ -941,16 +950,23 @@ def convert_to_zotero(
 
     converted: List[dict] = []
     unmatched: List[dict] = []
+    left_unconverted: List[dict] = []
     manual_skipped: List[dict] = []
     deduped = 0
 
     # Dedup state:
-    #   match_cache: doi/title key -> {"key","uri","itemdata"} match, or _MISS.
-    #   already_zotero: doi/title keys of works ALREADY cited via Zotero in the
-    #     doc — we must not re-add/re-convert these (leave the existing cite).
+    #   match_cache: doi/(widened-)title key -> {"key","uri","itemdata"}, or _MISS.
+    #   already_zotero: doi/(widened-)title keys of works ALREADY cited via Zotero
+    #     in the doc — we must not re-add/re-convert these (leave the existing cite).
+    #   already_zotero_titles: the TITLE-only keys of those same works, a shadow
+    #     set that lets a DOI-less foreign field still dedup against an existing
+    #     Zotero field whose CSL-JSON lacks the year/authors the widened key
+    #     embeds (see _is_already_zotero) — so widening the key (FIX 2) can't
+    #     spuriously re-convert an already-converted cite.
     match_cache: Dict[str, object] = {}
     title_cache: Dict[str, list] = {}
     already_zotero: set = set()
+    already_zotero_titles: set = set()
 
     # Resilient cached library index (DOI→PMID→title), loaded ONCE per run for
     # OFFLINE matching. ``strict=False`` degrades a failed read to the DOI cache
@@ -969,6 +985,11 @@ def convert_to_zotero(
                 ck = _meta_cache_key(meta)
                 if ck:
                     already_zotero.add(ck)
+                # Shadow the TITLE-only key so a DOI-less foreign field can still
+                # dedup against this existing Zotero cite even when the two carry
+                # year/authors asymmetrically (see _is_already_zotero).
+                if meta.get("title"):
+                    already_zotero_titles.add(_tk(meta["title"]))
 
     fields = _iter_fields(root)
     # detect manual refs once for reporting
@@ -1017,7 +1038,9 @@ def convert_to_zotero(
             # deduped and resolve it like any library item; the WHOLE field is
             # skipped after the loop only when EVERY item is already-Zotero (a pure
             # duplicate of existing cites — see the n_fresh check below).
-            already = bool(cache_key and cache_key in already_zotero)
+            already = _is_already_zotero(
+                meta, cache_key, already_zotero, already_zotero_titles
+            )
             if already:
                 deduped += 1
 
@@ -1080,8 +1103,30 @@ def convert_to_zotero(
             if not already:
                 n_fresh += 1
 
-        if not resolved_keys:
-            continue  # nothing matched for this field — leave it untouched
+        if any_miss:
+            # ALL-OR-NOTHING for a grouped foreign field — mirrors the grouped-
+            # marker policy citelink.apply_cite_link already owns (if ANY cited
+            # member is unresolved, the whole marker is left untouched). If any
+            # co-cited member is unmatched here, leave the WHOLE field foreign so
+            # the co-citation at this location survives INTACT. Converting only
+            # the matched members would silently drop the unmatched one from the
+            # sentence — '(A,B)' would become '(A)' — a data loss inconsistent
+            # with a standalone unmatched cite, which is left untouched. The
+            # unmatched member(s) are already recorded in ``unmatched``; when at
+            # least one member DID match (a PARTIAL group), also record the
+            # field-level skip so the caller sees the group was held intact until
+            # the missing member is added to the library.
+            if resolved_keys:
+                left_unconverted.append({
+                    "manager": manager,
+                    "location": f["carrier"],
+                    "keys": resolved_keys,
+                    "reason": "left unconverted: co-cited member unmatched",
+                })
+            # (resolved_keys empty => a fully-unmatched field; every member is
+            # already reported per-member in ``unmatched``, so there is nothing
+            # further to record. Either way, leave the field foreign.)
+            continue
         if n_fresh == 0:
             # Every resolved item is already cited via Zotero elsewhere — this
             # whole field is a pure duplicate; leave the existing cites untouched.
@@ -1138,6 +1183,7 @@ def convert_to_zotero(
         "out": None,
         "converted": converted,
         "unmatched": unmatched,
+        "left_unconverted": left_unconverted,
         "manual_skipped": manual_skipped,
         "deduped": deduped,
         "classification": classify_citation_sources(path),
@@ -1158,9 +1204,80 @@ def _tk(title: str) -> str:
     return "title:" + _normalize_title(title)
 
 
+def _meta_disambiguators(meta: dict) -> Tuple[str, str]:
+    """``(year4, first_author_token)`` for a meta, derived with the SAME rules
+    :func:`_match_in_library` uses to tell two same-title candidates apart —
+    so the DOI-less cache key can embed exactly those discriminators and two
+    DISTINCT same-title works never collapse in the per-run ``match_cache``.
+
+    * ``year4`` — the first run of four consecutive digits in ``meta["year"]``,
+      the byte-identical digit-scan :func:`_match_in_library` runs over a
+      candidate's ``date`` (see the ``cand_year`` loop). Applying it to the meta
+      too means a foreign meta's raw year and a Zotero CSL meta's issued-derived
+      year normalise identically (``"2020"`` / ``"c2020"`` / ``"2020-05"`` →
+      ``"2020"``), which is what keeps the cross-source ``already_zotero`` dedup
+      aligned once the key is widened.
+    * ``first_author_token`` — ``meta["authors"][0]`` split on whitespace, first
+      token, lowercased — byte-identical to :func:`_match_in_library`'s
+      ``first_author`` derivation (an EndNote / CSL ``"Surname Initials"`` string
+      reduces to the lowercased surname).
+    """
+    year4 = ""
+    for ch in str(meta.get("year") or ""):
+        if ch.isdigit():
+            year4 += ch
+            if len(year4) == 4:
+                break
+        else:
+            year4 = ""
+    if len(year4) != 4:
+        year4 = ""
+    first_author = ""
+    if meta.get("authors"):
+        first_author = (meta["authors"][0].split() or [""])[0].lower()
+    return year4, first_author
+
+
 def _meta_cache_key(meta: dict) -> Optional[str]:
     if meta.get("doi"):
         return _dk(meta["doi"])
     if meta.get("title"):
+        year4, first_author = _meta_disambiguators(meta)
+        if year4 or first_author:
+            # Widen the DOI-less key with the SAME discriminators the matcher
+            # uses (see _meta_disambiguators): two distinct same-title works
+            # (different year / first author) must NOT share a match_cache slot
+            # and reference-merge to whichever resolved first.
+            return _tk(meta["title"]) + "|" + year4 + "|" + first_author
+        # No discriminators available on this meta — fall back to a title-only
+        # key (the pre-widening behaviour). Two title-only metas of the same
+        # title still share a slot; that is the both-absent case handled by the
+        # already_zotero title shadow in _is_already_zotero.
         return _tk(meta["title"])
     return None
+
+
+def _is_already_zotero(
+    meta: dict,
+    cache_key: Optional[str],
+    already_zotero: set,
+    already_zotero_titles: set,
+) -> bool:
+    """Is *meta* a work ALREADY cited via a live Zotero field elsewhere?
+
+    Exact (widened) key match first. Then — ONLY for a DOI-less meta — a
+    TITLE-only fallback against the ``already_zotero_titles`` shadow set. The
+    fallback preserves the pre-widening (title-only) dedup so that widening the
+    match_cache key (FIX 2) does not spuriously RE-CONVERT a work already cited
+    via Zotero whose stored CSL-JSON happens to lack year/authors: without it,
+    an existing title-only Zotero key would no longer match a foreign field of
+    the same work that DOES carry year/first-author. A DOI-bearing meta is never
+    deduped on title (it can be matched reliably by its identifier), matching the
+    old behaviour where a meta with a DOI keyed on the DOI alone.
+    """
+    if cache_key and cache_key in already_zotero:
+        return True
+    title = meta.get("title")
+    if title and not meta.get("doi"):
+        return _tk(title) in already_zotero_titles
+    return False

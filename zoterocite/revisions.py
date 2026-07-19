@@ -109,17 +109,48 @@ def _wrap_run_as_deletion(r, ids, author, date) -> None:
         t.tag = qn("w:delText")
 
 
+# Run children that carry VISIBLE CONTENT Word renders in the accepted view. The
+# whole-paragraph strike (:func:`_replace_para_text`) must wrap a run bearing ANY of
+# these as a deletion — else the run survives unstruck and, since the replacement
+# <w:ins> is appended at paragraph END, is repositioned BEFORE the inserted text: a
+# standalone <w:tab>/<w:br>/<w:cr> then becomes a STRAY LEADING tab/break and the
+# accepted view no longer equals new_text (its original position is lost). <w:t> was
+# already covered; the standalone flow/format runs (tab/break/cr + non-breaking
+# hyphen + symbol) were the leak. NOTE noBreakHyphen/sym contribute no chars to
+# :func:`zoterocite.paras.paragraph_text` but Word still renders them, so striking
+# them keeps the accepted DOCUMENT == new_text.
+_STRIKE_CONTENT_TAGS = (qn("w:t"), qn("w:tab"), qn("w:br"), qn("w:cr"),
+                        qn("w:noBreakHyphen"), qn("w:sym"))
+# A comment/annotation ANCHOR run is NEVER struck: wrapping it in <w:del> tracked-
+# DELETES the comment's anchor point (a tracked-change-fidelity break — the comment
+# would detach when the deletion is accepted). Excluded even if it somehow co-carries
+# visible content, so the rejected view stays byte-identical to the original.
+_COMMENT_ANCHOR_TAGS = (qn("w:commentReference"), qn("w:annotationRef"))
+
+
+def _run_has_strikeable_content(r) -> bool:
+    """True if run ``r`` must be wrapped as a tracked deletion by the whole-paragraph
+    strike: it carries visible content Word renders (text OR a standalone tab / break /
+    carriage-return / non-breaking hyphen / symbol) and is NOT a comment/annotation
+    anchor run. See :data:`_STRIKE_CONTENT_TAGS` / :data:`_COMMENT_ANCHOR_TAGS`."""
+    if any(r.find(t) is not None for t in _COMMENT_ANCHOR_TAGS):
+        return False
+    return any(r.find(t) is not None for t in _STRIKE_CONTENT_TAGS)
+
+
 # -- private batch helper ----------------------------------------------------
 def _replace_para_text(p, new_text: str, ids: _Ids, author: str, date: str,
                        rpr: Optional[etree._Element] = None) -> None:
     """Core del+ins on a paragraph element (in-place, no doc/root needed).
 
-    Wraps each text-bearing run as a tracked deletion, then appends a tracked
-    insertion carrying `new_text` with the preserved first-run rPr.
+    Wraps each VISIBLE-CONTENT run (text, or a standalone tab/break — see
+    :func:`_run_has_strikeable_content`) as a tracked deletion, then appends a tracked
+    insertion carrying `new_text` with the preserved first-run rPr. A comment/
+    annotation anchor run is left untouched so the rejected view round-trips exactly.
     """
     keep_rpr = rpr if rpr is not None else _first_rpr(p)
     for r in list(p.iter(qn("w:r"))):
-        if r.find(qn("w:t")) is not None:
+        if _run_has_strikeable_content(r):
             _wrap_run_as_deletion(r, ids, author, date)
     p.append(_ins(ids, author, date, _make_run(new_text, keep_rpr)))
 

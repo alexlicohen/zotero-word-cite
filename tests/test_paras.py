@@ -87,6 +87,53 @@ def test_tracked_deletion_excluded():
     assert paragraph_text(p) == "keep  tail"
 
 
+def test_struck_tab_excluded_from_accepted_view():
+    # A tracked-STRUCK <w:tab> (under <w:del>) must NOT appear in the accepted view —
+    # exactly like struck <w:t>. (Regression: the tab/br branches used
+    # also_del=False, leaking the struck tab as a stray "\t".)
+    p = etree.Element(qn("w:p"))
+    _run(p, "Aim 1.")
+    d = etree.SubElement(p, qn("w:del"))
+    dr = etree.SubElement(d, qn("w:r"))
+    etree.SubElement(dr, qn("w:tab"))
+    _run(p, "tail")
+    assert paragraph_text(p) == "Aim 1.tail"
+
+
+def test_struck_break_excluded_from_accepted_view():
+    p = etree.Element(qn("w:p"))
+    _run(p, "one")
+    d = etree.SubElement(p, qn("w:del"))
+    dr = etree.SubElement(d, qn("w:r"))
+    etree.SubElement(dr, qn("w:br"))
+    _run(p, "two")
+    assert paragraph_text(p) == "onetwo"
+
+
+def test_inserted_tab_included_in_accepted_view():
+    # A tracked-INSERTED <w:tab> (under <w:ins>) IS in the accepted view (insertions
+    # are kept) — the guard only excludes struck/moved-away content, not insertions.
+    p = etree.Element(qn("w:p"))
+    _run(p, "a")
+    ins = etree.SubElement(p, qn("w:ins"))
+    ir = etree.SubElement(ins, qn("w:r"))
+    etree.SubElement(ir, qn("w:tab"))
+    _run(p, "b")
+    assert paragraph_text(p) == "a\tb"
+
+
+def test_movefrom_tab_excluded_from_accepted_view():
+    # A <w:tab> in a move SOURCE (<w:moveFrom>) is gone from the accepted view (the
+    # source moved away), matching the <w:t> moveFrom handling.
+    p = etree.Element(qn("w:p"))
+    _run(p, "x")
+    mf = etree.SubElement(p, qn("w:moveFrom"))
+    mr = etree.SubElement(mf, qn("w:r"))
+    etree.SubElement(mr, qn("w:tab"))
+    _run(p, "y")
+    assert paragraph_text(p) == "xy"
+
+
 def test_literal_newline_in_wt_preserved():
     # python-docx add_run("a\nb") stores a literal newline inside one <w:t>;
     # it must survive unchanged (not be doubled or stripped).

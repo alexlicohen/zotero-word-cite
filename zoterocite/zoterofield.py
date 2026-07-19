@@ -794,6 +794,31 @@ def _isolate_marker_runs(para: etree._Element, anchor: str):
         spans.append((run, t, text, pos, pos + len(text)))
         pos += len(text)
 
+    # Cross-container guard — MUST run before any mutation below. _text_run_segments
+    # descends through <w:ins>/<w:hyperlink>/<w:sdt> (para.iter(w:r)), so when a
+    # marker straddles a container boundary the runs it overlaps sit under DIFFERENT
+    # parents. The strike/splice step (_wrap_runs_as_del, _splice_field_at_marker)
+    # removes every marker run from a SINGLE parent, so a mixed-parent set raises an
+    # lxml ValueError MID-mutation, corrupting the doc. Detect it here while the tree
+    # is still pristine and refuse cleanly with LookupError (which
+    # _splice_field_at_marker turns into a skippable no-op) instead. Uses the EXACT
+    # same "entirely outside" predicate as the mutation loop, so the overlap set it
+    # checks is identical to the set that loop would touch. Parents are compared by
+    # identity (`is`) — lxml's proxy caching keeps this reliable while refs are held;
+    # id() would not be.
+    overlap_parents: List[etree._Element] = []
+    for run, _t, _text, s0, s1 in spans:
+        if s1 <= start or s0 >= end:
+            continue  # run entirely outside the marker
+        par = run.getparent()
+        if not any(par is q for q in overlap_parents):
+            overlap_parents.append(par)
+    if len(overlap_parents) > 1:
+        raise LookupError(
+            f"anchor {anchor!r} spans an inline container "
+            "(ins/hyperlink/sdt) — not supported"
+        )
+
     marker_runs: List[etree._Element] = []
     parent = para
     insert_idx = None

@@ -1766,14 +1766,99 @@ def to_reference(item: dict) -> "cite.Reference":
 # Write capability (Zotero Web API v3)
 # ---------------------------------------------------------------------------
 
-# CSL type → Zotero itemType mapping (extend as needed)
+# CSL type / Crossref type → Zotero itemType.
+#
+# Real callers (refresolve, unify, endnote) feed the RAW Crossref ``type``
+# string ("journal-article", "book-chapter", "proceedings-article",
+# "posted-content", "report", "monograph", …) straight through — NOT the CSL
+# spelling — so BOTH the CSL spellings and the Crossref spellings must resolve
+# here.  If a non-journal Crossref type is unmapped it silently falls back to
+# ``journalArticle`` and the reference is created with the WRONG item type in the
+# shared group library.
+#
+# Every value here MUST be a real Zotero itemType and MUST have an entry in
+# ``_ITEM_FIELD_MAP`` below, so the payload is reshaped to that type's valid
+# fields (see ``csljson_to_zotero_item`` and the note there on why an unreshaped
+# payload is rejected by the write API).
 _CSL_TYPE_MAP: dict[str, str] = {
+    # CSL type names (unify/endnote default their ``type`` to "article-journal")
     "article-journal": "journalArticle",
     "article": "journalArticle",
     "paper-conference": "conferencePaper",
     "book": "book",
     "chapter": "bookSection",
+    # Crossref ``type`` strings, passed verbatim by refresolve/unify/endnote
+    "journal-article": "journalArticle",
+    "proceedings-article": "conferencePaper",
+    "book-chapter": "bookSection",
+    "posted-content": "preprint",
+    "report": "report",
+    "monograph": "book",
+    "edited-book": "book",
+    "reference-book": "book",
 }
+
+# Per-target-itemType field shaping.
+#
+# Zotero's write API REJECTS any field that is not valid for the item's
+# ``itemType`` (e.g. ``publicationTitle`` on a ``bookSection``), so the flat
+# journal-shaped CSL payload cannot be POSTed as-is under a non-journal type —
+# it must be reshaped to that type's OWN field names, dropping fields that have
+# no valid slot.  (This is the paired half of the ``_CSL_TYPE_MAP`` fix: mapping
+# the type correctly WITHOUT reshaping would turn today's silent wrong-type into
+# a hard write failure.)
+#
+# Each entry maps our carried CSL-ish source keys → the Zotero field name valid
+# for that itemType.  A source key ABSENT from a type's map is DROPPED for that
+# type.  ``journal`` is the CSL container-title and maps to each type's own
+# container field.  Field names are per the Zotero item-type/field schema
+# (journalArticle→publicationTitle, bookSection→bookTitle, conferencePaper→
+# proceedingsTitle, preprint→repository); ``issue`` exists only on
+# ``journalArticle`` among these types, ``pages`` does not exist on ``book``
+# (which uses numPages).  DOI is handled separately — see ``_DOI_NATIVE_TYPES``.
+_ITEM_FIELD_MAP: dict[str, dict[str, str]] = {
+    "journalArticle": {
+        "journal": "publicationTitle",
+        "volume": "volume",
+        "issue": "issue",
+        "pages": "pages",
+    },
+    "conferencePaper": {          # no ``issue`` field on this type
+        "journal": "proceedingsTitle",
+        "volume": "volume",
+        "pages": "pages",
+    },
+    "bookSection": {              # no ``issue``; container is ``bookTitle``
+        "journal": "bookTitle",
+        "volume": "volume",
+        "pages": "pages",
+    },
+    "book": {                     # no ``pages`` (uses numPages), no ``issue``
+        "volume": "volume",
+    },
+    "report": {                   # no ``volume``/``issue``; drop the container
+        "pages": "pages",
+    },
+    "preprint": {                 # container is the ``repository`` name
+        "journal": "repository",
+    },
+}
+
+# itemTypes with a native Zotero ``DOI`` field.  For ANY other itemType the DOI
+# is folded into the universally-valid ``extra`` field as ``"DOI: <doi>"`` (the
+# Zotero-native convention for DOI-less types) rather than emitted as a ``DOI``
+# key the write API would reject.  Kept deliberately CONSERVATIVE: only the
+# three types whose native ``DOI`` field is certain are listed — book/
+# bookSection/report route through ``extra``, which is valid whether or not
+# their schema carries a native DOI (fail-safe on the real-library write path;
+# see the module note on schema verification).
+# Verified against the live Zotero schema (api.zotero.org/schema, 2026-07-18):
+# each of these item types carries a native ``DOI`` field, so we emit it natively
+# (``to_reference`` reads native DOI, not ``extra``).  bookSection/book/report were
+# schema-confirmed to have DOI and promoted here from the earlier extra-only fallback.
+_DOI_NATIVE_TYPES: frozenset[str] = frozenset(
+    {"journalArticle", "conferencePaper", "preprint", "bookSection", "book", "report"}
+)
 
 
 def _post_json(
@@ -1859,8 +1944,12 @@ def key_can_write_status():
     if not cfg:
         return False  # nothing to write with — a definitive no, not "unknown"
 
-    # Use a direct URL to the /keys/ endpoint (not the library-scoped base)
-    url = f"{API_BASE}/keys/{cfg['api_key']}"
+    # Query the key-privileges endpoint by the ``current`` alias so the key value
+    # is carried ONLY in the ``Zotero-API-Key`` header, never in the request-line
+    # URI (which servers/CDNs/proxies routinely log). ``GET /keys/current``
+    # returns the SAME object shape as the deprecated ``/keys/<key>`` form
+    # (Zotero Web API v3), so the ``access`` parsing below is unchanged.
+    url = f"{API_BASE}/keys/current"
     req = urllib.request.Request(
         url,
         method="GET",
@@ -1928,12 +2017,23 @@ def csljson_to_zotero_item(
           "type":    "article-journal",   # CSL type — overrides item_type arg
         }
 
-    The ``type`` key (CSL type) is mapped to a Zotero ``itemType`` via
-    :data:`_CSL_TYPE_MAP`; unknown types fall back to ``item_type``.
+    The ``type`` key (a CSL type name OR a raw Crossref type string) is mapped
+    to a Zotero ``itemType`` via :data:`_CSL_TYPE_MAP`; unknown types fall back
+    to ``item_type``.
+
+    The scalar payload is then RESHAPED per :data:`_ITEM_FIELD_MAP` to the fields
+    valid for that ``itemType`` — Zotero's write API rejects an item that carries
+    a field invalid for its type, so the flat journal-shaped payload cannot be
+    posted verbatim under a non-journal type.  ``journal`` maps to the type's
+    container field (``publicationTitle`` / ``bookTitle`` / ``proceedingsTitle``
+    / ``repository``); fields with no valid slot for the type (e.g. ``issue`` on
+    anything but ``journalArticle``) are dropped.  ``doi`` becomes a native
+    ``DOI`` field for :data:`_DOI_NATIVE_TYPES` and is otherwise folded into
+    ``extra`` as ``"DOI: <doi>"``.
 
     Authors are mapped from ``{"family", "given"}`` → Zotero
     ``{"creatorType": "author", "lastName", "firstName"}``.
-    ``year`` → ``date``, ``journal`` → ``publicationTitle``, ``doi`` → ``DOI``.
+    ``year`` → ``date``.
 
     ``collections`` is a list of Zotero collection keys (not names).
     ``tags`` is a list of tag strings.
@@ -1956,19 +2056,41 @@ def csljson_to_zotero_item(
                 "lastName": last,
             })
 
+    # Common (type-agnostic) fields — valid for every target itemType.
     item: dict[str, Any] = {
         "itemType": zotero_type,
         "title": (meta.get("title") or "").strip(),
         "creators": creators,
         "date": str(meta["year"]).strip() if meta.get("year") else "",
-        "DOI": (meta.get("doi") or "").strip(),
-        "publicationTitle": (meta.get("journal") or "").strip(),
-        "volume": str(meta.get("volume") or "").strip(),
-        "issue": str(meta.get("issue") or "").strip(),
-        "pages": (meta.get("pages") or "").strip(),
         "collections": list(collections) if collections else [],
         "tags": [{"tag": t} for t in (tags or [])],
     }
+
+    # Reshape the remaining scalar fields to the TARGET itemType's own field
+    # names, dropping any that have no valid slot for that type.  Emitting a
+    # field invalid for the itemType (e.g. ``publicationTitle`` on a
+    # ``bookSection``) makes Zotero's write API reject the whole item, so the
+    # flat journal-shaped payload must never be posted verbatim under a
+    # non-journal type.  (For ``journalArticle`` the map reproduces the previous
+    # payload exactly — that path is unchanged.)
+    source_scalars = {
+        "journal": (meta.get("journal") or "").strip(),
+        "volume": str(meta.get("volume") or "").strip(),
+        "issue": str(meta.get("issue") or "").strip(),
+        "pages": (meta.get("pages") or "").strip(),
+    }
+    for src_key, zotero_field in _ITEM_FIELD_MAP.get(zotero_type, {}).items():
+        item[zotero_field] = source_scalars[src_key]
+
+    # DOI: native field only where the itemType has one; otherwise fold into the
+    # universally-valid ``extra`` field so a non-journal item never carries a
+    # ``DOI`` key that the write API would reject.
+    doi = (meta.get("doi") or "").strip()
+    if zotero_type in _DOI_NATIVE_TYPES:
+        item["DOI"] = doi
+    elif doi:
+        item["extra"] = f"DOI: {doi}"
+
     return item
 
 
@@ -1983,19 +2105,39 @@ def ensure_collection(name: str) -> str:
     """
     name_norm = name.strip()
 
-    # Paginate through all collections
+    # Paginate through all collections. The EMPTY page is the PRIMARY, always-safe
+    # terminator: keep requesting until a page comes back empty (Zotero returns []
+    # once ``start`` reaches the end). ``Total-Results`` is only a DEFENSIVE early
+    # exit — a proxy that re-cases/strips or garbles that header must NOT stop
+    # paging early and let us conclude a collection is absent from a truncated
+    # page-1 read. Concluding "absent" from a partial read on this WRITE path is a
+    # fail-OPEN that CREATES a duplicate of a collection that actually exists on a
+    # later page, so this loop fails CLOSED toward "keep looking".
     start = 0
     while True:
         params: dict[str, Any] = {"format": "json", "limit": "100", "start": str(start)}
         data, headers = _get_json_headers(build_request("collections", params))
-        if not isinstance(data, list):
+        if not isinstance(data, list) or not data:
+            # End of pagination (empty page) or a degraded/malformed response —
+            # either way, stop; only NOW may we conclude the collection is absent.
             break
         for coll in data:
             cdata = coll.get("data", {}) if isinstance(coll, dict) else {}
             if (cdata.get("name") or "").strip().lower() == name_norm.lower():
                 return coll["key"]
         start += len(data)
-        if not data or start >= int(headers.get("Total-Results", start)):
+        # Optional early exit once the whole library has been read, parsed
+        # DEFENSIVELY (mirror the hardened ``_probe_items``): a missing/garbled
+        # header leaves ``total`` None → keep paging to the empty-page terminator
+        # rather than raising or breaking early.
+        raw_total = headers.get("Total-Results")
+        total: Optional[int] = None
+        if raw_total is not None:
+            try:
+                total = int(raw_total)
+            except (TypeError, ValueError):
+                total = None
+        if total is not None and start >= total:
             break
 
     # Not found — create it

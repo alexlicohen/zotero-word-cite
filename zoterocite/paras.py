@@ -102,10 +102,16 @@ def paragraph_text(p: etree._Element) -> str:
             if not _drop(node, also_del=True):
                 out.append(node.text or "")
         elif tag == tab_tag:
-            if not _drop(node, also_del=False):
+            # A tracked-STRUCK tab (under w:del / w:moveFrom) is gone from the
+            # accepted view, exactly like a struck <w:t> — so also_del=True, matching
+            # the t_tag branch and views._extract's tab guards. (also_del=False here
+            # leaked a struck tab into the accepted view AND desynced the
+            # revisions._plain_text_mask backstop, force-refusing granular edits.)
+            if not _drop(node, also_del=True):
                 out.append("\t")
         elif tag in br_tags:
-            if not _drop(node, also_del=False):
+            # Same as the tab branch: a struck break is excluded from the accepted view.
+            if not _drop(node, also_del=True):
                 out.append("\n")
     return "".join(out)
 

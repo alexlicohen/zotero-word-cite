@@ -319,15 +319,9 @@ def is_plausible_id(csl_id: str) -> bool:
     return True
 
 
-def _online_exists(csl_id: str, timeout: float = 4.0) -> Optional[bool]:
-    """Single short GET to the raw CSL file. Returns:
-
-    * ``True``  -> the file exists (HTTP 200),
-    * ``False`` -> the host answered that it does not (HTTP 404),
-    * ``None``  -> *cannot verify* (network unreachable / timeout / other HTTP
-      error). Callers must treat ``None`` as "unknown", never as invalid.
-    """
-    url = f"{RAW_BASE}/{csl_id}.csl"
+def _probe_csl_url(url: str, timeout: float) -> Optional[bool]:
+    """Single short GET. ``True``/``False`` on a definitive 200/404, ``None``
+    when unverifiable (network unreachable / timeout / other HTTP error)."""
     req = urllib.request.Request(url, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (trusted host)
@@ -338,6 +332,29 @@ def _online_exists(csl_id: str, timeout: float = 4.0) -> Optional[bool]:
         return None  # 403/5xx/etc. -> cannot verify
     except (urllib.error.URLError, OSError):
         return None  # DNS/timeout/offline -> cannot verify
+
+
+def _online_exists(csl_id: str, timeout: float = 4.0) -> Optional[bool]:
+    """Probe the raw CSL file, falling back to the ``dependent/`` subpath.
+
+    Most ids are "independent" styles living at ``master/<id>.csl``, but many
+    real, uncataloged journal styles are "dependent" styles that live at
+    ``master/dependent/<id>.csl`` instead. Returns:
+
+    * ``True``  -> the file exists (HTTP 200) at either location,
+    * ``False`` -> BOTH locations answered a definitive 404,
+    * ``None``  -> *cannot verify* (network unreachable / timeout / other HTTP
+      error) on either probe. Callers must treat ``None`` as "unknown", never
+      as invalid.
+    """
+    root_result = _probe_csl_url(f"{RAW_BASE}/{csl_id}.csl", timeout)
+    if root_result is not False:
+        # True (found) or None (unverifiable) -> return as-is, no second probe.
+        return root_result
+    # Root definitively 404'd; a real dependent style may still live under
+    # dependent/. Its own None ("cannot verify") must stay None, not collapse
+    # to False.
+    return _probe_csl_url(f"{RAW_BASE}/dependent/{csl_id}.csl", timeout)
 
 
 def is_valid_style(csl_id: str, *, online: bool = False) -> bool:

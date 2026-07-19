@@ -163,6 +163,76 @@ class TestIsValidStyleOnline:
 
 
 # ---------------------------------------------------------------------------
+# _online_exists — dependent-style fallback probe
+# ---------------------------------------------------------------------------
+class TestOnlineExistsDependentFallback:
+    def _dispatching_urlopen(self, root_result, dependent_result):
+        """Route the mock response by which URL is requested: root master/<id>.csl
+        vs master/dependent/<id>.csl. Each *_result is ('status', code),
+        ('http_error', code), or ('exc', exception)."""
+        def _fn(req, timeout=4.0):
+            is_dependent = "/dependent/" in req.full_url
+            kind, val = dependent_result if is_dependent else root_result
+            if kind == "exc":
+                raise val
+            if kind == "http_error":
+                raise urllib.error.HTTPError(req.full_url, val, "err", {}, None)
+            resp = MagicMock()
+            resp.status = val
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+        return _fn
+
+    def test_root_404_dependent_200_is_true(self, monkeypatch):
+        monkeypatch.setattr(
+            "zoterocite.csldb.urllib.request.urlopen",
+            self._dispatching_urlopen(("http_error", 404), ("status", 200)),
+        )
+        assert csldb._online_exists("some-dependent-style") is True
+
+    def test_both_404_is_false(self, monkeypatch):
+        monkeypatch.setattr(
+            "zoterocite.csldb.urllib.request.urlopen",
+            self._dispatching_urlopen(("http_error", 404), ("http_error", 404)),
+        )
+        assert csldb._online_exists("totally-made-up-journal") is False
+
+    def test_root_200_never_probes_dependent(self, monkeypatch):
+        def _boom(req, timeout=4.0):
+            if "/dependent/" in req.full_url:
+                raise AssertionError("must not probe dependent/ when root is 200")
+            resp = MagicMock()
+            resp.status = 200
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+        monkeypatch.setattr("zoterocite.csldb.urllib.request.urlopen", _boom)
+        assert csldb._online_exists("brain") is True
+
+    def test_root_404_dependent_unverifiable_is_none(self, monkeypatch):
+        # Root definitively 404s; the dependent probe errors (offline/5xx) ->
+        # overall result must stay None ("cannot verify"), NOT collapse to False.
+        monkeypatch.setattr(
+            "zoterocite.csldb.urllib.request.urlopen",
+            self._dispatching_urlopen(
+                ("http_error", 404), ("exc", urllib.error.URLError("offline"))
+            ),
+        )
+        assert csldb._online_exists("plausible-but-unknown") is None
+
+    def test_root_unverifiable_never_probes_dependent(self, monkeypatch):
+        # Root errors out (cannot verify) -> overall None, and the dependent/
+        # path is never probed (no second HTTP call on an inconclusive root).
+        def _fn(req, timeout=4.0):
+            if "/dependent/" in req.full_url:
+                raise AssertionError("must not probe dependent/ when root is unverifiable")
+            raise urllib.error.URLError("offline")
+        monkeypatch.setattr("zoterocite.csldb.urllib.request.urlopen", _fn)
+        assert csldb._online_exists("plausible-but-unknown") is None
+
+
+# ---------------------------------------------------------------------------
 # style_validation_note (E12) — accepted-but-unverified styles must WARN
 # ---------------------------------------------------------------------------
 class TestStyleValidationNote:

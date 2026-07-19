@@ -122,6 +122,149 @@ class TestCsljsonToZoteroItem:
 
 
 # ---------------------------------------------------------------------------
+# csljson_to_zotero_item — per-itemType field reshaping
+# ---------------------------------------------------------------------------
+
+class TestCsljsonPerTypeReshaping:
+    """The per-itemType field reshaping — the paired half of the type-map fix.
+
+    Real callers (refresolve/unify/endnote) feed the RAW Crossref ``type``
+    string, so non-journal references must resolve to the right Zotero itemType
+    AND be reshaped to that type's own fields.  Zotero's write API rejects any
+    field invalid for an item's ``itemType``, so mapping the type correctly
+    WITHOUT reshaping would turn today's silent wrong-type into a hard write
+    failure.  Each test asserts BOTH the itemType and that the emitted payload
+    contains ONLY schema-valid fields for that type.
+    """
+
+    BASE = {
+        "doi": "10.1000/xyz123",
+        "title": "A Great Work",
+        "authors": [{"family": "Smith", "given": "John A"}],
+        "year": "2023",
+        "journal": "Some Container",
+        "volume": "26",
+        "issue": "4",
+        "pages": "512-520",
+    }
+
+    # Independent restatement of the Zotero item-type/field schema: the fields
+    # this function is PERMITTED to emit per itemType.  Kept deliberately
+    # separate from the source's own maps so a wrong (schema-invalid) mapping in
+    # the source is caught here rather than silently mirrored.  ``DOI`` is native
+    # for every mapped type here — verified against the live Zotero schema
+    # (api.zotero.org/schema, 2026-07-18): journalArticle/conferencePaper/preprint/
+    # bookSection/book/report all carry a native DOI field.
+    _COMMON = {"itemType", "title", "creators", "date", "collections", "tags"}
+    SCHEMA_VALID = {
+        "journalArticle": _COMMON | {"publicationTitle", "volume", "issue", "pages", "DOI"},
+        "conferencePaper": _COMMON | {"proceedingsTitle", "volume", "pages", "DOI"},
+        "bookSection": _COMMON | {"bookTitle", "volume", "pages", "DOI", "extra"},
+        "book": _COMMON | {"volume", "DOI", "extra"},
+        "report": _COMMON | {"pages", "DOI", "extra"},
+        "preprint": _COMMON | {"repository", "DOI"},
+    }
+
+    def _assert_schema_valid(self, item):
+        itype = item["itemType"]
+        allowed = self.SCHEMA_VALID[itype]
+        offenders = set(item) - allowed
+        assert not offenders, (
+            f"{itype} emitted field(s) not valid for the type: {sorted(offenders)}"
+        )
+
+    def test_book_chapter_becomes_book_section(self):
+        item = zotero.csljson_to_zotero_item({**self.BASE, "type": "book-chapter"})
+        assert item["itemType"] == "bookSection"
+        # container maps to bookTitle, NOT publicationTitle
+        assert item["bookTitle"] == "Some Container"
+        assert "publicationTitle" not in item
+        # bookSection has no ``issue`` field
+        assert "issue" not in item
+        # bookSection has a native DOI field (schema-verified) — emitted natively
+        assert item["DOI"] == "10.1000/xyz123"
+        assert "extra" not in item
+        assert item["volume"] == "26"
+        assert item["pages"] == "512-520"
+        self._assert_schema_valid(item)
+
+    def test_proceedings_article_becomes_conference_paper(self):
+        item = zotero.csljson_to_zotero_item({**self.BASE, "type": "proceedings-article"})
+        assert item["itemType"] == "conferencePaper"
+        assert item["proceedingsTitle"] == "Some Container"
+        assert "publicationTitle" not in item
+        assert "issue" not in item                    # conferencePaper has no issue
+        assert item["DOI"] == "10.1000/xyz123"        # native DOI field
+        assert "extra" not in item
+        assert item["volume"] == "26"
+        assert item["pages"] == "512-520"
+        self._assert_schema_valid(item)
+
+    def test_posted_content_becomes_preprint(self):
+        item = zotero.csljson_to_zotero_item({**self.BASE, "type": "posted-content"})
+        assert item["itemType"] == "preprint"
+        assert item["repository"] == "Some Container"
+        for invalid in ("publicationTitle", "volume", "issue", "pages"):
+            assert invalid not in item, invalid
+        assert item["DOI"] == "10.1000/xyz123"        # native DOI field
+        self._assert_schema_valid(item)
+
+    def test_report_type(self):
+        item = zotero.csljson_to_zotero_item({**self.BASE, "type": "report"})
+        assert item["itemType"] == "report"
+        for invalid in ("publicationTitle", "volume", "issue"):
+            assert invalid not in item, invalid
+        assert item["pages"] == "512-520"
+        assert item["DOI"] == "10.1000/xyz123"        # native DOI field (schema-verified)
+        assert "extra" not in item
+        self._assert_schema_valid(item)
+
+    def test_book_variants_become_book(self):
+        for crossref_type in ("monograph", "edited-book", "reference-book", "book"):
+            item = zotero.csljson_to_zotero_item({**self.BASE, "type": crossref_type})
+            assert item["itemType"] == "book", crossref_type
+            for invalid in ("publicationTitle", "issue", "pages"):
+                assert invalid not in item, f"{crossref_type}: {invalid}"
+            assert item["volume"] == "26"
+            assert item["DOI"] == "10.1000/xyz123"     # native DOI field (schema-verified)
+            assert "extra" not in item
+            self._assert_schema_valid(item)
+
+    def test_crossref_journal_article_spelling_maps(self):
+        # refresolve feeds the raw Crossref spelling; it must resolve exactly
+        # like the CSL spelling ("article-journal").
+        item = zotero.csljson_to_zotero_item({**self.BASE, "type": "journal-article"})
+        assert item["itemType"] == "journalArticle"
+
+    def test_journal_article_payload_unchanged(self):
+        # The journalArticle payload must be identical to the pre-fix output
+        # (same keys, same values) — the fix must not perturb the common path.
+        item = zotero.csljson_to_zotero_item({**self.BASE, "type": "journal-article"})
+        assert item == {
+            "itemType": "journalArticle",
+            "title": "A Great Work",
+            "creators": [{"creatorType": "author", "firstName": "John A", "lastName": "Smith"}],
+            "date": "2023",
+            "collections": [],
+            "tags": [],
+            "publicationTitle": "Some Container",
+            "volume": "26",
+            "issue": "4",
+            "pages": "512-520",
+            "DOI": "10.1000/xyz123",
+        }
+        assert "extra" not in item
+
+    def test_all_mapped_types_emit_only_valid_fields(self):
+        # Meta-invariant: EVERY entry in the type map must produce a payload whose
+        # fields are all schema-valid for the resulting itemType — the whole
+        # point of the reshaping (an invalid field is rejected by the write API).
+        for csl_type in zotero._CSL_TYPE_MAP:
+            item = zotero.csljson_to_zotero_item({**self.BASE, "type": csl_type})
+            self._assert_schema_valid(item)
+
+
+# ---------------------------------------------------------------------------
 # key_can_write
 # ---------------------------------------------------------------------------
 
@@ -172,10 +315,11 @@ class TestKeyCanWrite:
     def test_api_key_not_in_library_urls(self, monkeypatch):
         """The API key must not appear in library item/collection request URLs.
 
-        Note: ``key_can_write`` calls ``GET /keys/<key>`` (the key IS the resource
-        path — unavoidable by Zotero API design). We verify that build_request and
-        _post_json, which construct library-scoped URLs, never embed the key there,
-        and that key_can_write does not return or raise with the key value.
+        Note: ``key_can_write`` calls ``GET /keys/current`` (the key travels in the
+        ``Zotero-API-Key`` header, never in the path — see
+        ``test_key_not_in_url_and_status_parsing_unchanged``). We verify here that
+        build_request and _post_json, which construct library-scoped URLs, never
+        embed the key there, and that key_can_write does not return the key value.
         """
         monkeypatch.setenv("ZOTERO_API_KEY", "SECRETKEY999")
         monkeypatch.setenv("ZOTERO_GROUP_ID", "2504198")
@@ -248,6 +392,85 @@ class TestEnsureCollection:
             key = zotero.ensure_collection("Brand New Collection")
 
         assert key == "NEWCOLL"
+
+
+class TestEnsureCollectionPagination:
+    """FIX: ``ensure_collection`` must page to completion even when a proxy strips
+    or garbles the ``Total-Results`` header.
+
+    The old terminator ``start >= int(headers.get('Total-Results', start))`` (a)
+    defaulted a MISSING header to ``start`` → ``start >= start`` broke after page
+    1, and (b) raised ``ValueError`` on a non-integer header. Concluding a
+    collection is ABSENT from a truncated first page is a fail-OPEN on this WRITE
+    path: it then CREATES a duplicate of a collection that actually exists on a
+    later page, littering the shared group. The empty-page terminator fails CLOSED
+    toward "keep looking" — a create happens only after a genuinely empty page.
+    """
+
+    def _setenv(self, monkeypatch):
+        monkeypatch.setenv("ZOTERO_API_KEY", "k")
+        monkeypatch.setenv("ZOTERO_GROUP_ID", "2504198")
+        monkeypatch.delenv("ZOTERO_USER_ID", raising=False)
+
+    @staticmethod
+    def _refuse_create(path, body, **kw):
+        raise AssertionError(
+            "ensure_collection wrongly CREATED a duplicate collection "
+            f"{body!r} that already existed on a later page"
+        )
+
+    def test_missing_total_results_still_pages_to_page2(self, monkeypatch):
+        """TEETH: page 1 is a FULL page (100 collections) with NO Total-Results
+        header; the target 'My Grant' lives on page 2. The old default-to-``start``
+        terminator broke after page 1 (100 >= 100) → target never seen → duplicate
+        create. After: the empty-page terminator keeps paging and returns the
+        page-2 key; ``_post_json`` is never reached.
+
+        Mutation check: restoring ``if not data or start >= int(headers.get(
+        'Total-Results', start)): break`` fires the _post_json guard → RED."""
+        self._setenv(monkeypatch)
+        page1 = [{"key": f"C{i}", "data": {"name": f"Coll {i}"}} for i in range(100)]
+        page2 = [{"key": "TARGETKEY", "data": {"name": "My Grant"}}]
+        seq = iter([(page1, {}), (page2, {}), ([], {})])  # header STRIPPED
+        monkeypatch.setattr(zotero, "_get_json_headers",
+                            lambda req, timeout=15.0: next(seq))
+        monkeypatch.setattr(zotero, "_post_json", self._refuse_create)
+        assert zotero.ensure_collection("My Grant") == "TARGETKEY"
+
+    def test_garbled_total_results_does_not_raise(self, monkeypatch):
+        """A non-integer Total-Results (proxy corruption) must not raise
+        ValueError from ``int(...)``; it is ignored and pagination proceeds to the
+        page-2 match (case-insensitively)."""
+        self._setenv(monkeypatch)
+        page1 = [{"key": f"C{i}", "data": {"name": f"Coll {i}"}} for i in range(100)]
+        page2 = [{"key": "TARGETKEY", "data": {"name": "TSC R01"}}]
+        garbled = {"Total-Results": "not-a-number"}
+        seq = iter([(page1, garbled), (page2, garbled), ([], garbled)])
+        monkeypatch.setattr(zotero, "_get_json_headers",
+                            lambda req, timeout=15.0: next(seq))
+        monkeypatch.setattr(zotero, "_post_json", self._refuse_create)
+        assert zotero.ensure_collection("tsc r01") == "TARGETKEY"
+
+    def test_valid_total_results_early_exit_then_create(self, monkeypatch):
+        """The early-exit optimisation is preserved: with a VALID Total-Results of
+        100 and no match among the 100, the loop stops after page 1 (start >=
+        total) WITHOUT fetching a needless second page, then creates. The single
+        canned page proves no extra fetch (a second _get_json_headers call would
+        StopIteration)."""
+        self._setenv(monkeypatch)
+        page1 = [{"key": f"C{i}", "data": {"name": f"Coll {i}"}} for i in range(100)]
+        seq = iter([(page1, {"Total-Results": "100"})])
+        monkeypatch.setattr(zotero, "_get_json_headers",
+                            lambda req, timeout=15.0: next(seq))
+        created: dict = {}
+
+        def fake_post(path, body, **kw):
+            created["name"] = body[0]["name"]
+            return {"successful": {"0": {"key": "NEWKEY"}}, "failed": {}}
+
+        monkeypatch.setattr(zotero, "_post_json", fake_post)
+        assert zotero.ensure_collection("Nonexistent") == "NEWKEY"
+        assert created["name"] == "Nonexistent"
 
 
 # ---------------------------------------------------------------------------
@@ -1049,6 +1272,34 @@ class TestKeyCanWriteStatus:
         monkeypatch.delenv("ZOTERO_USER_ID", raising=False)
         # Nothing to write WITH is a definitive no, not "could not verify".
         assert zotero.key_can_write_status() is False
+
+    def test_key_not_in_url_and_status_parsing_unchanged(self, monkeypatch):
+        """FIX: the live API key must be carried ONLY in the Zotero-API-Key header,
+        never in the request-line URL (logged by servers/CDNs/proxies).
+        key_can_write_status now GETs ``/keys/current`` (not ``/keys/<key>``); the
+        tri-state parsing is BYTE-IDENTICAL (still returns definitive True here).
+
+        Mutation check: reverting to ``url = f'{API_BASE}/keys/{cfg["api_key"]}'``
+        puts SECRETKEY999 into ``req.full_url`` → this test goes RED."""
+        monkeypatch.setattr(zotero, "_retry_sleep", lambda s: None)
+        monkeypatch.setenv("ZOTERO_API_KEY", "SECRETKEY999")
+        monkeypatch.setenv("ZOTERO_GROUP_ID", "2504198")
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=30.0):
+            captured["url"] = req.full_url
+            captured["hdr"] = req.get_header("Zotero-api-key")
+            return _fake_response({"access": {"groups": {"all": {"write": True}}}})
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            status = zotero.key_can_write_status()
+
+        assert status is True                       # tri-state parsing unchanged
+        assert "SECRETKEY999" not in captured["url"], (
+            f"API key leaked into key_can_write_status URL: {captured['url']}"
+        )
+        assert captured["url"] == "https://api.zotero.org/keys/current"
+        assert captured["hdr"] == "SECRETKEY999"    # key travels in the header only
 
     def test_create_items_unknown_records_truthful_retry_reason(self, monkeypatch):
         # When write-access cannot be verified, create_items fails closed AND the

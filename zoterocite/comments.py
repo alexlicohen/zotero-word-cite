@@ -213,6 +213,13 @@ def list_comments(doc: Docx) -> List[Tuple[int, str, str]]:
     root = doc.read_tree("word/comments.xml")
     res = []
     for c in root.findall(qn("w:comment")):
+        try:
+            cid = int(c.get(qn("w:id")))
+        except (TypeError, ValueError):
+            # Malformed <w:comment> with a missing/non-numeric w:id (dirty or
+            # foreign-tool output): skip that one comment rather than abort the
+            # whole listing with a TypeError.
+            continue
         text = "".join(t.text or "" for t in c.iter(qn("w:t")))
-        res.append((int(c.get(qn("w:id"))), c.get(qn("w:author")) or "", text))
+        res.append((cid, c.get(qn("w:author")) or "", text))
     return res

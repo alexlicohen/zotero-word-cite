@@ -1200,6 +1200,23 @@ def cite_check(
     rw_path: Optional[Path] = None
     if rw_csv:
         rw_path = Path(rw_csv)
+        if not rw_path.exists():
+            # The user explicitly requested this screen with an rw_csv path
+            # that doesn't exist — do NOT silently skip retraction screening
+            # (that would produce a clean-looking result that never ran the
+            # screen the user asked for). Fail loud at ERROR.
+            findings.append(Finding(
+                check="CITE-RW-MISSING",
+                severity="ERROR",
+                message=(
+                    f"Retraction Watch CSV '{rw_path}' was explicitly specified "
+                    f"but does not exist; retraction screening was NOT run. "
+                    f"Provide a valid --rw-csv path or omit it to use the "
+                    f"auto-refreshed cache."
+                ),
+                source=_RW_SOURCE,
+            ))
+            rw_path = None
     elif cited_dois:
         # Auto-refresh the cached DB when missing/stale (network-resilient).
         rw_path, rw_note = ensure_retraction_db(

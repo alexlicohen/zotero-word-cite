@@ -408,6 +408,14 @@ def plan_unification(
             "existing_key": existing_key,
             "retracted": retracted,
             "divergent": divergent,
+            # The reflist entry's PRINTED number (e.g. "3." -> 3). This is exactly
+            # the number a numeric in-text marker uses to cite this reference
+            # (``_link_intext_to_reflist`` keys the link off ``by_number``), so the
+            # apply pass uses it to place each ref at its correct slot inside a
+            # GROUPED marker like "[3,4]" (cite 3 then 4). ``None`` when the entry
+            # carried no parseable numbering (an author-year bibliography), in which
+            # case no numeric marker links to it anyway.
+            "printed_number": _numbering_to_int(entry.get("numbering")),
             "intext_links": list(ref_to_intext.get(entry["index"], [])),
             # F7: carry each linked marker's text/kind (not just its index) so the
             # apply pass can re-locate it in the mutated file. Back-compat:
@@ -703,6 +711,15 @@ def apply_unification(
     dict
         ``{"out", "added", "matched", "replaced", "needs_input",
         "retracted_flagged", "unresolved_in_doc"}``.
+
+        **``replaced`` counts PHYSICAL in-text citation LOCATIONS, not
+        references.** Each is one increment: a converted foreign field
+        (:mod:`citeconvert`), a resolved placeholder, and — crucially — each
+        plain-text in-text MARKER rewritten to a live Zotero field. A GROUPED
+        numeric marker like ``"[3,4]"`` becomes ONE field citing both refs and so
+        increments ``replaced`` by 1 (NOT by 2). This is the marker-granular
+        contract downstream summaries rely on; do not switch it to per-reference
+        without updating every consumer (currently only the CLI summary line).
     """
     decisions = decisions or {}
     if decisions.get("add_missing") is not None:
@@ -845,6 +862,10 @@ def apply_unification(
             "ph": None,
             "title": _meta_title(meta) or ref["input"][:80],
             "ref_index": ref["ref_index"],
+            # Printed reflist number; orders this ref inside a grouped in-text
+            # marker at apply time. ``None`` on old/serialized plans (falls back
+            # to reflist order — see the group-by-marker pass below).
+            "printed_number": ref.get("printed_number"),
         }
         if ref.get("in_library") and ref.get("existing_key"):
             placement["key"] = ref["existing_key"]
@@ -1027,11 +1048,15 @@ def apply_unification(
 
     doc = zoterofield.Docx(rewrite_src)
     root = doc.read_tree(zoterofield.DOCUMENT)
-    # One anchor index for every uniqueness check below: each placement would
-    # otherwise re-walk the whole document (O(placements*doc)). Each conversion
-    # replaces only its own marker text with a "({key})" field render that contains
-    # no other (distinct) marker, so the snapshot stays valid across placements; the
-    # per-occurrence splice in replace_text_with_zotero_field still reads live text.
+    # One anchor index for every uniqueness check below: each marker would
+    # otherwise re-walk the whole document (O(markers*doc)). Each PHYSICAL marker
+    # is now converted EXACTLY ONCE (the group-by-marker pass below), replacing
+    # only its own marker text with a "(key; ...)" field render that contains no
+    # other (distinct) marker, so this snapshot's per-marker occurrence count stays
+    # valid across the whole loop; the splice in replace_text_with_zotero_field
+    # still reads live text. (The old per-reference loop converted a grouped marker
+    # once per co-cited ref, so the SAME anchor was re-checked against this stale
+    # snapshot after its own conversion — the trap the group-by-marker pass closes.)
     from .paras import ParaIndex
     _para_index = ParaIndex(root)
 
@@ -1066,46 +1091,167 @@ def apply_unification(
     # skip those markers below — only manual/foreign-text cites should be converted.
     already_live = zoterofield.existing_renderings(root)
 
-    # in-text markers for accepted references
+    # in-text markers for accepted references — GROUPED BY PHYSICAL MARKER.
+    #
+    # A grouped numeric marker like "[3,4]" is carried on BOTH ref3's and ref4's
+    # ``intext_markers`` (``_link_intext_to_reflist`` links it to every cited
+    # number). The old per-REFERENCE loop converted that one physical marker once
+    # per co-cited ref: ref3 first replaced "[3,4]" with a field citing ONLY ref3,
+    # then ref4's pass found the anchor gone and its co-citation was silently
+    # DROPPED — "[3,4]" became a field citing only [3]. We now convert each
+    # PHYSICAL marker EXACTLY ONCE into a single field citing ALL its grouped
+    # references, in the marker's printed order — mirroring
+    # ``citelink.apply_cite_link``'s all-or-nothing grouped-marker policy: if any
+    # cited number is not accepted-and-keyed, the WHOLE marker is left as plain
+    # text and reported, never converted to a lossy subset.
+    #
+    # First pass: bucket every accepted, keyed, non-placeholder placement by the
+    # identity of the physical inventory marker it resolves to (ref3 and ref4 both
+    # resolve to the SAME marker object, so ``id(marker)`` groups them). Author-year
+    # markers link to a single reference, so they form natural singleton groups.
+    marker_groups: Dict[int, dict] = {}
     for pl in placements:
-        if pl["key"] is None or pl["is_ph"]:
+        if pl["is_ph"]:
             continue
-        key = pl["key"]
-        idata = _itemdata_from_meta(pl["meta"], key)
-        # Degrade-safe: a matched-key placement under a DEGRADED read (offline /
-        # creds missing) must still write the field (carries the KEY; Word rebinds
-        # the URI on Refresh) rather than crash on item_uri. See zotero single owner.
-        uri = zotero.item_uri_offline_safe(key)
         # F7: resolve each linked marker against the inventory of the MUTATED file
         # (rewrite_src). Prefer the plan-carried marker text (index-shift-proof);
         # fall back to the raw plan index only for old/serialized plans that lack
-        # ``intext_markers``. ``_dedup_markers`` keeps each physical marker once.
+        # ``intext_markers``. Placements with ``key is None`` (accepted but not
+        # keyable — e.g. create failed) are KEPT in the group so the all-or-nothing
+        # check below sees the cited number is unwritable and refuses the marker.
         for marker in _resolve_link_markers(pl, intext_by_text, intext_by_index):
-            anchor = marker["text"]
-            if anchor.strip() in already_live:
-                # Already a live Zotero field — leave it untouched (re-citing would
-                # clobber the managed field and lose its rendered text).
-                continue
-            if not _anchor_is_unique(anchor):
+            g = marker_groups.get(id(marker))
+            if g is None:
+                g = {"marker": marker, "members": []}
+                marker_groups[id(marker)] = g
+            g["members"].append(pl)
+
+    # Second pass: convert each physical marker once.
+    for g in marker_groups.values():
+        marker = g["marker"]
+        members = g["members"]
+        anchor = marker["text"]
+        if anchor.strip() in already_live:
+            # Already a live Zotero field — leave it untouched (re-citing would
+            # clobber the managed field and lose its rendered text).
+            continue
+
+        # Order the references to cite, and enforce the all-or-nothing policy.
+        # Branch on the marker KIND, never on _numeric_marker_targets: that helper
+        # returns the YEAR for an author-year marker ("(Smith, 2020)" -> [2020]),
+        # so it cannot distinguish numeric from author-year.
+        targets = _numeric_marker_targets(anchor) if marker["kind"] == "numeric" else []
+        if marker["kind"] == "numeric":
+            # NUMERIC marker (single "[3]" or grouped "[3,4]"/"[5-7]"): cite EVERY
+            # number, in the marker's printed order. Map each number to its keyed
+            # placement via the carried printed reflist number.
+            by_num: Dict[int, dict] = {}
+            missing_pn = False
+            for pl in members:
+                if pl.get("key") is None:
+                    continue
+                pn = pl.get("printed_number")
+                if pn is None:
+                    missing_pn = True
+                    continue
+                by_num.setdefault(pn, pl)
+            if missing_pn and not by_num:
+                # BACK-COMPAT: an old/serialized plan carries no printed_number.
+                # Fall back to reflist (member) order, which matches the printed
+                # order of a standard ascending bibliography. Still all-or-nothing:
+                # only convert when the count of keyed members equals the count of
+                # cited numbers (a grouped marker missing a member is left plain).
+                keyed = [pl for pl in members if pl.get("key") is not None]
+                if len(keyed) != len(targets):
+                    report["unresolved_in_doc"].append({
+                        "marker": anchor,
+                        "kind": marker["kind"],
+                        "reason": (
+                            f"grouped citation not fully accepted/keyed (cites "
+                            f"{targets}, have {len(keyed)} of {len(targets)}); left "
+                            "as plain text (all-or-nothing) so no co-citation is "
+                            "silently dropped"
+                        ),
+                    })
+                    continue
+                ordered = keyed
+            else:
+                missing = [n for n in targets if n not in by_num]
+                if missing:
+                    report["unresolved_in_doc"].append({
+                        "marker": anchor,
+                        "kind": marker["kind"],
+                        "reason": (
+                            f"grouped citation not fully accepted/keyed (cited "
+                            f"number(s) {missing} are unaccepted or unkeyable); left "
+                            "as plain text (all-or-nothing) so no co-citation is "
+                            "silently dropped"
+                        ),
+                    })
+                    continue
+                ordered = [by_num[n] for n in targets]
+        else:
+            # Author-year (or otherwise non-numeric) marker: link is to a single
+            # reference (see _link_intext_to_reflist, whose author_year arm
+            # ``break``s after the first match). Cite the keyed member(s) in the
+            # order encountered.
+            ordered = [pl for pl in members if pl.get("key") is not None]
+            # All-or-nothing, symmetric with the numeric branch above. Today this
+            # cannot fire (single-member by construction), but it makes the
+            # no-silent-co-citation-drop invariant LOCAL instead of depending on a
+            # distant ``break``: if author-year linkage ever grows to group
+            # "(Smith 2020; Jones 2021)", an unkeyable member must leave the whole
+            # marker as plain text rather than silently citing the keyed subset.
+            if len(ordered) != len(members):
                 report["unresolved_in_doc"].append({
                     "marker": anchor,
                     "kind": marker["kind"],
-                    "reason": "anchor not uniquely located in document",
+                    "reason": (
+                        "grouped citation not fully accepted/keyed (an author-year "
+                        "co-cited member is unaccepted or unkeyable); left as plain "
+                        "text (all-or-nothing) so no co-citation is silently dropped"
+                    ),
                 })
                 continue
-            try:
-                zoterofield.replace_text_with_zotero_field(
-                    doc, anchor, [key],
-                    itemdata=[idata], uris=[uri],
-                    rendered=f"({key})", track=track, **_author_kw,
-                )
-                report["replaced"] += 1
-            except Exception as exc:  # noqa: BLE001 — best-effort, never fail the run
-                report["unresolved_in_doc"].append({
-                    "marker": anchor,
-                    "kind": marker["kind"],
-                    "reason": f"replace failed: {exc}",
-                })
+
+        if not ordered:
+            # Nothing keyable to cite here (e.g. every member's create failed).
+            # Leave the marker as plain text — the unkeyable refs are already
+            # surfaced via needs_input from the create pass.
+            continue
+
+        if not _anchor_is_unique(anchor):
+            report["unresolved_in_doc"].append({
+                "marker": anchor,
+                "kind": marker["kind"],
+                "reason": "anchor not uniquely located in document",
+            })
+            continue
+
+        keys = [pl["key"] for pl in ordered]
+        itemdata = [_itemdata_from_meta(pl["meta"], pl["key"]) for pl in ordered]
+        # Degrade-safe: a matched-key placement under a DEGRADED read (offline /
+        # creds missing) must still write the field (carries the KEY; Word rebinds
+        # the URI on Refresh) rather than crash on item_uri. See zotero single owner.
+        uris = [zotero.item_uri_offline_safe(k) for k in keys]
+        try:
+            zoterofield.replace_text_with_zotero_field(
+                doc, anchor, keys,
+                itemdata=itemdata, uris=uris,
+                # rendered is the pre-Refresh placeholder text; for one key this is
+                # byte-identical to the old "({key})". Keys are alphanumeric so the
+                # render can never re-introduce a numeric marker into the tree.
+                rendered="(" + "; ".join(keys) + ")",
+                track=track, **_author_kw,
+            )
+            # Per-PHYSICAL-marker count: one grouped "[3,4]" -> +1, not +len(keys).
+            report["replaced"] += 1
+        except Exception as exc:  # noqa: BLE001 — best-effort, never fail the run
+            report["unresolved_in_doc"].append({
+                "marker": anchor,
+                "kind": marker["kind"],
+                "reason": f"replace failed: {exc}",
+            })
 
     # resolved placeholders → insert at the placeholder's literal text anchor
     for pl in placements:

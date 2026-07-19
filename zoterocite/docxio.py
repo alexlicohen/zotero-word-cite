@@ -20,6 +20,14 @@ from .ooxml import NS, qn
 
 DOCUMENT = "word/document.xml"
 
+# Strict Open XML (ISO/IEC 29500 Strict) uses a different root namespace URI
+# than the Transitional WordprocessingML namespace zotero-word-cite's qn()/NS map
+# resolve against. A Strict .docx parses "successfully" (well-formed XML) but
+# every qn('w:*') lookup silently matches nothing — the whole document reads
+# as 0 paragraphs / 0 words with no warning, which would false-PASS an NIH
+# word/page-limit check. Fail loud instead.
+_STRICT_WORDPROCESSINGML_NS = "http://purl.oclc.org/ooxml/wordprocessingml/main"
+
 
 class DocxLoadError(Exception):
     """A .docx package could not be opened or a requested part could not be
@@ -61,11 +69,21 @@ class Docx:
             if part not in self._raw:
                 raise DocxLoadError(f"missing part {part!r} in {self.path}")
             try:
-                self._trees[part] = etree.fromstring(self._raw[part])
+                root = etree.fromstring(self._raw[part])
             except etree.XMLSyntaxError as e:
                 raise DocxLoadError(f"corrupt XML in {part!r}: {e}") from e
             except IndexError as e:  # some malformed packages surface here
                 raise DocxLoadError(f"corrupt XML in {part!r}: {e}") from e
+            if isinstance(root.tag, str) and root.tag.startswith("{"):
+                root_ns = root.tag[1:root.tag.index("}")]
+                if root_ns == _STRICT_WORDPROCESSINGML_NS:
+                    raise DocxLoadError(
+                        f"Strict Open XML .docx not supported (part {part!r} uses "
+                        f"the ISO/IEC 29500 Strict WordprocessingML namespace, not "
+                        f"Transitional) — re-save as standard/transitional .docx "
+                        f"in Word (File > Save As > Word Document)."
+                    )
+            self._trees[part] = root
         return self._trees[part]
 
     def tree(self, part: str = DOCUMENT) -> etree._Element:

@@ -552,6 +552,166 @@ class TestConvert:
         # exactly one converted field cites BOTH A (MENKEY1) and B (ZKEY)
         assert {"MENKEY1", "ZKEY"} in keysets, keysets
 
+    def test_grouped_partial_match_leaves_whole_field_foreign(self, tmp_path, fake_zotero):
+        # FIX 1 — data loss: a GROUPED foreign cite (A, B) where A matches the
+        # library but B does NOT must be left ENTIRELY foreign. The old behaviour
+        # converted A alone, silently dropping B's co-citation — '(A,B)' -> '(A)'.
+        # All-or-nothing (mirrors citelink.apply_cite_link): keep the group intact
+        # until B is added to the library.
+        src = tmp_path / "g.docx"
+        new_doc(src, ["A grouped cite of one present and one missing work here."])
+        doc = Docx(src)
+        root = doc.tree(DOCUMENT)
+        grouped = " ADDIN CSL_CITATION " + json.dumps({
+            "citationItems": [
+                {"id": "A", "itemData": {"title": "Work A Present",
+                                         "DOI": "10.1000/widgets.2001",
+                                         "issued": {"date-parts": [["2019"]]}},
+                 "uris": ["http://mendeley.com/a"]},
+                {"id": "B", "itemData": {"title": "Work B Missing",
+                                         "DOI": "10.0000/missing",
+                                         "issued": {"date-parts": [["2020"]]}},
+                 "uris": ["http://mendeley.com/b"]},
+            ],
+            "mendeley": {"plainTextFormattedCitation": "(a,b)"},
+            "schema": "https://github.com/citation-style-language/schema/raw/master/csl-citation.json",
+        }) + " "
+        _append_complex_field(_find_para(root, "grouped cite"), grouped)
+        p = tmp_path / "p.docx"; doc.save(p)
+
+        out = tmp_path / "o.docx"
+        res = convert_to_zotero(p, out=out, managers=("mendeley",))
+
+        # Nothing converted: the whole field is held back.
+        assert res["converted"] == []
+        # The matched member A must NOT have been converted alone (the data loss).
+        keys = [it["key"] for cit in scan_citations(res["out"]) for it in cit["items"]]
+        assert "MENKEY1" not in keys, f"co-cited member A dropped-and-converted alone: {keys}"
+        # The foreign field survives intact for a human to fix.
+        assert classify_citation_sources(res["out"])["counts"].get("mendeley", 0) >= 1
+        # The field-level skip is reported with the explicit reason ...
+        assert len(res["left_unconverted"]) == 1
+        lu = res["left_unconverted"][0]
+        assert lu["reason"] == "left unconverted: co-cited member unmatched"
+        assert "MENKEY1" in lu["keys"]
+        # ... and the missing member is still surfaced in unmatched.
+        assert any(u["extracted"].get("doi") == "10.0000/missing" for u in res["unmatched"])
+
+    def test_meta_cache_key_disambiguates_same_title_diff_year(self):
+        # FIX 2 — reference merge: two DISTINCT same-title, DOI-less works must
+        # get DIFFERENT per-run cache keys (old title-only key collapsed them).
+        a = {"title": "Shared Title", "year": "2020", "authors": ["Smith J"]}
+        b = {"title": "Shared Title", "year": "2021", "authors": ["Jones A"]}
+        assert cc._meta_cache_key(a) != cc._meta_cache_key(b)
+        # Same work (same title/year/surname token) still shares ONE key.
+        b_same = {"title": "Shared Title", "year": "2020", "authors": ["Smith John"]}
+        assert cc._meta_cache_key(a) == cc._meta_cache_key(b_same)
+
+    def test_meta_cache_key_title_only_when_no_discriminators(self):
+        # Both-absent fallback: no year/authors -> plain title key (unchanged).
+        assert cc._meta_cache_key({"title": "Bare Title"}) == cc._tk("Bare Title")
+        # A DOI always wins regardless of discriminators.
+        assert cc._meta_cache_key({"title": "T", "doi": "10.1/x", "year": "2020"}) == cc._dk("10.1/x")
+
+    def test_meta_disambiguators_match_matcher_derivation(self):
+        # Digit-scanned 4-digit year + lowercased first-author surname token,
+        # EXACTLY as _match_in_library derives them.
+        assert cc._meta_disambiguators({"year": "2020-05", "authors": ["Smith J"]}) == ("2020", "smith")
+        assert cc._meta_disambiguators({"year": "c2019", "authors": ["Doe RA"]}) == ("2019", "doe")
+        assert cc._meta_disambiguators({"authors": ["Smith John"]}) == ("", "smith")
+        assert cc._meta_disambiguators({"year": "20"}) == ("", "")   # <4 digits -> no year
+        assert cc._meta_disambiguators({}) == ("", "")
+
+    def test_distinct_same_title_works_not_reference_merged(self, tmp_path, fake_zotero, monkeypatch):
+        # FIX 2 end-to-end: two DOI-less fields sharing a title but resolving to
+        # DIFFERENT library items (via year/first-author disambiguation) must each
+        # keep their OWN item. The old title-only cache key merged the second into
+        # the first's match — a silent reference merge.
+        from zoterocite import zotero
+        # Empty offline index -> title lookup misses -> _match_in_library uses the
+        # live search + year/first-author disambiguation below.
+        monkeypatch.setattr(zotero, "library_index",
+                            lambda **k: {"doi": {}, "pmid": {}, "title": {}})
+
+        def search_items(query, qmode=None):
+            if cc.normalize_title(query) == cc.normalize_title("Shared Title Alpha"):
+                return [
+                    {"key": "KEYA", "data": {"key": "KEYA", "title": "Shared Title Alpha",
+                                             "date": "2020", "creators": [{"lastName": "Smith"}]}},
+                    {"key": "KEYB", "data": {"key": "KEYB", "title": "Shared Title Alpha",
+                                             "date": "2021", "creators": [{"lastName": "Jones"}]}},
+                ]
+            return []
+        monkeypatch.setattr(zotero, "search_items", search_items)
+
+        def _men(year, fam, given):
+            return " ADDIN CSL_CITATION " + json.dumps({
+                "citationItems": [{"id": "X", "itemData": {
+                    "title": "Shared Title Alpha",
+                    "author": [{"family": fam, "given": given}],
+                    "issued": {"date-parts": [[year]]}}, "uris": ["u"]}],
+                "mendeley": {"plainTextFormattedCitation": "(x)"},
+                "schema": "https://github.com/citation-style-language/schema/raw/master/csl-citation.json",
+            }) + " "
+
+        src = tmp_path / "s.docx"
+        new_doc(src, ["First cite of work one here.", "Second cite of work two here."])
+        doc = Docx(src)
+        root = doc.tree(DOCUMENT)
+        _append_complex_field(_find_para(root, "work one"), _men("2020", "Smith", "John"))
+        _append_complex_field(_find_para(root, "work two"), _men("2021", "Jones", "Alice"))
+        p = tmp_path / "p.docx"; doc.save(p)
+
+        out = tmp_path / "o.docx"
+        res = convert_to_zotero(p, out=out, managers=("mendeley",))
+        keys = sorted(it["key"] for cit in scan_citations(res["out"]) for it in cit["items"])
+        assert keys == ["KEYA", "KEYB"], f"same-title works reference-merged in cache: {keys}"
+
+    def test_already_zotero_titleonly_dedups_foreign_with_discriminators(self, tmp_path, fake_zotero, monkeypatch):
+        # FIX 2 already_zotero interaction: an existing Zotero field whose CSL-JSON
+        # lacks year/authors (a title-only key) must STILL dedup against a foreign
+        # field of the same work that DOES carry year/first-author — else widening
+        # the cache key would spuriously RE-CONVERT an already-converted cite.
+        from zoterocite import zotero
+        # Offline index resolves the DOI-less title, so the foreign field WOULD
+        # convert absent the dedup guard.
+        monkeypatch.setattr(zotero, "library_index",
+                            lambda **k: {"doi": {}, "pmid": {},
+                                         "title": {"recurrent work title": "RECKEY"}})
+
+        src = tmp_path / "s.docx"
+        new_doc(src, ["Foreign cite of the recurrent work here.",
+                      "Existing zotero of the recurrent work here."])
+        doc = Docx(src)
+        root = doc.tree(DOCUMENT)
+        foreign = " ADDIN CSL_CITATION " + json.dumps({
+            "citationItems": [{"id": "X", "itemData": {
+                "title": "Recurrent Work Title",
+                "author": [{"family": "Smith", "given": "John"}],
+                "issued": {"date-parts": [["2020"]]}}, "uris": ["u"]}],
+            "mendeley": {"plainTextFormattedCitation": "(x)"},
+            "schema": "https://github.com/citation-style-language/schema/raw/master/csl-citation.json",
+        }) + " "
+        zot = "ADDIN ZOTERO_ITEM CSL_CITATION " + json.dumps({
+            "citationID": "ZID1",
+            "properties": {"formattedCitation": "(1)", "plainCitation": "(1)", "noteIndex": 0},
+            "citationItems": [{"id": "2504198/RECKEY", "uris": [GROUP + "RECKEY"],
+                               "itemData": {"id": "2504198/RECKEY", "type": "article-journal",
+                                            "title": "Recurrent Work Title"}}],
+            "schema": "https://github.com/citation-style-language/schema/raw/master/csl-citation.json",
+        })
+        _append_complex_field(_find_para(root, "Foreign cite"), foreign)
+        _append_complex_field(_find_para(root, "Existing zotero"), zot)
+        p = tmp_path / "p.docx"; doc.save(p)
+
+        out = tmp_path / "o.docx"
+        res = convert_to_zotero(p, out=out, managers=("mendeley",))
+        # No spurious re-convert: the foreign field is left alone (deduped).
+        assert res["converted"] == []
+        assert res["deduped"] >= 1
+        keys = [it["key"] for cit in scan_citations(res["out"]) for it in cit["items"]]
+        assert keys.count("RECKEY") == 1, f"already-converted cite re-converted: {keys}"
+
     def test_unmatched_recorded_not_fabricated(self, tmp_path, fake_zotero):
         # Mendeley cite to a DOI NOT in the fake library -> unmatched, not converted.
         src = tmp_path / "s.docx"

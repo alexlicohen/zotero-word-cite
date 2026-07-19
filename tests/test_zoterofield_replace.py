@@ -159,3 +159,69 @@ def test_replace_anchor_not_found_raises(tmp_path):
     assert root.find(".//" + qn("w:del")) is None
     # no Zotero field was spliced in
     assert root.find(".//" + qn("w:instrText")) is None
+
+
+# -- FIX 3: marker straddling an inline-container boundary -------------------
+from lxml import etree
+from zoterocite.zoterofield import _isolate_marker_runs, _splice_field_at_marker
+
+_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def _para(inner: str) -> etree._Element:
+    return etree.fromstring(
+        f'<w:p xmlns:w="{_W}">{inner}</w:p>'.encode()
+    )
+
+
+def _run(text: str) -> str:
+    return f'<w:r><w:t xml:space="preserve">{text}</w:t></w:r>'
+
+
+def test_isolate_marker_across_hyperlink_raises_lookuperror():
+    """A citation marker that straddles a <w:hyperlink> boundary yields overlapping
+    runs under DIFFERENT parents. _wrap_runs_as_del / the no-track splice remove all
+    marker runs from a SINGLE parent, so pre-fix this raised an lxml ValueError
+    MID-mutation and corrupted the tree. The guard must convert it into a clean,
+    pre-mutation LookupError instead — and leave the paragraph untouched."""
+    # "(Smith et al., 2020)" spans a run under <w:p> and a run under <w:hyperlink>.
+    para = _para(
+        _run("Lesion mapping (Smith ")
+        + f'<w:hyperlink>{_run("et al., 2020) to circuits.")}</w:hyperlink>'
+    )
+    before = etree.tostring(para)
+
+    with pytest.raises(LookupError) as ei:
+        _isolate_marker_runs(para, MARKER)
+    msg = str(ei.value)
+    assert "inline container" in msg
+    assert "not supported" in msg
+
+    # Not a ValueError, and NOTHING was mutated before the raise (tree byte-identical).
+    assert etree.tostring(para) == before
+
+    # The higher-level splice turns this into a skippable no-op (returns False), so a
+    # batch converting many markers never crashes on this one. On the LookupError
+    # path _splice_field_at_marker returns before touching doc/root/field_xml, so
+    # placeholders are safe here.
+    para2 = _para(
+        _run("Lesion mapping (Smith ")
+        + f'<w:hyperlink>{_run("et al., 2020) to circuits.")}</w:hyperlink>'
+    )
+    assert _splice_field_at_marker(
+        None, None, para2, MARKER, "",
+        track=True, author="zotero-word-cite", date="2026-01-01T00:00:00Z",
+    ) is False
+
+
+def test_isolate_marker_same_parent_split_still_isolates():
+    """Guard must NOT over-fire: a marker split across TWO runs under the SAME parent
+    isolates normally (this is the ordinary rPr-preserving split path)."""
+    para = _para(_run("Lesion mapping (Smith ") + _run("et al., 2020) to circuits."))
+    marker_runs, parent, idx = _isolate_marker_runs(para, MARKER)
+    assert marker_runs                      # isolated, no raise
+    # every isolated run shares the returned single parent
+    assert all(r.getparent() is parent for r in marker_runs)
+    assert "".join(
+        (t.text or "") for r in marker_runs for t in r.iter(qn("w:t"))
+    ) == MARKER

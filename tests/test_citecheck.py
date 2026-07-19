@@ -539,6 +539,23 @@ class TestCiteCheck:
         assert "CITE-RETRACTED" in checks
         assert "CITE-CONCERN" in checks
 
+    def test_explicit_missing_rw_csv_fails_loud(self, doc_with_citations, tmp_path):
+        """An explicitly-supplied rw_csv path that doesn't exist must NOT
+        silently skip retraction screening. Without a loud finding the result
+        looks clean even though the screen the user asked for never ran."""
+        missing_path = tmp_path / "does-not-exist.csv"
+        assert not missing_path.exists()
+        findings = cite_check(
+            doc_with_citations, rw_csv=str(missing_path), check_existence=False,
+        )
+        checks = [f.check for f in findings]
+        severities = {f.check: f.severity for f in findings}
+        assert "CITE-RW-MISSING" in checks
+        assert severities["CITE-RW-MISSING"] == "ERROR"
+        # The document DOES cite a retracted DOI; with the CSV missing the
+        # screen cannot have run, so a clean pass must not be implied.
+        assert "CITE-RETRACTED" not in checks
+
     def test_no_zotero_fields(self, tmp_path):
         """Plain .docx with no Zotero fields → single INFO finding."""
         src = tmp_path / "plain.docx"
