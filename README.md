@@ -68,13 +68,16 @@ cd zotero-word-cite
 dependencies (`lxml`, `python-docx`, `pytest`). It does not touch the rest of
 your system.
 
-> **Tip — make it a Claude Code skill.** If you use Claude Code, clone (or move)
-> this folder to `~/.claude/skills/zotero-word-cite`. Claude will then discover
-> it automatically and you can just ask in plain English (see
+> **Tip — make it an agent skill.** Clone the repo wherever you keep checkouts,
+> then point your agent's skills directory at it with a symlink. Everything in
+> here resolves paths from its own location, so the checkout can live anywhere
+> and both entry points keep working (see
 > [section 5](#5-use-it-with-claude-code-easiest)).
 > ```bash
-> git clone https://github.com/alexlicohen/zotero-word-cite.git ~/.claude/skills/zotero-word-cite
-> cd ~/.claude/skills/zotero-word-cite && ./install.sh
+> git clone https://github.com/alexlicohen/zotero-word-cite.git ~/projects/zotero-word-cite
+> cd ~/projects/zotero-word-cite && ./install.sh
+> # then expose it to your agent, e.g. for Claude Code:
+> ln -s ~/projects/zotero-word-cite ~/.claude/skills/zotero-word-cite
 > ```
 
 ---
