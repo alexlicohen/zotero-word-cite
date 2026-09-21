@@ -25,7 +25,7 @@ cite_check(path, *, rw_csv=None, check_existence=False) -> list[Finding]
     Orchestrates all checks; returns a flat list[Finding].
 
 default_rw_path() -> Path
-    ~/.claude/skills/zotero-word-cite/data/retraction_watch.csv
+    <repo root>/data/retraction_watch.csv (package-relative; see the function)
 
 refresh_retraction_db(dest=None, *, url) -> Path
     Download the Retraction Watch CSV from ``url`` into ``dest``.
