@@ -585,15 +585,16 @@ def fetch_all(query: Optional[str] = None, qmode: Optional[str] = None,
 # ``fetch_all`` itself is UNTOUCHED — existing callers (``library_doi_index``,
 # ``library_index``, ``export_backup``) keep their exact behaviour.
 
-# Disk caches for the delta sync — gitignored ``data/`` (same convention as the
-# DOI/library-index caches above).  Kept per SCOPE (top-level vs all items),
-# because the two are different item sets and must not share a watermark.
-_SYNC_CACHE_TOP = Path(__file__).parent.parent / "data" / "zotero_sync_cache_top.json"
-_SYNC_CACHE_ALL = Path(__file__).parent.parent / "data" / "zotero_sync_cache_all.json"
+# Disk caches for the delta sync — the shared regenerable-cache dir that
+# :func:`_http.cache_path` owns, same convention as the DOI/library-index caches
+# above.  Kept per SCOPE (top-level vs all items), because the two are different
+# item sets and must not share a watermark.
+_SYNC_CACHE_TOP = _http.cache_path("zotero_sync_cache_top.json")
+_SYNC_CACHE_ALL = _http.cache_path("zotero_sync_cache_all.json")
 
 
 def _default_sync_cache_path(top: bool) -> Path:
-    """The default gitignored cache file for the requested item scope."""
+    """The default cache file for the requested item scope."""
     return _SYNC_CACHE_TOP if top else _SYNC_CACHE_ALL
 
 
@@ -734,8 +735,8 @@ def _write_sync_cache(path: Path, *, version: int, top: bool, items: list[dict])
     }
     try:
         _atomic_write_json(path, payload)
-    except Exception:  # noqa: BLE001 — cache write is best-effort; never break the read
-        pass
+    except Exception as exc:  # noqa: BLE001 — best-effort; warn once, never break the read
+        _http.warn_cache_unwritable(path, exc)
 
 
 def _sync_discovery(last_version: int, *, top: bool):
@@ -877,7 +878,7 @@ def synced_fetch_all(
 
     Fails CLOSED on any anomaly in the delta path (see the module-section note):
     it falls back to a full :func:`fetch_all` rather than ever serving a
-    stale-and-wrong merged cache.  ``cache_path`` overrides the default gitignored
+    stale-and-wrong merged cache.  ``cache_path`` overrides the default cache
     location (used by tests for isolation); ``top`` selects the item scope exactly
     like :func:`fetch_all``.  ``fresh=True`` skips the cache read and forces a cold
     full resync that ALSO re-seeds the cache at the fresh watermark (so a repair
@@ -1068,15 +1069,15 @@ def resolve_doi_item(doi: str, *, refresh_on_miss: bool = True) -> Optional[dict
     return item
 
 
-# Path to the DOI index cache, relative to this file's package root.
-_DOI_INDEX_CACHE = Path(__file__).parent.parent / "data" / "zotero_doi_index.json"
+# Path to the DOI index cache, in the shared regenerable-cache dir.
+_DOI_INDEX_CACHE = _http.cache_path("zotero_doi_index.json")
 
 # Module-level in-memory cache: (index_dict, fetched_at_unix_seconds)
 _doi_index_mem: Optional[tuple[dict, float]] = None
 
 # Combined (doi+pmid+title) index cache — independent of the legacy DOI-only
 # cache above so library_doi_index keeps its exact on-disk format/back-compat.
-_LIB_INDEX_CACHE = Path(__file__).parent.parent / "data" / "zotero_library_index.json"
+_LIB_INDEX_CACHE = _http.cache_path("zotero_library_index.json")
 
 # Module-level in-memory cache: (index_dict, fetched_at_unix_seconds), where
 # index_dict is {"doi": {...}, "pmid": {...}, "title": {...}}.
@@ -1144,7 +1145,7 @@ def library_doi_index(*, refresh: bool = False, max_age_hours: float = 24.0) -> 
 
     1. In-memory: a module-level tuple ``(index, fetched_at)`` is reused
        within the same process if younger than ``max_age_hours``.
-    2. On-disk: ``data/zotero_doi_index.json`` (``data/`` is gitignored).
+    2. On-disk: ``zotero_doi_index.json`` in the shared cache dir.
        Written after every successful fetch; reused on subsequent process
        starts as long as the ``fetched_at`` timestamp is within TTL.
 
@@ -1207,8 +1208,8 @@ def library_doi_index(*, refresh: bool = False, max_age_hours: float = 24.0) -> 
         # Write disk cache (best-effort; never raise) via the shared atomic writer.
         try:
             _atomic_write_json(_DOI_INDEX_CACHE, {"fetched_at": fetched_at, "index": idx})
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001 — unwritable cache: warn once, carry on
+            _http.warn_cache_unwritable(_DOI_INDEX_CACHE, exc)
 
         return idx
 
@@ -1266,7 +1267,7 @@ def _load_doi_cache_only() -> Optional[dict[str, str]]:
     """Best-effort load of the ``library_doi_index`` disk cache, ignoring TTL.
 
     Returns the ``{normalized_doi: item_key}`` map from
-    ``data/zotero_doi_index.json`` if it is present and parseable, else ``None``.
+    the cached ``zotero_doi_index.json`` if it is present and parseable, else ``None``.
     Used by :func:`library_index` (``strict=False``) to degrade a failed combined
     fetch to DOI-only coverage rather than empty — the DOI cache survives outages
     that leave the combined ``library_index`` cache cold. NEVER raises.
@@ -1294,7 +1295,7 @@ def library_index(
     presence by DOI → PMID → title without three separate fetches.
 
     Caching mirrors :func:`library_doi_index` — a two-layer cache (in-memory
-    tuple + the gitignored disk file ``data/zotero_library_index.json``),
+    tuple + the cached disk file ``zotero_library_index.json``),
     ``refresh=True`` bypasses both, and an empty library returns three empty maps.
 
     **Failure semantics depend on ``strict`` (the WRITE-vs-READ split):**
@@ -1364,8 +1365,8 @@ def library_index(
         # Write disk cache (best-effort; never raise) via the shared atomic writer.
         try:
             _atomic_write_json(_LIB_INDEX_CACHE, {"fetched_at": fetched_at, "index": idx})
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001 — unwritable cache: warn once, carry on
+            _http.warn_cache_unwritable(_LIB_INDEX_CACHE, exc)
 
         return idx
 

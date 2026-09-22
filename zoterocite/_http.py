@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -131,6 +132,66 @@ def _parse_retry_after(value: Optional[str]) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Regenerable-cache location + the unwritable-cache warning
+# ---------------------------------------------------------------------------
+# The SINGLE owner, for every module in this package, of "where does a
+# regenerable cache artefact live" and "what happens when it cannot be written".
+# Every cache writer (:mod:`zotero`'s sync/DOI/library indices, the response
+# cache below) routes through these two functions instead of building its own
+# path or swallowing its own write failure.
+#
+# Cache artefacts are PACKAGE-relative — ``data/`` beside this package,
+# gitignored — so the checkout can be installed anywhere and symlinked into the
+# skills folder. ``.resolve()`` first, like :func:`citecheck.default_rw_path`, so
+# an entry point reached through a symlink still lands in the real checkout.
+
+
+def cache_path(*parts: str) -> Path:
+    """A path for a REGENERABLE cache artefact. Pure path arithmetic; no disk.
+
+    The directory is deliberately NOT created here: cache writers create it
+    lazily and degrade through :func:`warn_cache_unwritable` when they cannot.
+    """
+    return Path(__file__).resolve().parent.parent.joinpath("data", *parts)
+
+
+#: Cache locations already warned about, so a batch of writes warns at most once each.
+_CACHE_WARNED: set = set()
+
+
+def _reset_cache_warnings() -> None:
+    """Test hook: forget which cache locations have already warned."""
+    _CACHE_WARNED.clear()
+
+
+def warn_cache_unwritable(path, exc: Optional[BaseException] = None) -> bool:
+    """Warn ONCE per location (stderr) that a cache write was skipped.
+
+    Every disk-cache writer calls this from its ``except`` branch instead of
+    failing or staying silent: a cache that cannot be written must never fail a
+    command that would otherwise succeed — the toolkit has to work from a
+    read-only checkout, or in a sandbox where only the document's own folder is
+    writable — but a SILENT skip hides a real slowdown, because every run then
+    re-fetches what it just downloaded. Returns ``True`` iff it warned. Never
+    raises: a broken stderr must not break the command either.
+    """
+    try:
+        key = str(Path(path).parent)
+        if key in _CACHE_WARNED:
+            return False
+        _CACHE_WARNED.add(key)
+        detail = f" ({exc})" if exc is not None else ""
+        print(
+            f"{_TOOL}: cache not writable at {key}{detail} — continuing without "
+            f"caching (make that directory writable to silence this).",
+            file=sys.stderr,
+        )
+        return True
+    except Exception:  # noqa: BLE001 — a warning must never break a caller
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Opt-in disk-backed response cache (public read-only GETs only)
 # ---------------------------------------------------------------------------
 # A per-call, opt-in cache so a repeated resolution run does not re-fetch every
@@ -151,8 +212,10 @@ def _parse_retry_after(value: Optional[str]) -> float:
 #     before the key is hashed and is NEVER written to disk (only the hash and
 #     the response body are stored, and the body does not echo the key).
 #
-# The cache path is a module attribute (tests redirect it to a tmp file).
-_HTTP_CACHE_PATH = Path(__file__).parent.parent / "data" / "http_response_cache.json"
+# The cache path is a module attribute (tests redirect it to a tmp file). It lives
+# in the cache dir this module owns (:func:`cache_path`) — it is pure regenerable
+# HTTP state.
+_HTTP_CACHE_PATH = cache_path("http_response_cache.json")
 
 # Process-level in-memory layer. ``None`` = not yet loaded from disk (seeded
 # lazily on first access); a dict maps ``key_hash -> {"body": text, "ts": unix}``.
@@ -234,8 +297,8 @@ def _save_disk_cache(cache: dict) -> None:
         _HTTP_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(_HTTP_CACHE_PATH, "w", encoding="utf-8") as fh:
             json.dump(cache, fh)
-    except Exception:  # noqa: BLE001 — unwritable cache: skip silently
-        pass
+    except Exception as exc:  # noqa: BLE001 — unwritable cache: warn once, carry on
+        warn_cache_unwritable(_HTTP_CACHE_PATH, exc)
 
 
 def _fresh_entry_body(entry, now: float, ttl: float) -> Optional[bytes]:

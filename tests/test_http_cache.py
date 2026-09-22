@@ -21,6 +21,7 @@ Two guards carry TEETH (mutation-confirmed with ``gf mutate-check``):
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -241,3 +242,59 @@ def test_resolve_reference_served_from_cache(cache_file, monkeypatch):
     assert r1["candidates"] and r2["candidates"]
     assert r1 == r2
     assert calls["n"] == 1  # 2nd resolve served from the shared response cache
+
+
+# ---------------------------------------------------------------------------
+# 7 — an UNWRITABLE cache warns ONCE and still serves the body
+# ---------------------------------------------------------------------------
+
+def test_unwritable_cache_warns_once_and_still_serves(tmp_path, monkeypatch, capsys):
+    """A cache write that cannot land must WARN ONCE per location — never fail,
+    never stay silent.  A silent skip hides a real slowdown (every run re-fetches
+    what it just downloaded), which is exactly what a read-only checkout or a
+    sandboxed run looks like.
+
+    TEETH: put ``_save_disk_cache``'s except branch back to a bare ``pass`` and
+    the first stderr assertion fails; drop the ``_CACHE_WARNED`` guard inside
+    ``warn_cache_unwritable`` and the warned-once assertion fails.
+    """
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("")                      # the cache path's PARENT is a file
+    monkeypatch.setattr(_http, "_HTTP_CACHE_PATH", blocker / "http_cache.json",
+                        raising=False)
+    _http._reset_http_cache()
+    _http._reset_cache_warnings()
+    calls = _count_do_fetch(monkeypatch, b"ok")
+
+    assert _http.http_get("http://api.example.test/a", timeout=5,
+                          cache_ttl=1000) == b"ok"
+    assert "cache not writable" in capsys.readouterr().err
+
+    assert _http.http_get("http://api.example.test/b", timeout=5,
+                          cache_ttl=1000) == b"ok"
+    assert "cache not writable" not in capsys.readouterr().err   # warned ONCE
+    assert calls["n"] == 2                                       # no fetch was lost
+
+
+def test_cache_path_is_package_relative_and_owned_here(tmp_path):
+    """``_http.cache_path`` is the SINGLE owner of every regenerable cache path.
+
+    ``zotero``'s sync/DOI/library indices resolve through it, which is what keeps
+    that module brand-agnostic (the private toolkit's copy points the same
+    function at its own platform cache dir).  Package-relative + ``.resolve()`` =
+    install anywhere, symlink into the skills folder.
+    """
+    import zoterocite
+
+    root = Path(zoterocite.__file__).resolve().parent.parent
+    assert _http.cache_path("x.json") == root / "data" / "x.json"
+    assert _http.cache_path("sub", "y.json") == root / "data" / "sub" / "y.json"
+
+    # Every module-level cache path resolves through it. (``_HTTP_CACHE_PATH``
+    # itself is redirected to a tmp file by conftest's autouse isolation, so
+    # assert its DEFAULT through the owner instead of reading the attribute.)
+    from zoterocite import zotero
+    for p in (zotero._SYNC_CACHE_TOP, zotero._SYNC_CACHE_ALL,
+              zotero._DOI_INDEX_CACHE, zotero._LIB_INDEX_CACHE,
+              _http.cache_path("http_response_cache.json")):
+        assert p.parent == root / "data", p

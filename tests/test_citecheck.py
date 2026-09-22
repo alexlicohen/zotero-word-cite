@@ -777,10 +777,18 @@ class TestCiteCheck:
 # ---------------------------------------------------------------------------
 
 def test_default_rw_path():
+    """The RW cache is PACKAGE-relative, so the checkout can live anywhere.
+
+    It is a 60+ MB re-downloadable file, so it belongs in the gitignored ``data/``
+    dir beside the package — never at a hard-coded install location, and never at
+    a path that assumes the checkout DIRECTORY is named after the project (the
+    install-anywhere contract: clone wherever, symlink it into the skills folder).
+    """
+    from zoterocite import citecheck as cc
+
     p = default_rw_path()
     assert p.name == "retraction_watch.csv"
-    assert "zotero-word-cite" in str(p)
-    assert "data" in p.parts
+    assert p.parent == Path(cc.__file__).resolve().parent.parent / "data"
 
 
 # ---------------------------------------------------------------------------
