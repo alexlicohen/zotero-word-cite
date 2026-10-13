@@ -9,6 +9,11 @@ naming, leftover template guidance) and never fail the gate.
 Errors:
     * malformed XML in any ``.xml``/``.rels`` part (root cause of repair dialogs)
     * empty accepted-view text (round-trip produced nothing)
+    * a comment in ``word/comments.xml`` with no ``w:commentReference`` in any
+      story part (body, headers, footers, footnotes, endnotes). Word opens the
+      file but never shows that comment, so a reviewer's note is silently lost.
+      ERROR, not WARNING: it is cross-part integrity damage of the same kind as
+      malformed XML (the signature of a comment-anchor-loss bug).
     * a MEASURED whole-document page count over a configured ``max_pages``. This
       is the one limit that can fail the gate: it is a real, rendered page count
       (via :func:`zoterocite.pagefit.page_count`), and it is how the gate enforces
@@ -34,6 +39,7 @@ from typing import Any, Dict, List, Optional
 from lxml import etree
 
 from .docxio import Docx, DocxLoadError
+from .ooxml import qn
 from .views import counts, read_views
 
 # Parts that must be well-formed XML for Word to open the package cleanly.
@@ -89,6 +95,59 @@ def _check_well_formed(doc: Docx, errors: List[str]) -> int:
             # turns a bad part into a VAL-ERR rather than a traceback.)
             errors.append(f"malformed XML in part {part}: {exc}")
     return inspected
+
+
+_COMMENTS_PART = "word/comments.xml"
+
+
+def _is_comment_story_part(name: str) -> bool:
+    """A main-document part that may carry ``w:commentReference``: the body,
+    headers, footers, footnotes, endnotes. Comment parts themselves and the
+    glossary document (which has its own comments part) are excluded."""
+    if not (name.startswith("word/") and name.endswith(".xml")):
+        return False
+    if name.startswith("word/glossary/"):
+        return False
+    return not name.rsplit("/", 1)[-1].startswith("comments")
+
+
+def _check_orphan_comments(doc: Docx) -> List[str]:
+    """Comment ids in ``word/comments.xml`` with no ``w:commentReference`` in ANY
+    story part. Word does not display such a comment, so the reviewer's note is
+    silently lost (the signature of a comment-anchor-loss bug).
+
+    References are collected from every story part (document, headers, footers,
+    footnotes, endnotes), so a comment anchored in a footnote is not an orphan. A
+    reference inside a tracked deletion still counts: Word shows the comment until
+    the deletion is accepted. Unparseable parts are skipped here; the
+    well-formedness check already reports them.
+    """
+    if not doc.has(_COMMENTS_PART):
+        return []
+    w_id = qn("w:id")
+    try:
+        comment_ids = [c.get(w_id) for c in
+                       doc.read_tree(_COMMENTS_PART).iter(qn("w:comment"))]
+    except DocxLoadError:
+        return []
+    referenced = set()
+    for part in doc.parts():
+        if not _is_comment_story_part(part):
+            continue
+        try:
+            root = doc.read_tree(part)
+        except DocxLoadError:
+            continue
+        referenced.update(r.get(w_id) for r in root.iter(qn("w:commentReference")))
+    orphans = [cid for cid in comment_ids if cid not in referenced]
+    if not orphans:
+        return []
+    shown = ", ".join(str(c) for c in orphans[:10])
+    more = "..." if len(orphans) > 10 else ""
+    return [
+        f"{len(orphans)} comment(s) in {_COMMENTS_PART} have no commentReference "
+        f"in any story part (Word will not display them): id {shown}{more}"
+    ]
 
 
 def _find_section_text(accepted: str, heading: str) -> Optional[str]:
@@ -170,6 +229,10 @@ def validate(
         accepted = ""
     if not accepted:
         errors.append("accepted view is empty (round-trip produced no text)")
+
+    # 2b. Comment integrity: every comment must be anchored -------------------
+    info["checks"].append("orphan_comments")
+    errors.extend(_check_orphan_comments(doc))
 
     # 3. Limits -------------------------------------------------------------
     if limits:

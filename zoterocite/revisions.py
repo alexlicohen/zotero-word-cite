@@ -1186,9 +1186,73 @@ def _remove_move_range_markers(root) -> None:
             m.getparent().remove(m)
 
 
+# Comment ANCHOR markers. A resolution pass that drops a tracked-change wrapper
+# wholesale must never drop these with it: Word stops showing a comment whose range
+# or reference is gone. Google Docs' Office export routinely puts them INSIDE a
+# suggestion (a w:del that deletes a comment's anchored text; a w:ins by A nested in
+# a w:del by B).
+_COMMENT_MARKERS = ("w:commentRangeStart", "w:commentRangeEnd", "w:commentReference")
+# What each resolution direction drops wholesale (the rest it unwraps or keeps).
+_REMOVED_ON_ACCEPT = ("w:del", "w:moveFrom")
+_REMOVED_ON_REJECT = ("w:ins", "w:moveTo")
+
+
+def _is_revision_wrapper(el) -> bool:
+    """True when ``el`` (a w:ins/w:del/w:moveFrom/w:moveTo) WRAPS content. The same
+    tags inside a properties element (``pPr/rPr`` paragraph-mark revisions,
+    ``trPr`` row revisions, ``numPr`` numbering revisions — any ``*Pr`` parent) are
+    empty MARKERS, never wrappers, so nothing is ever hoisted out of them."""
+    parent = el.getparent()
+    return parent is not None and not etree.QName(parent).localname.endswith("Pr")
+
+
+def _lift_comment_marker(m):
+    """Detach comment marker ``m`` and return the node to re-insert. A range marker
+    moves as is. A ``w:commentReference`` moves ALONE into a fresh run styled
+    ``CommentReference`` (Word's own reference-run shape), so any text its original
+    run carried (``w:t`` / ``w:delText``) stays put and resolves normally."""
+    m.getparent().remove(m)
+    if m.tag != qn("w:commentReference"):
+        return m
+    r = etree.Element(qn("w:r"))
+    rpr = etree.SubElement(r, qn("w:rPr"))
+    etree.SubElement(rpr, qn("w:rStyle")).set(qn("w:val"), "CommentReference")
+    r.append(m)
+    return r
+
+
+def _hoist_comment_markers(scope, removed_tags) -> int:
+    """SINGLE OWNER of comment-marker preservation for wrapper removal. Every comment
+    marker under ``scope`` that has an ancestor (up to and including ``scope``) whose
+    tag is in ``removed_tags`` AND which is a real wrapper (:func:`_is_revision_wrapper`)
+    is moved to the position of its OUTERMOST such ancestor — the one this resolution
+    removes. Ancestors the resolution merely unwraps are not in ``removed_tags``, so a
+    marker may stay inside them. Markers are processed in document order and each is
+    inserted immediately before its target, so hoisted markers keep their relative
+    order. Returns the number of markers moved. Call it BEFORE the removal sweep."""
+    removed = frozenset(qn(t) for t in removed_tags)
+    moved = 0
+    for m in list(scope.iter(*(qn(t) for t in _COMMENT_MARKERS))):
+        outer = None
+        a = m.getparent()
+        while a is not None:
+            if a.tag in removed and _is_revision_wrapper(a):
+                outer = a
+            if a is scope:
+                break
+            a = a.getparent()
+        if outer is None:
+            continue
+        outer.addprevious(_lift_comment_marker(m))
+        moved += 1
+    return moved
+
+
 def accept_all(doc: Docx) -> Docx:
     root = doc.tree(DOCUMENT)
     _guard_unhandled(root)
+    # Comment markers inside a wrapper that is about to vanish move out first.
+    _hoist_comment_markers(root, _REMOVED_ON_ACCEPT)
     # deletions and move-froms vanish (the deleted/original text is gone)
     for d in root.findall(".//" + qn("w:del")):
         d.getparent().remove(d)
@@ -1227,7 +1291,9 @@ def _reject_inserted_para_marks(root, marked) -> None:
     inserted paragraph; without it the empty ``<w:p>`` would be left as an orphan.
 
     A marked paragraph with no following sibling paragraph (e.g. the very last in
-    its parent) cannot merge forward; its emptied shell is removed in place."""
+    its parent) cannot merge forward. Whatever survives in it (text the insertion
+    did not cover, comment markers hoisted out of the rejected insertion) is KEPT
+    in place, the ins mark already gone; only a truly-empty shell is removed."""
     p_tag = qn("w:p")
     for p in marked:
         parent = p.getparent()
@@ -1236,12 +1302,13 @@ def _reject_inserted_para_marks(root, marked) -> None:
         nxt = p.getnext()
         while nxt is not None and nxt.tag != p_tag:
             nxt = nxt.getnext()
-        if nxt is None:
-            parent.remove(p)
-            continue
-        # Move p's surviving runs (everything except its own pPr) to the start of
-        # the next paragraph, after that paragraph's pPr if present.
+        # p's surviving runs (everything except its own pPr).
         movers = [ch for ch in p if ch.tag != qn("w:pPr")]
+        if nxt is None:
+            if not movers:
+                parent.remove(p)    # truly-empty shell -> no orphan
+            continue
+        # Move them to the start of the next paragraph, after its pPr if present.
         nxt_ppr = nxt.find(qn("w:pPr"))
         anchor_idx = (list(nxt).index(nxt_ppr) + 1) if nxt_ppr is not None else 0
         for off, ch in enumerate(movers):
@@ -1255,6 +1322,8 @@ def reject_all(doc: Docx) -> Docx:
     # Capture paragraphs whose MARK is inserted BEFORE the generic ins sweep wipes
     # the signal; their forward-merge happens after the normal reject passes.
     marked = [p for p in root.iter(qn("w:p")) if _inserted_para_mark(p)]
+    # Comment markers inside a wrapper that is about to vanish move out first.
+    _hoist_comment_markers(root, _REMOVED_ON_REJECT)
     # insertions and move-tos vanish (the new/destination text is gone)
     for ins in root.findall(".//" + qn("w:ins")):
         ins.getparent().remove(ins)
@@ -1331,14 +1400,22 @@ def spread_timestamps(doc: Docx, author: str, start: Optional[str] = None,
     result reads like a human pass, not a clock tick.
 
     Window defaults: ``end`` -> now; ``start`` -> ``end - min_minutes`` (>= 15 min
-    wide). Other authors' marks are left untouched. Returns the number of *marks*
-    (not events) updated.
+    wide). ``start``/``end`` use the same convention as ``now_iso``: LOCAL
+    wall-clock with a ``Z`` suffix, never converted. Raises ``ValueError`` (before
+    touching any mark) when the resolved start is after the resolved end; the window
+    is never swapped, since a swapped window writes marks after the session end.
+    Other authors' marks are left untouched. Returns the number of *marks* (not
+    events) updated.
     """
     from datetime import datetime, timedelta
     end_dt = datetime.strptime(end, DATE_FMT) if end else datetime.strptime(now_iso(), DATE_FMT)
     start_dt = datetime.strptime(start, DATE_FMT) if start else end_dt - timedelta(minutes=min_minutes)
     if start_dt > end_dt:
-        start_dt, end_dt = end_dt, start_dt
+        raise ValueError(
+            f"spread window start {start_dt.strftime(DATE_FMT)} is after its end "
+            f"{end_dt.strftime(DATE_FMT)}{'' if end else ' (end defaulted to now)'}. "
+            f"Both are LOCAL wall-clock with a Z suffix, the same convention as "
+            f"w:date/now_iso; do not pass UTC.")
     if (end_dt - start_dt) < timedelta(minutes=min_minutes):   # enforce the minimum span
         start_dt = end_dt - timedelta(minutes=min_minutes)
     start_s, end_s = start_dt.strftime(DATE_FMT), end_dt.strftime(DATE_FMT)

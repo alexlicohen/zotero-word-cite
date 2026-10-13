@@ -120,6 +120,97 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+# -- Table-of-contents detection (anchor tie-break) --------------------------
+# A TOC entry repeats its heading's text, so a heading anchor substring-matches
+# BOTH the heading and its TOC line. ``ParaIndex.find`` uses these predicates to
+# break that one tie in favour of the body paragraph. Self-contained on purpose:
+# this module is brand-synced to the public mirror and must import nothing
+# grant-only.
+_TOC_STYLE_PREFIX = "TOC"            # TOC1..TOC9 and TOCHeading (built-in styleIds)
+_TOC_GALLERY = "table of contents"   # sdtPr/docPartObj/docPartGallery@w:val
+
+
+def _is_toc_instr(instr: str) -> bool:
+    # "TOC \o "1-3" \h \z \u" and a table of figures ("TOC \h \z \c "Figure"").
+    s = instr.strip().upper()
+    return s == "TOC" or s.startswith("TOC ") or s.startswith("TOC\\")
+
+
+def _toc_style(p: etree._Element) -> bool:
+    ps = p.find(f"{qn('w:pPr')}/{qn('w:pStyle')}")
+    return ps is not None and (ps.get(qn("w:val")) or "").startswith(_TOC_STYLE_PREFIX)
+
+
+def _toc_container(p: etree._Element) -> bool:
+    """Inside a ``w:sdt`` whose docPartGallery is 'Table of Contents', or holding a
+    ``w:fldSimple`` whose instr is a TOC field."""
+    for fs in p.iter(qn("w:fldSimple")):
+        if _is_toc_instr(fs.get(qn("w:instr")) or ""):
+            return True
+    sdt_tag = qn("w:sdt")
+    anc = p.getparent()
+    while anc is not None:
+        if anc.tag == sdt_tag:
+            for path in ("w:docPartObj", "w:docPartList"):
+                g = anc.find(f"{qn('w:sdtPr')}/{qn(path)}/{qn('w:docPartGallery')}")
+                if g is not None and (g.get(qn("w:val")) or "").strip().lower() == _TOC_GALLERY:
+                    return True
+        anc = anc.getparent()
+    return False
+
+
+def _toc_field_paragraphs(root: etree._Element, paras: List[etree._Element]) -> set:
+    """``id()`` of every paragraph in *paras* that shows text while a TOC complex
+    field is open.
+
+    A complex field spans paragraphs: ``fldChar begin`` → ``instrText`` →
+    ``fldChar separate`` → result → ``fldChar end``. We walk the whole tree in
+    document order keeping a field stack (fields nest: each TOC entry carries a
+    PAGEREF), and mark a paragraph when one of its ``w:t`` is read while ANY open
+    field is a TOC. Keying on visible text rather than on "open at paragraph start"
+    keeps a body paragraph that merely carries the TOC's trailing ``fldChar end``
+    at its start from being misread as a TOC entry. ``mc:Fallback`` duplicates are
+    skipped, as in :func:`paragraph_text`; a nested textbox paragraph is attributed
+    to its outer body paragraph.
+    """
+    pset = {id(p): p for p in paras}
+    fld_tag, instr_tag, t_tag = qn("w:fldChar"), qn("w:instrText"), qn("w:t")
+    fallback_tag = qn("mc:Fallback")
+    stack: List[list] = []   # each entry: [instr_text, in_instr_phase]
+    out: set = set()
+
+    def _owner(node):
+        anc = node.getparent()
+        while anc is not None:
+            if anc.tag == fallback_tag:
+                return None
+            if id(anc) in pset:
+                return anc
+            anc = anc.getparent()
+        return None
+
+    for node in root.iter(fld_tag, instr_tag, t_tag):
+        owner = _owner(node)
+        if owner is None:
+            continue
+        if node.tag == fld_tag:
+            kind = node.get(qn("w:fldCharType"))
+            if kind == "begin":
+                stack.append(["", True])
+            elif kind == "separate":
+                if stack:
+                    stack[-1][1] = False
+            elif kind == "end":
+                if stack:
+                    stack.pop()
+        elif node.tag == instr_tag:
+            if stack and stack[-1][1]:
+                stack[-1][0] += node.text or ""
+        elif stack and any(_is_toc_instr(f[0]) for f in stack):
+            out.add(id(owner))
+    return out
+
+
 class ParaIndex:
     """One-shot anchor resolver: walk the tree ONCE, then resolve many anchors.
 
@@ -154,17 +245,44 @@ class ParaIndex:
     invariant.
     """
 
-    __slots__ = ("_entries",)
+    __slots__ = ("_entries", "_root", "_toc_fields")
 
     def __init__(self, root: etree._Element) -> None:
+        self._root = root
         self._entries = [(p, _norm(paragraph_text(p))) for p in iter_paragraphs(root)]
+        self._toc_fields = None   # lazily built on the first ambiguous anchor
 
     def find_all(self, anchor: str) -> List[etree._Element]:
         a = _norm(anchor)
         return [p for (p, t) in self._entries if a in t]
 
-    def find(self, anchor: str) -> etree._Element:
+    def is_toc(self, p: etree._Element) -> bool:
+        """Is *p* a table-of-contents paragraph? True if its pStyle starts with
+        ``TOC`` (TOC1..TOC9, TOCHeading), it sits in a ``w:sdt`` whose
+        docPartGallery is 'Table of Contents', it holds a TOC ``w:fldSimple``, or
+        it shows text inside a TOC complex field (see :func:`_toc_field_paragraphs`)."""
+        if _toc_style(p) or _toc_container(p):
+            return True
+        if self._toc_fields is None:
+            self._toc_fields = _toc_field_paragraphs(
+                self._root, [e[0] for e in self._entries])
+        return id(p) in self._toc_fields
+
+    def candidates(self, anchor: str) -> List[etree._Element]:
+        """:meth:`find_all`, with ONE tie-break: when several paragraphs match and
+        exactly one of them is not a TOC paragraph, return just that one. A heading
+        anchor otherwise also hits its own TOC entry. Zero or one hit, or an
+        ambiguity the tie-break cannot settle, comes back unchanged, so a caller can
+        still tell "not found" from "not unique"."""
         hits = self.find_all(anchor)
+        if len(hits) > 1:
+            body = [p for p in hits if not self.is_toc(p)]
+            if len(body) == 1:
+                return body
+        return hits
+
+    def find(self, anchor: str) -> etree._Element:
+        hits = self.candidates(anchor)
         if len(hits) != 1:
             raise LookupError(f"anchor {anchor!r} matched {len(hits)} paragraphs (need exactly 1)")
         return hits[0]
@@ -172,6 +290,11 @@ class ParaIndex:
 
 def find_paragraphs(root: etree._Element, anchor: str) -> List[etree._Element]:
     return ParaIndex(root).find_all(anchor)
+
+
+def find_paragraph_candidates(root: etree._Element, anchor: str) -> List[etree._Element]:
+    """:meth:`ParaIndex.candidates` for a one-off lookup."""
+    return ParaIndex(root).candidates(anchor)
 
 
 def find_paragraph(root: etree._Element, anchor: str) -> etree._Element:
