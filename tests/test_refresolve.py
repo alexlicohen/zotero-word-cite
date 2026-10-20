@@ -1004,6 +1004,16 @@ class TestPubmedFetchAuthors:
             return {pmid: record for pmid in ids}
         return _efetch
 
+    def test_structured_authors_preferred(self, monkeypatch):
+        """entrez's authors_structured (ForeName) wins over the bare strings."""
+        record = {"title": "T.", "year": "2016", "journal": "J",
+                  "authors": ["Cohen AL"],
+                  "authors_structured": [{"family": "Cohen", "given": "Alexander L"}]}
+        monkeypatch.setattr(rr._entrez, "efetch_pubmed", self._fake_efetch(record))
+        result = rr._pubmed_fetch("26980150")
+        assert result["authors"] == [{"family": "Cohen", "given": "Alexander L"}]
+        assert result["authors_plain"] == ["Cohen AL"]
+
     def test_authors_populated_from_entrez_record(self, monkeypatch):
         record = {
             "title": "Lesion network mapping of stroke.",
@@ -1015,7 +1025,11 @@ class TestPubmedFetchAuthors:
         monkeypatch.setattr(rr._entrez, "efetch_pubmed", self._fake_efetch(record))
         result = rr._pubmed_fetch("26980150")
         assert result is not None
-        assert result["authors"] == ["Cohen AL", "Fox MD"]
+        # CSL-shaped like every resolver path (the bare strings were dropped by
+        # zotero.csljson_to_zotero_item); the strings stay as authors_plain.
+        assert result["authors"] == [{"family": "Cohen", "given": "AL"},
+                                     {"family": "Fox", "given": "MD"}]
+        assert result["authors_plain"] == ["Cohen AL", "Fox MD"]
 
     def test_authors_empty_when_entrez_returns_none(self, monkeypatch):
         """If efetch_pubmed returns no record for the PMID, _pubmed_fetch returns None."""
@@ -1037,7 +1051,8 @@ class TestPubmedFetchAuthors:
         assert result["authors"] == []
 
     def test_collective_name_author_passes_through(self, monkeypatch):
-        """CollectiveName authors (plain strings) pass through unchanged."""
+        """CollectiveName authors become a given-less family entry (the
+        corporate guard's shape); the plain strings are kept."""
         record = {
             "title": "Consortium paper.",
             "abstract": "",
@@ -1048,4 +1063,6 @@ class TestPubmedFetchAuthors:
         monkeypatch.setattr(rr._entrez, "efetch_pubmed", self._fake_efetch(record))
         result = rr._pubmed_fetch("99999999")
         assert result is not None
-        assert result["authors"] == ["Jones BK", "Brain Imaging Consortium"]
+        assert result["authors"] == [{"family": "Jones", "given": "BK"},
+                                     {"family": "Brain Imaging Consortium", "given": ""}]
+        assert result["authors_plain"] == ["Jones BK", "Brain Imaging Consortium"]

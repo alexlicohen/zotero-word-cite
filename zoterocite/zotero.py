@@ -2188,8 +2188,16 @@ def create_items(
     pmid_index: Optional[dict[str, str]] = None,
     attach_pdfs: bool = False,
     index_degraded: bool = False,
+    verify_authors: bool = False,
 ) -> dict:
     """Batch-create Zotero items from CSL-JSON-ish metadata dicts.
+
+    Every meta is first normalised by
+    :func:`zoterocite.refresolve.normalize_create_meta` (the single owner:
+    entities/markup out of title + container title, ALL-CAPS personal names
+    recased, bare author strings structured) BEFORE the dedup lookups, so the
+    title searched for in the library is the title posted.  Result entries echo
+    the CALLER's ``title`` so callers can map them back to their inputs.
 
     Parameters
     ----------
@@ -2236,6 +2244,16 @@ def create_items(
         go to ``skipped_existing``.  Belt-and-suspenders with the caller's own
         degraded-read guard (``unify.apply_unification`` already fails closed on
         the ``LibraryUnavailableError`` raise).
+    verify_authors:
+        OPT-IN (default ``False``).  After dedup, run
+        :func:`zoterocite.refresolve.reconcile_create_authors` over ONLY the
+        items about to be POSTed (one DOI->PMID ESearch + one EFetch batch):
+        PubMed's structured author list replaces a shorter / ALL-CAPS /
+        mismatched one.  Never blocks a create and runs after every dedup
+        decision, so it cannot change which library item a meta matches; any
+        failure leaves the authors as they were and flags the item
+        ``authors_unverified``.  Per-item decisions are returned under
+        ``"author_check"`` (key present only when this is ``True``).
 
     Returns
     -------
@@ -2272,6 +2290,10 @@ def create_items(
     if not metas:
         return result
 
+    # Lazy import: refresolve is the owner of create-path metadata hygiene and
+    # of the PubMed author check; zotero stays import-light at module load.
+    from . import refresolve as _rr
+
     # Gate on write permission.  Fail closed on BOTH a definitive "no access"
     # and an unverifiable result, but record the truthful reason per item so a
     # caller surfaces "retry — could not verify" instead of asserting no-write.
@@ -2302,10 +2324,18 @@ def create_items(
                 })
             return result
 
-    # Split into to-create vs skipped
+    # Split into to-create vs skipped.  ``meta`` is the caller's dict (echoed in
+    # every result entry); ``norm`` is its normalised copy — what the dedup
+    # title lookup searches for and what is posted.
     to_create: list[dict] = []   # (meta, zotero_item)
+    pending: list[tuple] = []    # (meta, norm) that passed dedup
     for meta in metas:
+        try:
+            norm = _rr.normalize_create_meta(meta)
+        except Exception:  # noqa: BLE001 — hygiene must never abort the batch
+            norm = dict(meta)
         title = (meta.get("title") or "").strip()
+        dedup_title = (norm.get("title") or "").strip()
         doi = (meta.get("doi") or "").strip()
         pmid = str(meta.get("pmid") or "").strip()
 
@@ -2344,21 +2374,54 @@ def create_items(
                     })
                     continue
                 if existing_key is None:
+                    existing_key = _title_exists_in_library(dedup_title)
+                # Normalisation changed the title: also look for the RAW form, so
+                # an item an earlier (un-normalised) run created with the
+                # ``&amp;``/markup title is still found, never duplicated.
+                if existing_key is None and dedup_title != title:
                     existing_key = _title_exists_in_library(title)
 
                 if existing_key is not None:
                     result["skipped_existing"].append({"title": title, "existing_key": existing_key})
                     continue
+        except Exception as exc:
+            result["failed"].append({"title": title, "reason": f"Item conversion error: {exc}"})
+            continue
 
+        pending.append((meta, norm))
+
+    # Opt-in PubMed author check — ONLY items about to be POSTed (every dedup
+    # decision is already final above).  Never blocks: a failure flags the item.
+    if verify_authors:
+        checks: list = []
+        if pending:
+            try:
+                checks = _rr.reconcile_create_authors([m for m, _ in pending])
+            except Exception as exc:  # noqa: BLE001 — degrade, never block
+                checks = [{
+                    "title": (m.get("title") or "").strip(),
+                    "doi": (m.get("doi") or "").strip() or None,
+                    "pmid": str(m.get("pmid") or "").strip() or None,
+                    "author_check": _rr.AUTHOR_CHECK_UNVERIFIED,
+                    "reason": f"error: {type(exc).__name__}",
+                } for m, _ in pending]
+        for (meta, norm), chk in zip(pending, checks):
+            use = chk.pop("authors", None) if isinstance(chk, dict) else None
+            if use and chk.get("author_check") == _rr.AUTHOR_CHECK_PUBMED:
+                norm["authors"] = _rr._normalize_authors(use)
+        result["author_check"] = [c for c in checks if isinstance(c, dict)]
+
+    for meta, norm in pending:
+        title = (meta.get("title") or "").strip()
+        try:
             zitem = csljson_to_zotero_item(
-                meta,
+                norm,
                 collections=[coll_key] if coll_key else None,
                 tags=tags,
             )
         except Exception as exc:
             result["failed"].append({"title": title, "reason": f"Item conversion error: {exc}"})
             continue
-
         to_create.append((meta, zitem))
 
     # POST in batches of ≤50, each with a unique Zotero-Write-Token

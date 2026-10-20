@@ -22,9 +22,21 @@ check_preprint_status(doi, *, fetch=True) -> dict
     ``published_doi`` is only populated when the relation entry carries
     ``"id-type": "doi"``; the published venue name is omitted (callers should
     resolve ``published_doi`` separately to get the journal name).
+
+normalize_create_meta(meta) -> dict
+    The single owner of create-path metadata hygiene (called by
+    ``zotero.create_items`` before its dedup lookups): unescape HTML entities and
+    strip JATS/HTML markup in title + container title, recase ALL-CAPS personal
+    names, structure bare author strings.
+
+reconcile_create_authors(metas, *, fetch=True) -> list[dict]
+    Bounded PubMed author check for items about to be created (one DOI->PMID
+    ESearch + one EFetch batch per call); PubMed's list wins when Crossref's is
+    shorter / all-caps / mismatched.
 """
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -808,11 +820,21 @@ def _pubmed_fetch(pmid: str) -> Optional[dict]:
     rec = results.get(pmid)
     if rec is None:
         return None
+    # ``authors`` is CSL-shaped ``{family, given}`` like every other resolver
+    # path: entrez's bare "Lastname Initials" strings were silently dropped by
+    # ``zotero.csljson_to_zotero_item``, so PMID-resolved items were created with
+    # NO creators.  The bare strings stay available as ``authors_plain``.
+    plain = list(rec.get("authors") or [])
+    structured = [dict(a) for a in (rec.get("authors_structured") or [])
+                  if isinstance(a, dict)]
+    if not structured and plain:
+        structured = [a for a in (_author_from_string(x) for x in plain) if a]
     return {
         "doi": rec.get("doi") or None,
         "pmid": str(pmid),
         "title": rec.get("title"),
-        "authors": rec.get("authors") or [],
+        "authors": structured,
+        "authors_plain": plain,
         "year": rec.get("year"),
         "journal": rec.get("journal"),
         "type": "journal-article",
@@ -984,3 +1006,364 @@ def resolve_reference(text: str, *, fetch: bool = True) -> dict:
         "candidates": candidates,
         "identifiers": identifiers,
     }
+
+
+# ---------------------------------------------------------------------------
+# 4. Create-path metadata hygiene — the SINGLE owner (normalize_create_meta)
+# ---------------------------------------------------------------------------
+#
+# Crossref (and, less often, PubMed) metadata carries publisher artefacts that
+# land verbatim in the shared Zotero library unless cleaned before the write:
+# ALL-CAPS personal names, HTML entities (``&amp;``) and JATS/HTML inline markup
+# (``<i>``, ``<sub>``, ``<jats:italic>``) in titles and container titles, and
+# bare "Lastname Initials" author strings that the Zotero mapping drops.
+# ``zotero.create_items`` applies :func:`normalize_create_meta` to every meta
+# BEFORE its write-time dedup lookups, so the title it searches the library for
+# is the title it posts.  Only names are recased; titles and container titles
+# are never case-changed.  DOI / PMID are never touched (dedup keys unchanged).
+
+# Inline markup tags stripped from titles.  A WHITELIST, not ``<[^>]+>``: a title
+# may legitimately contain ``<`` (``p<0.05``, ``IL-6<TNF``) once ``&lt;`` is
+# unescaped, and that text must survive.
+_MARKUP_TAG_RE = re.compile(
+    r"</?(?:(?:jats|mml|xhtml|html|m):[\w.-]+|i|b|u|em|strong|sub|sup|sc|scp|"
+    r"span|small|tt|font|a|br|p|italic|bold|underline|monospace)"
+    r"(?:\s[^<>]*)?/?>",
+    re.IGNORECASE,
+)
+_BREAK_TAG_RE = re.compile(r"</?(?:br|p)(?:\s[^<>]*)?/?>", re.IGNORECASE)
+
+# Lower-case name particles (only when another token follows them in the
+# family name: ``VAN DER BERG`` -> ``van der Berg``; a bare ``DE`` stays ``De``).
+_NAME_PARTICLES = frozenset({
+    "van", "von", "der", "den", "de", "del", "della", "di", "da", "du", "dos",
+    "das", "la", "le", "ter", "ten", "zu", "af", "av",
+})
+_VOWELS = frozenset("AEIOUYÀÁÂÃÄÅÈÉÊËÌÍÎÏÒÓÔÕÖÙÚÛÜÝ")
+_PUBMED_INITIALS_RE = re.compile(r"^[A-Z]{1,4}$")
+
+
+def _clean_markup_text(text: str) -> str:
+    """Strip whitelisted inline markup, unescape HTML entities (to a fixed
+    point, so double-escaped ``&amp;amp;`` resolves), strip markup the unescape
+    revealed, and collapse whitespace.  Never changes letter case.  Idempotent."""
+    if not text:
+        return text
+    t = _BREAK_TAG_RE.sub(" ", text)
+    t = _MARKUP_TAG_RE.sub("", t)
+    for _ in range(3):
+        u = html.unescape(t)
+        if u == t:
+            break
+        t = u
+    t = _BREAK_TAG_RE.sub(" ", t)
+    t = _MARKUP_TAG_RE.sub("", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _is_all_caps(text: str) -> bool:
+    """True when *text* has >= 2 cased letters and none of them is lowercase.
+
+    ``SMITH`` / ``O'BRIEN`` / ``JOHN A.`` -> True; ``McDonald`` / ``DeLisi`` /
+    ``J`` / a caseless script -> False.
+    """
+    letters = [c for c in text or "" if c.isalpha()]
+    cased = [c for c in letters if c.isupper() or c.islower()]
+    return len(cased) >= 2 and not any(c.islower() for c in cased)
+
+
+def _cap_word(word: str) -> str:
+    """Proper-case one all-caps name segment (no spaces/hyphens): ``SMITH`` ->
+    ``Smith``, ``O'BRIEN`` -> ``O'Brien``, ``MCDONALD`` -> ``McDonald``."""
+    low = word.lower()
+    i = next((k for k, c in enumerate(low) if c.isalpha()), None)
+    if i is None:
+        return word
+    out = low[:i] + low[i].upper() + low[i + 1:]
+    m = re.match(r"^(\W*[^\W\d_])(['’])([^\W\d_])(.*)$", out)
+    if m:  # single-letter prefix + apostrophe: O'Brien, D'Angelo, N'Diaye
+        out = m.group(1) + m.group(2) + m.group(3).upper() + m.group(4)
+    if len(out) > 3 and out.startswith("Mc") and out[2].isalpha():
+        out = "Mc" + out[2].upper() + out[3:]
+    return out
+
+
+def _looks_like_initials(part: str) -> bool:
+    """A given-name segment that is (probably) initials, never recased:
+    anything dotted (``J.A.``, ``J.``), <= 2 letters (``JA``), or 3 letters with
+    no vowel (``JRR``)."""
+    if "." in part:
+        return True
+    letters = [c for c in part if c.isalpha()]
+    if len(letters) <= 2:
+        return True
+    return len(letters) == 3 and not any(c.upper() in _VOWELS for c in letters)
+
+
+def _recase_family(family: str) -> str:
+    tokens = family.split()
+    out = []
+    for i, tok in enumerate(tokens):
+        if tok.lower() in _NAME_PARTICLES and i < len(tokens) - 1:
+            out.append(tok.lower())
+        else:
+            out.append("-".join(_cap_word(p) for p in tok.split("-")))
+    return " ".join(out)
+
+
+def _recase_given(given: str) -> str:
+    return " ".join(
+        "-".join(p if _looks_like_initials(p) else _cap_word(p) for p in tok.split("-"))
+        for tok in given.split()
+    )
+
+
+def _author_from_string(text: str) -> Optional[dict]:
+    """Structure a bare author string: ``"Last, First"`` -> family/given;
+    PubMed's ``"Lastname AB"`` -> family ``Lastname`` / given ``AB``; anything
+    else (a collective name) -> ``{"family": text, "given": ""}``."""
+    s = (text or "").strip()
+    if not s:
+        return None
+    if "," in s:
+        fam, _, giv = s.partition(",")
+        return {"family": fam.strip(), "given": giv.strip()}
+    toks = s.split()
+    if len(toks) >= 2 and _PUBMED_INITIALS_RE.match(toks[-1]):
+        return {"family": " ".join(toks[:-1]), "given": toks[-1]}
+    return {"family": s, "given": ""}
+
+
+def _normalize_author(author):
+    """Normalise one author entry (see :func:`normalize_create_meta`)."""
+    if isinstance(author, str):
+        author = _author_from_string(author)
+    if not isinstance(author, dict):
+        return author
+    if "family" not in author and "given" not in author:
+        return dict(author)
+    fam = html.unescape(str(author.get("family") or "")).strip()
+    giv = html.unescape(str(author.get("given") or "")).strip()
+    # A family name with NO given name is treated as a possible collective /
+    # acronym (``ENIGMA``, ``WHO``) and never recased; so is anything the
+    # corporate guard flags.  People carry a given name.
+    if giv and not _is_corporate_author(fam, giv):
+        if _is_all_caps(fam):
+            fam = _recase_family(fam)
+        if _is_all_caps(giv):
+            giv = _recase_given(giv)
+    out = dict(author)
+    out["family"] = fam
+    out["given"] = giv
+    return out
+
+
+def _normalize_authors(authors) -> list:
+    out = []
+    for a in authors or []:
+        n = _normalize_author(a)
+        if n is not None:
+            out.append(n)
+    return out
+
+
+def normalize_create_meta(meta: dict) -> dict:
+    """Return a NORMALISED COPY of a metadata dict headed for Zotero creation.
+
+    The single owner of create-path metadata hygiene; ``zotero.create_items``
+    calls it on every meta before dedup so the dedup title and the posted title
+    agree.  Pure (no network, no mutation of *meta*) and idempotent.
+
+    * ``title`` / ``journal``: HTML entities unescaped (``&amp;`` -> ``&``,
+      numeric references), JATS/HTML inline markup stripped (``<i>``, ``<sub>``,
+      ``<jats:italic>``), whitespace collapsed.  Letter case is NOT changed.
+    * ``authors``: bare strings become ``{family, given}``; a personal name
+      field that is ALL CAPS is proper-cased (``SMITH-JONES`` -> ``Smith-Jones``,
+      ``O'BRIEN`` -> ``O'Brien``, ``VAN DER BERG`` -> ``van der Berg``) while
+      initials (``J.A.``, ``JA``), mixed-case names (``McDonald``, ``DeLisi``),
+      corporate authors and given-less entries (acronyms) are left alone.
+    * Every other key (``doi``, ``pmid``, ``year``, ...) is copied unchanged.
+    """
+    if not isinstance(meta, dict):
+        return meta
+    out = dict(meta)
+    for key in ("title", "journal"):
+        if isinstance(out.get(key), str):
+            out[key] = _clean_markup_text(out[key])
+    if isinstance(out.get("authors"), list):
+        out["authors"] = _normalize_authors(out["authors"])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 5. PubMed author reconciliation for items about to be created
+# ---------------------------------------------------------------------------
+
+# Items checked per call.  One EFetch batch holds ``entrez._BATCH`` (100) PMIDs;
+# 50 items leaves room for a DOI that maps to more than one PubMed record.
+_AUTHOR_CHECK_MAX = 50
+
+AUTHOR_CHECK_PUBMED = "pubmed"
+AUTHOR_CHECK_CONFIRMED = "confirmed"
+AUTHOR_CHECK_UNVERIFIED = "authors_unverified"
+
+
+def _persons_shouting(authors: list) -> bool:
+    for a in authors:
+        fam = (a.get("family") or "").strip()
+        giv = (a.get("given") or "").strip()
+        if _is_corporate_author(fam, giv) or not giv:
+            continue
+        if _is_all_caps(fam) or _is_all_caps(giv):
+            return True
+    return False
+
+
+def _n_named(authors) -> int:
+    """Author entries that would become a Zotero creator (non-empty name)."""
+    n = 0
+    for a in authors or []:
+        if isinstance(a, dict):
+            n += bool(str(a.get("family") or "").strip() or str(a.get("given") or "").strip())
+        elif isinstance(a, str):
+            n += bool(a.strip())
+    return n
+
+
+def reconcile_create_authors(metas: list, *, fetch: bool = True) -> list:
+    """Check the authors of items ABOUT TO BE CREATED against PubMed.
+
+    Returns one decision per meta (aligned with *metas*)::
+
+        {"title", "doi", "pmid", "author_check", "reason",
+         "authors_before", "authors_after", "authors"}
+
+    ``author_check`` is ``"pubmed"`` (PubMed's structured list replaces the
+    meta's: the meta's list is empty, shorter, has an ALL-CAPS personal name, or
+    family-by-family mismatches per :func:`_author_family_compare`),
+    ``"confirmed"`` (PubMed agrees; the meta's list is kept) or
+    ``"authors_unverified"`` (no PMID found, PubMed unreachable, no PubMed
+    authors, PubMed's list is the SHORTER one, PMID/DOI disagree, over the
+    per-call cap, or ``fetch=False``).  ``authors`` (internal) is the list to
+    use, only on a ``"pubmed"`` decision; callers strip it from reports.
+
+    Bounded network: at most ONE ESearch (DOI->PMID, for metas with a DOI but no
+    PMID) and ONE EFetch call of <= ``entrez._BATCH`` PMIDs; ``fetch=False``
+    makes no call.  Never raises on a network failure (entrez degrades to empty
+    results); never changes a meta's DOI or PMID.
+    """
+    n = len(metas or [])
+    out: list = [None] * n
+
+    def _set(i, status, reason, before, after=None, authors=None, pmid=None):
+        m = metas[i]
+        out[i] = {
+            "title": (m.get("title") or "").strip(),
+            "doi": (m.get("doi") or "").strip() or None,
+            "pmid": pmid or (str(m.get("pmid") or "").strip() or None),
+            "author_check": status,
+            "reason": reason,
+            "authors_before": before,
+            "authors_after": before if after is None else after,
+        }
+        if authors is not None:
+            out[i]["authors"] = authors
+
+    cand: list = []
+    for i, m in enumerate(metas or []):
+        before = _n_named(m.get("authors"))
+        pmid = str(m.get("pmid") or "").strip()
+        doi = (m.get("doi") or "").strip()
+        if not fetch:
+            _set(i, AUTHOR_CHECK_UNVERIFIED, "offline", before)
+        elif not pmid and not (doi and _normalise_doi(doi)):
+            _set(i, AUTHOR_CHECK_UNVERIFIED, "no_pmid", before)
+        elif len(cand) >= _AUTHOR_CHECK_MAX:
+            _set(i, AUTHOR_CHECK_UNVERIFIED, "over_cap", before)
+        else:
+            cand.append(i)
+    if not cand:
+        return out
+
+    known = {i: str(metas[i].get("pmid")).strip() for i in cand
+             if str(metas[i].get("pmid") or "").strip()}
+    need_doi = [i for i in cand if i not in known]
+
+    looked_up: list = []
+    esearch_degraded = False
+    if need_doi:
+        term = " OR ".join(f'"{(metas[i].get("doi") or "").strip()}"[DOI]'
+                           for i in need_doi)
+        try:
+            looked_up, st = _entrez.esearch_pmids_status(term, retmax=2 * len(need_doi))
+            esearch_degraded = bool((st or {}).get("degraded"))
+        except Exception:  # noqa: BLE001 — a lookup failure only flags items
+            looked_up, esearch_degraded = [], True
+
+    pmids: list = []
+    for p in list(known.values()) + list(looked_up or []):
+        if p and p not in pmids:
+            pmids.append(p)
+    pmids = pmids[:_entrez._BATCH]
+    recs: dict = {}
+    efetch_degraded = False
+    if pmids:
+        try:
+            recs, fst = _entrez.efetch_pubmed_status(pmids)
+            efetch_degraded = bool((fst or {}).get("degraded"))
+        except Exception:  # noqa: BLE001
+            recs, efetch_degraded = {}, True
+    recs = recs or {}
+
+    # DOI -> (pmid, record); a DOI two records claim is ambiguous (None).
+    by_doi: dict = {}
+    for p, r in recs.items():
+        nd = _normalise_doi(r.get("doi") or "") if isinstance(r, dict) else None
+        if nd:
+            by_doi[nd] = None if nd in by_doi else (p, r)
+
+    for i in cand:
+        m = metas[i]
+        before = _n_named(m.get("authors"))
+        ndoi = _normalise_doi(m.get("doi") or "") if m.get("doi") else None
+        if i in known:
+            pmid = known[i]
+            rec = recs.get(pmid)
+            if rec is not None and ndoi and rec.get("doi") and \
+                    _normalise_doi(rec.get("doi")) != ndoi:
+                _set(i, AUTHOR_CHECK_UNVERIFIED, "pmid_doi_disagree", before)
+                continue
+            degraded = efetch_degraded
+        else:
+            hit = by_doi.get(ndoi) if ndoi else None
+            pmid, rec = hit if hit else (None, None)
+            degraded = esearch_degraded or efetch_degraded
+        if rec is None:
+            _set(i, AUTHOR_CHECK_UNVERIFIED,
+                 "pubmed_unavailable" if degraded else "no_pubmed_record", before)
+            continue
+        pm = [dict(a) for a in (rec.get("authors_structured") or []) if isinstance(a, dict)]
+        cr = [a for a in (m.get("authors") or []) if isinstance(a, dict)]
+        cmp = _author_family_compare(cr, pm)
+        if cmp["actual_count"] == 0:
+            _set(i, AUTHOR_CHECK_UNVERIFIED, "pubmed_no_authors", before, pmid=pmid)
+            continue
+        if cmp["cited_count"] == 0:
+            reason = "crossref_no_authors"
+        elif cmp["actual_count"] < cmp["cited_count"]:
+            # PubMed lists FEWER people (old records are capped): never drop
+            # names on its say-so; keep the meta's list and flag it.
+            _set(i, AUTHOR_CHECK_UNVERIFIED, "pubmed_shorter", before, pmid=pmid)
+            continue
+        elif cmp["mismatch"]:
+            reason = "mismatch"
+        elif cmp["cited_count"] < cmp["actual_count"]:
+            reason = "crossref_shorter"
+        elif _persons_shouting(cr):
+            reason = "crossref_all_caps"
+        else:
+            _set(i, AUTHOR_CHECK_CONFIRMED, "match", before, pmid=pmid)
+            continue
+        _set(i, AUTHOR_CHECK_PUBMED, reason, before, after=len(pm), authors=pm,
+             pmid=pmid)
+    return out

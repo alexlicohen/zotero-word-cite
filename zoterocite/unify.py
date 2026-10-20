@@ -37,11 +37,13 @@ dedup-hard, tagged, and reversible. Tests monkeypatch every network call.
 """
 from __future__ import annotations
 
+import functools
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from . import entrez
 from . import refextract
 from . import refresolve
 from . import zotero
@@ -77,8 +79,24 @@ _TIER_BY_CONFIDENCE = {
 }
 
 _YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
-# First "Author" token of an author-year in-text marker, e.g. "(Smith et al., 2020)".
-_FIRST_AUTHOR_RE = re.compile(r"[A-Za-z][A-Za-z'\-]+")
+# Surname token of an author-year item: refextract.AY_NAME is the single owner of
+# the Unicode-aware name shape ("Pagán", "Ørsted", "Ó Briain").
+_AY_NAME_RE = re.compile(refextract.AY_NAME)
+# "(Smith, 2020; Table 2)": a capitalised non-surname in a year-less chunk is
+# prose, not an undated work (refextract's own stop list).
+_AY_STOP_RE = re.compile(refextract._AY_STOP)
+# A 4-digit year inside an item or a reflist entry plus its optional same-author
+# letter suffix ("2020a"): group 1 = digits, group 2 = suffix or None. ``\b``
+# refused "2020a" outright; dropping the suffix instead would link "(Smith,
+# 2020b)" to whichever Smith-2020 entry came first. The suffix is one lowercase
+# letter not followed by another letter ("2020abc" is no suffix).
+_ITEM_YEAR_RE = re.compile(r"(?<!\d)((?:1[6-9]|20)\d{2})(?!\d)([a-z](?![A-Za-z]))?")
+# APA's suffix-only continuation of a suffixed year: the ", b" of "2020a, b".
+_ITEM_SUFFIX_CONT_RE = re.compile(r",\s*([a-z])(?=\s*(?:[,;]|$))")
+# Leading particle run of a reflist author ("van der Berg H" / "de Vries A").
+_REF_FIRST_AUTHOR_RE = re.compile(
+    rf"^\s*(?P<particles>(?:[a-z]{{1,4}}\s+){{0,3}})(?P<name>{refextract.AY_NAME})"
+)
 
 
 # ===========================================================================
@@ -119,41 +137,182 @@ def _numeric_marker_targets(marker_text: str) -> List[int]:
     return nums
 
 
-def _first_author_of_marker(marker_text: str) -> Optional[str]:
-    """First author surname from an author-year marker (best effort)."""
-    # Strip the enclosing parens / bare form; grab the first capitalised word.
-    body = marker_text.strip().lstrip("(").rstrip(")")
-    m = _FIRST_AUTHOR_RE.search(body)
-    if not m:
-        return None
-    token = m.group(0)
-    if token.lower() in ("et", "al"):
-        return None
-    return token
+def _author_year_items(marker_text: str) -> List[Tuple[str, str]]:
+    """The cited items of an author-year marker, in printed order, as
+    ``[(first_author_surname, year), ...]`` — the author-year counterpart of
+    :func:`_numeric_marker_targets` and the SINGLE owner of grouped-marker
+    splitting (linking, apply ordering, ``intext_keys`` item counts and PubMed
+    candidates all call it).
 
+    ``"(Smith et al., 2020)"`` → ``[("Smith", "2020")]``;
+    ``"(Alpha et al., 2022; Beta, 2012)"`` and
+    ``"(Alpha et al., 2022 and Beta et al., 2012)"`` → two items;
+    ``"(Alpha and Beta, 2020)"`` → ONE two-author item ``[("Alpha", "2020")]``;
+    ``"Delta and Epsilon (2019)"`` / ``"Gamma et al., in 2019"`` → one item.
 
-def _year_of_marker(marker_text: str) -> Optional[str]:
-    m = _YEAR_RE.search(marker_text)
-    return m.group(0) if m else None
+    Groups split on ``;`` always and on ``and`` / ``&`` only where BOTH sides
+    carry a year: the pieces between connectives are merged left to right and an
+    item closes at the first piece that holds a year. The year KEEPS its letter
+    suffix ("2020a"), which linking must honour (:func:`_author_year_item_link`).
 
+    Every year of an item is its own cited work, so no co-citation can vanish:
+    ``"Smith, 2019, 2020"`` and ``"Smith, 2020a, b"`` are two items each, and a
+    year-only chunk ``"(Smith, 2019; 2020)"`` / ``"(Smith, 2019 and 2020)"``
+    inherits the previous item's surname. A year with no name anywhere before it
+    becomes ``("", year)``, which never links, so the all-or-nothing apply leaves
+    its group as plain text.
 
-def _reflist_first_author(text: str) -> Optional[str]:
-    """First author surname of a reference-list entry (best effort).
-
-    Handles ``"1. Smith J, Jones A. Title..."`` and ``"[1] Smith AB. ..."`` by
-    stripping the leading numbering, then taking the first capitalised word.
+    A ``;`` chunk left with a NAME but no year ("Smith et al., n.d.", "Smith,
+    in press") is still a cited work: it becomes an item with year ``""``, which
+    never links, so the all-or-nothing apply leaves its group as plain text
+    instead of silently citing the other items. Leftover prose with no name
+    ("and references therein") never forms an item.
     """
-    stripped = re.sub(r"^\s*(\[\d+\]|\(?\d+\)?[.)])\s*", "", text).strip()
-    m = _FIRST_AUTHOR_RE.search(stripped)
-    return m.group(0) if m else None
+    body = marker_text.replace("(", " ").replace(")", " ")
+    items: List[Tuple[str, str]] = []
+
+    def _years(text: str) -> List[str]:
+        out: List[str] = []
+        for m in _ITEM_YEAR_RE.finditer(text):
+            out.append(m.group(1) + (m.group(2) or ""))
+            if m.group(2):
+                pos = m.end()
+                while True:
+                    c = _ITEM_SUFFIX_CONT_RE.match(text, pos)
+                    if c is None:
+                        break
+                    out.append(m.group(1) + c.group(1))
+                    pos = c.end()
+        return out
+
+    def _emit(text: str, years: List[str]) -> None:
+        name = _AY_NAME_RE.search(text)
+        if name and (years or not _AY_STOP_RE.match(name.group(0))):
+            surname = re.sub(r"\s+", " ", name.group(0))
+        elif years:
+            # Year-only chunk: the previous item's author ("" when there is none).
+            surname = items[-1][0] if items else ""
+        else:
+            return
+        for y in years or [""]:
+            items.append((surname, y))
+
+    for chunk in body.split(";"):
+        acc: List[str] = []
+        dated = False
+        for piece in re.split(r"\s+(?:and|&)\s+|\s*&\s*", chunk):
+            acc.append(piece)
+            if _ITEM_YEAR_RE.search(piece) is None:
+                continue
+            item = " and ".join(acc)
+            acc = []
+            dated = True
+            _emit(item, _years(item))
+        if acc and not dated:
+            # A wholly year-less chunk is an undated work; a leftover AFTER a
+            # dated item in the same chunk is trailing prose and is ignored.
+            _emit(" and ".join(acc), [])
+    return items
+
+
+def _split_year(year: str) -> Tuple[str, str]:
+    """``"2020b"`` → ``("2020", "b")``; ``"2020"`` → ``("2020", "")``."""
+    return year[:4], year[4:]
+
+
+def _surname_key(name: str) -> str:
+    """Comparable key for a surname: casefolded AND accent-insensitive.
+
+    Accent-insensitive by design: reference lists exported from PubMed/Crossref
+    or retyped by a collaborator often drop diacritics the in-text marker kept
+    ("Pagan" vs "Pagán", "Orsted" vs "Ørsted"). A false link needs two distinct
+    surnames that differ ONLY by diacritics AND share the cited year, which is
+    far rarer than the dropped-accent miss. Reuses the toolkit's surname fold
+    (:func:`refresolve._normalize_surname`), then drops spaces/hyphens so
+    "Ó Briain" == "OBriain" and "García-López" == "Garcia Lopez".
+    """
+    return re.sub(r"[\s\-]", "", refresolve._normalize_surname(name))
+
+
+@functools.lru_cache(maxsize=4096)
+def _reflist_first_author_keys(text: str) -> Tuple[str, ...]:
+    """Surname keys of a reference-list entry's first author (best effort).
+
+    Strips the leading numbering, then reads the leading name with any
+    lowercase particles. Returns both the with-particle key ("devries") and the
+    bare-name key ("vries"), so "(De Vries, 2020)" and "(Vries, 2020)" both
+    match "de Vries A". ``()`` when no name leads the entry. Cached: the
+    linker asks once per (item, entry) pair.
+    """
+    stripped = re.sub(r"^\s*(\[\d+\]|\(?\d+\)?[.)])\s*", "", text)
+    m = _REF_FIRST_AUTHOR_RE.match(stripped)
+    if not m:
+        return ()
+    bare = _surname_key(m.group("name"))
+    full = _surname_key(m.group("particles") + m.group("name"))
+    return tuple(k for k in dict.fromkeys((full, bare)) if k)
+
+
+@functools.lru_cache(maxsize=4096)
+def _ref_years(text: str) -> frozenset:
+    """The ``(digits, suffix)`` years a reflist entry carries (suffix ``""``
+    when none). Cached: the linker asks per item."""
+    return frozenset((m.group(1), m.group(2) or "") for m in _ITEM_YEAR_RE.finditer(text))
+
+
+def _ref_matches_item(ref_text: str, surname: str, year: str) -> bool:
+    """True when a reflist entry's first author is ``surname`` and it carries
+    ``year`` — the author-year link predicate. A suffixed entry year ("2020a")
+    matches only the same suffix; an unsuffixed entry year matches the item's
+    digits whatever its suffix (Vancouver lists drop it). Uniqueness across
+    the list is :func:`_author_year_item_link`'s job."""
+    key = _surname_key(surname)
+    digits, suffix = _split_year(year)
+    if not (key and digits) or key not in _reflist_first_author_keys(ref_text):
+        return False
+    return any(d == digits and (not s or s == suffix) for d, s in _ref_years(ref_text))
+
+
+def _author_year_item_link(surname: str, year: str, reflist: List[dict]) -> Optional[int]:
+    """The ONE reflist entry index an author-year item links to, or ``None``.
+
+    Every entry that matches (:func:`_ref_matches_item`) is a candidate. One
+    candidate links; several are narrowed to those carrying the item's exact
+    suffix; anything still ambiguous ("(Smith, 2020)" against two unsuffixed
+    Smith-2020 entries) stays UNLINKED rather than taking the first, so a
+    co-citation is never silently pointed at the wrong work.
+    """
+    hits = [e for e in reflist if _ref_matches_item(e["text"], surname, year)]
+    digits, suffix = _split_year(year)
+    if len(hits) > 1 and suffix:
+        hits = [e for e in hits if (digits, suffix) in _ref_years(e["text"])]
+    return hits[0]["index"] if len(hits) == 1 else None
+
+
+def _author_year_item_links(marker_text: str, reflist: List[dict]) -> List[Optional[int]]:
+    """Per item of an author-year marker, the reflist entry index it links to,
+    or ``None`` (unlinked or ambiguous). Aligned with :func:`_author_year_items`;
+    plan-time linking AND apply-time placement both read it."""
+    return [_author_year_item_link(s, y, reflist) for s, y in _author_year_items(marker_text)]
+
+
+def _marker_item_count(marker: dict) -> int:
+    """How many works a marker cites: numeric → every expanded number; author-
+    year → its items (at least 1, so an unparseable marker still counts as one)."""
+    if marker.get("kind") == "numeric":
+        return len(_numeric_marker_targets(marker.get("text") or ""))
+    return max(1, len(_author_year_items(marker.get("text") or "")))
 
 
 def _link_intext_to_reflist(intext: List[dict], reflist: List[dict]) -> Dict[int, List[int]]:
     """Map each reflist entry index → list of in-text marker indices pointing to it.
 
     * numeric marker → reflist entry whose ``numbering`` equals the cited number.
-    * author_year marker → reflist entry whose first-author surname + year both
-      appear in the entry text.
+    * author_year marker → EVERY item of the marker (:func:`_author_year_items`)
+      links to the ONE reflist entry whose first-author surname matches
+      (casefolded, accent-insensitive) and whose text carries the item's year
+      and suffix (:func:`_author_year_item_link`; ambiguous → unlinked).
+      A grouped "(Alpha, 2022; Beta, 2012)" therefore links to both references.
 
     Returns ``{reflist_index: [intext_index, ...]}``. Markers that cannot be
     linked are reported separately by the caller (see ``unlinked_intext``).
@@ -179,21 +338,151 @@ def _link_intext_to_reflist(intext: List[dict], reflist: List[dict]) -> Dict[int
                 if num in by_number:
                     _add(by_number[num], it_idx)
         else:  # author_year
-            author = _first_author_of_marker(marker["text"])
-            year = _year_of_marker(marker["text"])
-            if not author or not year:
-                continue
-            for entry in reflist:
-                etext = entry["text"]
-                ref_author = _reflist_first_author(etext)
-                if (
-                    ref_author
-                    and ref_author.lower() == author.lower()
-                    and year in _YEAR_RE.findall(etext)
-                ):
-                    _add(entry["index"], it_idx)
-                    break
+            for ref_idx in _author_year_item_links(marker["text"], reflist):
+                if ref_idx is not None:
+                    _add(ref_idx, it_idx)
     return links
+
+
+# Default bound on DISTINCT (surname, year) PubMed queries per plan.
+INTEXT_CANDIDATE_QUERY_CAP = 60
+# Candidates kept per unlinked author-year item.
+_INTEXT_CANDIDATES_PER_ITEM = 5
+
+
+def _plan_intext_inventory(intext: List[dict], reflist: List[dict]) -> List[dict]:
+    """Every in-text marker as the plan reports it: ``{index, text, kind,
+    n_items}`` plus, for author-year markers, ``items`` =
+    ``[{item, surname, year, ref_index}]`` (``ref_index`` ``None`` = that item
+    has no reference-list link). This is what ``decisions["intext_keys"]`` is
+    validated against at apply time."""
+    out: List[dict] = []
+    for m in intext:
+        entry = {"index": m["index"], "text": m["text"], "kind": m["kind"],
+                 "n_items": _marker_item_count(m)}
+        if m["kind"] == "author_year":
+            links = _author_year_item_links(m["text"], reflist)
+            entry["items"] = [
+                {"item": i, "surname": s, "year": y, "ref_index": links[i]}
+                for i, (s, y) in enumerate(_author_year_items(m["text"]))
+            ]
+        out.append(entry)
+    return out
+
+
+def _pubmed_author_year_query(surname: str, year: str) -> Tuple[List[dict], str]:
+    """Up to 5 PubMed records whose FIRST author is ``surname`` and publication
+    year is ``year``: ``(candidates, status)``. Never raises; status is ``ok``,
+    ``no_hits``, ``degraded`` (esearch/efetch failure) or ``error``."""
+    name = f'"{surname}"' if " " in surname else surname
+    term = f"{name}[1au] AND {year}[dp]"
+    try:
+        pmids, st = entrez.esearch_pmids_status(term, retmax=_INTEXT_CANDIDATES_PER_ITEM)
+        if not pmids:
+            return [], ("degraded" if st.get("degraded") else "no_hits")
+        recs, fst = entrez.efetch_pubmed_status(pmids)
+    except Exception:  # noqa: BLE001 — a candidate search must never fail planning
+        return [], "error"
+    cands: List[dict] = []
+    for pmid in pmids[:_INTEXT_CANDIDATES_PER_ITEM]:
+        rec = recs.get(pmid)
+        if not rec:
+            continue
+        structured = rec.get("authors_structured") or []
+        if structured and isinstance(structured[0], dict):
+            first = structured[0].get("family") or ""
+        else:
+            plain = rec.get("authors") or []
+            first = str(plain[0]).rsplit(" ", 1)[0] if plain else ""
+        cands.append({
+            "pmid": str(pmid),
+            "doi": rec.get("doi") or None,
+            "title": rec.get("title") or "",
+            "first_author": first,
+            "year": rec.get("year") or "",
+            "journal": rec.get("journal") or "",
+        })
+    if not cands and fst.get("degraded"):
+        return [], "degraded"
+    return cands, ("ok" if cands else "no_hits")
+
+
+def _pubmed_intext_candidates(plan_intext: List[dict], *, max_queries: int) -> Tuple[dict, dict]:
+    """CONFIRM-ONLY PubMed candidates for every author-year item with no
+    reference-list link: ``({str(intext_index): [item_entry, ...]}, summary)``.
+
+    Nothing here is ever applied: a candidate reaches the document only when the
+    user copies its PMID/DOI into ``decisions["intext_keys"]``. Bounded: one
+    query per DISTINCT (surname key, year), at most ``max_queries`` of them;
+    items past the cap get status ``not_queried_cap``. A failed search records
+    a status and never raises.
+    """
+    wanted: List[Tuple[dict, dict]] = []   # (marker entry, item entry)
+    for m in plan_intext:
+        for it in m.get("items") or []:
+            if it.get("ref_index") is None:
+                wanted.append((m, it))
+    cache: Dict[Tuple[str, str], Tuple[List[dict], str]] = {}
+    out: Dict[str, List[dict]] = {}
+    n_capped = 0
+    hb: dict = {}
+    for n, (m, it) in enumerate(wanted, 1):
+        # PubMed's [dp] knows no "2020a": query by the digits, so "2020a" and
+        # "2020b" by one author share a query (and its candidates).
+        digits = _split_year(it["year"])[0]
+        qkey = (_surname_key(it["surname"]), digits)
+        if not digits:
+            cands, status = [], "no_year"     # undated item: nothing to search by
+        elif not qkey[0]:
+            cands, status = [], "no_surname"  # year-only item with no author before it
+        elif qkey not in cache:
+            if len(cache) >= max(0, int(max_queries)):
+                cands, status = [], "not_queried_cap"
+                n_capped += 1
+            else:
+                cache[qkey] = _pubmed_author_year_query(it["surname"], digits)
+                cands, status = cache[qkey]
+        else:
+            cands, status = cache[qkey]
+        _resolution_heartbeat("unify pubmed candidates", n, len(wanted), hb)
+        out.setdefault(str(m["index"]), []).append({
+            "item": it["item"], "surname": it["surname"], "year": it["year"],
+            "status": status, "candidates": [dict(c) for c in cands],
+        })
+    summary = {
+        "items": len(wanted),
+        "queries": len(cache),
+        "query_cap": int(max_queries),
+        "items_capped": n_capped,
+        "degraded": sum(1 for _c, s in cache.values() if s in ("degraded", "error")),
+    }
+    return out, summary
+
+
+def _decisions_template() -> dict:
+    """The decisions JSON shape, emitted in every plan so a user can copy it."""
+    return {
+        "accept": [],
+        "placeholder_resolutions": {},
+        "intext_keys": {},
+        "add_missing": True,
+        "_help": {
+            "accept": "ref_index values from needs_confirmation.references to accept "
+                      "(HIGH-tier refs in 'auto' are accepted without listing).",
+            "placeholder_resolutions": '{"<ph_index>": "suggestion" | <candidate index> '
+                                       '| {metadata} | null}',
+            "intext_keys": '{"<intext index>" or "<exact marker text>": "<identifier>" '
+                           'or ["<identifier>", ...] one per cited item, in item order}. '
+                           "Identifier: a DOI (10.xxxx/...), a PMID ('PMID:123' or bare "
+                           "digits) or an 8-character Zotero item key in the group "
+                           "library. An index key wins over a text key for the same "
+                           "marker; a text key applies to every marker with that text. "
+                           "Use for markers with no reference-list link "
+                           "(see 'intext' / 'intext_candidates'); copy a candidate's "
+                           "pmid or doi here to confirm it.",
+            "add_missing": "false = never create Zotero items (same as --no-add-missing)",
+        },
+    }
 
 
 def _candidates_divergent(resolved: dict) -> bool:
@@ -252,6 +541,7 @@ def plan_unification(
     fetch: bool = True,
     check_retractions: bool = True,
     offline: bool = False,
+    max_candidate_queries: int = INTEXT_CANDIDATE_QUERY_CAP,
 ) -> dict:
     """Read-only planning pass for reference unification (NO writes, NO doc edits).
 
@@ -281,12 +571,21 @@ def plan_unification(
           attempting a network call.  Zero network calls are guaranteed.
 
         The default (``False``) preserves the existing online behaviour.
+    max_candidate_queries:
+        Bound on DISTINCT (first-author surname, year) PubMed searches made for
+        author-year items with no reference-list link (default
+        :data:`INTEXT_CANDIDATE_QUERY_CAP`). Searches run only when ``fetch``
+        is on (never offline / ``--no-fetch``); ``0`` disables them.
 
     Returns
     -------
     dict
         ``{"summary", "references", "placeholders", "foreign_fields",
-        "needs_confirmation", "auto"}`` — see module docstring / spec.
+        "needs_confirmation", "auto", "intext", "intext_candidates",
+        "decisions_template"}`` — see module docstring / spec.
+        ``intext_candidates`` maps ``str(intext index)`` to per-item PubMed
+        candidates; they are CONFIRM-ONLY and never applied unless copied into
+        ``decisions["intext_keys"]``.
     """
     if offline:
         fetch = False
@@ -308,6 +607,14 @@ def plan_unification(
         for m in intext
         if m["index"] not in linked_intext_indices
     ]
+    plan_intext = _plan_intext_inventory(intext, reflist)
+
+    # ---- PubMed candidates for unlinked author-year items (confirm-only) ---
+    intext_candidates: dict = {}
+    candidates_summary: Optional[dict] = None
+    if fetch:
+        intext_candidates, candidates_summary = _pubmed_intext_candidates(
+            plan_intext, max_queries=max_candidate_queries)
 
     # ---- retraction DB (loaded once, offline-resilient) -------------------
     # Single owner: citecheck.load_retraction_map. allow_network=True (explicit)
@@ -484,6 +791,8 @@ def plan_unification(
     }
     if network_note:
         summary["network_note"] = network_note
+    if candidates_summary is not None:
+        summary["intext_candidates"] = candidates_summary
 
     return {
         "summary": summary,
@@ -496,6 +805,9 @@ def plan_unification(
             "placeholders": needs_confirmation_placeholders,
         },
         "auto": auto,
+        "intext": plan_intext,
+        "intext_candidates": intext_candidates,
+        "decisions_template": _decisions_template(),
     }
 
 
@@ -663,6 +975,288 @@ def _resolve_link_markers(
     return out
 
 
+# ===========================================================================
+# decisions["intext_keys"] — in-text marker → identifier(s)
+# ===========================================================================
+
+class IntextKeysError(ValueError):
+    """``decisions["intext_keys"]`` failed validation. Raised by
+    :func:`apply_unification` BEFORE any Zotero write or document change; the
+    message names the marker index (and the marker's own text, never more of
+    the document)."""
+
+
+_ZOTERO_ITEM_KEY_RE = re.compile(r"[A-Z0-9]{8}")
+_PMID_IDENT_RE = re.compile(r"(?i)pmid\s*:?\s*(\d{1,9})")
+_DOI_IDENT_RE = re.compile(r"10\.\d{4,9}/\S+")
+
+
+def _parse_intext_identifier(raw: Any) -> Tuple[str, str]:
+    """``(kind, value)`` for one ``intext_keys`` identifier, ``kind`` in
+    ``doi`` / ``pmid`` / ``key``; raises ``ValueError`` when malformed.
+
+    * ``"PMID:123"`` (any case, optional space/colon) or bare digits → PMID.
+      An all-digit string is ALWAYS a PMID, never a Zotero key.
+    * exactly 8 characters ``[A-Z0-9]`` → Zotero item key.
+    * otherwise a DOI (``doi:`` / ``https://doi.org/`` prefixes allowed),
+      normalised by :func:`citecheck._normalise_doi`.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("identifier must be a non-empty string")
+    s = raw.strip()
+    m = _PMID_IDENT_RE.fullmatch(s)
+    if m:
+        return "pmid", m.group(1)
+    if s.isdigit():
+        if len(s) > 9:
+            raise ValueError("PMID too long")
+        return "pmid", s
+    if _ZOTERO_ITEM_KEY_RE.fullmatch(s):
+        return "key", s
+    doi = citecheck._normalise_doi(re.sub(r"(?i)^doi:\s*", "", s))
+    if doi and _DOI_IDENT_RE.fullmatch(doi):
+        return "doi", doi
+    raise ValueError("not a DOI, PMID or Zotero item key")
+
+
+def _plan_intext_markers(plan: dict) -> List[dict]:
+    """The plan-time in-text inventory ``intext_keys`` is validated against:
+    ``plan["intext"]``; for an older plan without it, the union of
+    ``unlinked_intext`` and every reference's ``intext_markers``."""
+    if isinstance(plan.get("intext"), list):
+        return [m for m in plan["intext"] if isinstance(m, dict) and "index" in m]
+    seen: Dict[int, dict] = {}
+    for m in plan.get("unlinked_intext") or []:
+        seen.setdefault(int(m["index"]), m)
+    for ref in plan.get("references") or []:
+        for m in ref.get("intext_markers") or []:
+            seen.setdefault(int(m["index"]), m)
+    return [seen[i] for i in sorted(seen)]
+
+
+def _validate_intext_keys(plan: dict, decisions: dict, lib_index: Optional[dict]) -> List[dict]:
+    """Validate ``decisions["intext_keys"]`` against the plan; return
+    ``[{"index", "marker", "idents": [(kind, value), ...]}]`` sorted by index.
+
+    Fails closed (:class:`IntextKeysError`) on: a non-object value; an unknown
+    marker index or marker text; the same index given twice; a value list whose
+    length differs from the marker's item count; a malformed identifier; a
+    marker also linked to a reference the user listed in ``decisions["accept"]``
+    (two decisions for one marker); a Zotero key absent from a successful
+    library read. Precedence: an INDEX key wins over a TEXT key for the same
+    marker; a text key applies to every marker carrying exactly that text.
+    """
+    raw = decisions.get("intext_keys")
+    if raw is None or raw == {}:
+        return []
+    if not isinstance(raw, dict):
+        raise IntextKeysError(
+            "decisions['intext_keys'] must be an object mapping an in-text marker "
+            "(plan intext index, or its exact text) to an identifier or a list of "
+            "identifiers")
+    inventory = _plan_intext_markers(plan)
+    by_index = {int(m["index"]): m for m in inventory}
+    by_text: Dict[str, List[dict]] = {}
+    for m in inventory:
+        by_text.setdefault(m.get("text") or "", []).append(m)
+
+    assigned: Dict[int, Any] = {}
+    text_keys: List[Tuple[str, Any]] = []
+    for k, v in raw.items():
+        if isinstance(k, int) and not isinstance(k, bool) or (
+            isinstance(k, str) and k.strip().isdigit()
+        ):
+            idx = int(k)
+            if idx not in by_index:
+                raise IntextKeysError(f"intext_keys: no in-text marker with index {idx} in the plan")
+            if idx in assigned:
+                raise IntextKeysError(f"intext_keys: marker {idx} is given more than once")
+            assigned[idx] = v
+        elif isinstance(k, str) and k in by_text:
+            text_keys.append((k, v))
+        else:
+            raise IntextKeysError(f"intext_keys: no in-text marker with text {k!r} in the plan")
+    for text, v in text_keys:
+        for m in by_text[text]:
+            assigned.setdefault(int(m["index"]), v)   # an index key wins
+
+    explicit = set(decisions.get("accept", []) or [])
+    accepted_link: Dict[int, Any] = {}
+    for ref in plan.get("references") or []:
+        if ref.get("ref_index") in explicit:
+            linked = list(ref.get("intext_links") or [])
+            linked += [m.get("index") for m in ref.get("intext_markers") or []]
+            for i in linked:
+                if i is not None:
+                    accepted_link.setdefault(int(i), ref["ref_index"])
+
+    lib_keys: Optional[set] = None
+    if lib_index is not None:
+        lib_keys = set()
+        for sub in ("doi", "pmid", "title"):
+            lib_keys.update((lib_index.get(sub) or {}).values())
+
+    out: List[dict] = []
+    for idx in sorted(assigned):
+        m = by_index[idx]
+        label = f"intext_keys: marker {idx} {m.get('text')!r}"
+        if idx in accepted_link:
+            raise IntextKeysError(
+                f"{label} is also handled by decisions['accept'] (reference "
+                f"{accepted_link[idx]}); keep one of the two")
+        v = assigned[idx]
+        vals = v if isinstance(v, list) else [v]
+        n = _marker_item_count(m)
+        if len(vals) != n:
+            raise IntextKeysError(
+                f"{label}: {len(vals)} identifier(s) given but the marker cites {n} "
+                "item(s); give a list with one identifier per item, in item order")
+        idents: List[Tuple[str, str]] = []
+        for pos, val in enumerate(vals):
+            try:
+                kind, ident = _parse_intext_identifier(val)
+            except ValueError as exc:
+                raise IntextKeysError(
+                    f"{label} item {pos}: malformed identifier {val!r} ({exc})") from None
+            if kind == "key" and lib_keys is not None and ident not in lib_keys:
+                raise IntextKeysError(
+                    f"{label} item {pos}: Zotero key {ident} is not in the group library")
+            idents.append((kind, ident))
+        out.append({"index": idx, "marker": m, "idents": idents})
+    return out
+
+
+def _intext_key_placements(
+    assignments: List[dict],
+    lib_index: Optional[dict],
+    *,
+    add_missing: bool,
+    report: dict,
+    to_create_metas: List[dict],
+    to_create_back: List[dict],
+) -> List[dict]:
+    """Turn validated ``intext_keys`` assignments into placements (one per cited
+    item, carrying ``intext_index`` + ``item_pos``) and route each identifier:
+
+    * Zotero key → cited as-is (validation already proved it is in the library;
+      on a degraded read it cannot be proved → ``needs_input``, not cited).
+    * DOI / PMID present in the library (:func:`zotero.lookup_index_key`, the
+      single presence owner) → cited by that key.
+    * missing DOI / PMID → appended to ``to_create_metas``/``to_create_back`` so
+      the caller's step 4 decides (degraded read → refuse; ``add_missing`` off →
+      skipped; write gate; ``create_items(dedup, index_degraded)``). Metadata is
+      fetched (``refresolve._crossref_doi_fetch`` / ``_pubmed_fetch``, the
+      identifier-first fetchers ``resolve_reference`` itself uses) ONLY when a
+      create can actually happen (readable library and ``add_missing``); a
+      failed lookup is a ``needs_input``, never a bibliographic guess. A work
+      already queued for creation (same DOI/PMID) is not queued twice: the
+      placement becomes a ``_siblings`` entry of the queued one.
+
+    Mutates ``report`` (matched / needs_input) and the two to-create lists.
+    """
+    placements: List[dict] = []
+    resolved: Dict[Tuple[str, str], dict] = {}
+
+    def _queued(meta: dict) -> Optional[dict]:
+        doi = _meta_doi(meta)
+        ndoi = citecheck._normalise_doi(doi) if doi else None
+        pmid = _meta_pmid(meta)
+        for qpl, qmeta in zip(to_create_back, to_create_metas):
+            qdoi = _meta_doi(qmeta)
+            if ndoi and qdoi and citecheck._normalise_doi(qdoi) == ndoi:
+                return qpl
+            if pmid and _meta_pmid(qmeta) == pmid:
+                return qpl
+        return None
+
+    def _resolve(kind: str, ident: str, pl: dict) -> dict:
+        label = {"doi": "DOI", "pmid": "PMID", "key": "Zotero key"}[kind] + f" {ident}"
+        pl["title"] = label
+        if kind == "key":
+            if lib_index is None:
+                report["needs_input"].append({
+                    "title": label, "doi": None, **_intext_ref(pl),
+                    "reason": "Zotero library could not be read (degraded/unavailable); "
+                              "cannot confirm this item key exists, so the marker is "
+                              "left as plain text. Re-run when the library is reachable.",
+                })
+                return {}
+            report["matched"].append({"title": label, "key": ident, **_intext_ref(pl)})
+            return {"key": ident, "meta": None}
+        doi = ident if kind == "doi" else None
+        pmid = ident if kind == "pmid" else None
+        key = _lookup_in_library(lib_index, doi=doi, pmid=pmid, title=None) if lib_index else None
+        if key:
+            report["matched"].append({"title": label, "key": key, **_intext_ref(pl)})
+            return {"key": key, "meta": None}
+        meta: dict = {"doi": doi} if doi else {"pmid": pmid}
+        if lib_index is not None and add_missing:
+            # The identifier fetchers directly (not resolve_reference): a failed
+            # DOI/PMID lookup must not fall through to a bibliographic search.
+            try:
+                rmeta = (refresolve._crossref_doi_fetch(doi) if doi
+                         else refresolve._pubmed_fetch(pmid))
+            except Exception:  # noqa: BLE001 — a lookup failure is a needs_input
+                rmeta = None
+            if not isinstance(rmeta, dict):
+                report["needs_input"].append({
+                    "title": label, "doi": doi, **_intext_ref(pl),
+                    "reason": "could not resolve this identifier's metadata "
+                              "(Crossref/PubMed); nothing to add to Zotero or cite.",
+                })
+                return {}
+            meta = _strip_score(dict(rmeta))
+            if doi and not meta.get("doi"):
+                meta["doi"] = doi
+            if pmid and not meta.get("pmid"):
+                meta["pmid"] = pmid
+            pl["title"] = _meta_title(meta) or label
+            key = _lookup_in_library(lib_index, doi=_meta_doi(meta),
+                                     pmid=_meta_pmid(meta), title=_meta_title(meta))
+            if key:
+                report["matched"].append({"title": pl["title"], "key": key, **_intext_ref(pl)})
+                return {"key": key, "meta": meta}
+            queued = _queued(meta)
+            if queued is not None:
+                return {"rep": queued, "meta": meta}
+        pl["meta"] = meta
+        to_create_metas.append(meta)
+        to_create_back.append(pl)
+        return {"rep": pl, "meta": meta}
+
+    for a in assignments:
+        m = a["marker"]
+        for pos, (kind, ident) in enumerate(a["idents"]):
+            pl = {
+                "meta": None, "key": None, "is_ph": False, "ph": None,
+                "ref_index": None, "printed_number": None,
+                "intext_links": [m["index"]],
+                "intext_markers": [{"index": m["index"], "text": m["text"],
+                                    "kind": m.get("kind")}],
+                "intext_index": m["index"], "item_pos": pos, "title": "",
+            }
+            placements.append(pl)
+            st = resolved.get((kind, ident))
+            if st is None:
+                st = resolved[(kind, ident)] = _resolve(kind, ident, pl)
+            else:
+                pl["title"] = (st.get("rep") or {}).get("title") or f"{kind} {ident}"
+            if st.get("key"):
+                pl["key"], pl["meta"] = st["key"], st.get("meta")
+            elif st.get("rep") is not None and st["rep"] is not pl:
+                pl["meta"] = st.get("meta")
+                st["rep"].setdefault("_siblings", []).append(pl)
+    return placements
+
+
+def _intext_ref(pl: dict) -> dict:
+    """Report fields naming the in-text marker an ``intext_keys`` placement
+    came from (empty for reference / placeholder placements)."""
+    if pl.get("intext_index") is None:
+        return {}
+    return {"intext_index": pl["intext_index"], "item": pl.get("item_pos")}
+
+
 def apply_unification(
     path,
     plan: dict,
@@ -692,6 +1286,18 @@ def apply_unification(
         ``decisions["add_missing"]`` (if present) overrides the ``add_missing``
         keyword. ``choice`` is a metadata dict, a candidate index, the string
         ``"suggestion"``, or ``None`` (see :func:`_resolve_placeholder_meta`).
+        ``decisions["intext_keys"]`` maps an in-text marker (plan ``intext``
+        index as a string, or the exact marker text) to an identifier — DOI,
+        PMID (``"PMID:123"`` / bare digits) or 8-character Zotero item key — or a
+        list of them, one per cited item in item order. Each marker becomes a
+        Zotero citation field even with no reference list: an identifier already
+        in the library is cited by its key; a missing DOI/PMID is resolved
+        (Crossref/PubMed) and created through the same gated create path as a
+        missing reference (or reported in ``needs_input`` when ``add_missing``
+        is off / the library read is degraded). It is validated BEFORE any
+        Zotero write or document change; any problem raises
+        :class:`IntextKeysError` and nothing is written
+        (see :func:`_validate_intext_keys`).
     out:
         Destination path for the rewritten document.
     add_missing:
@@ -710,7 +1316,10 @@ def apply_unification(
     -------
     dict
         ``{"out", "added", "matched", "replaced", "needs_input",
-        "retracted_flagged", "unresolved_in_doc"}``.
+        "retracted_flagged", "unresolved_in_doc", "create_failed",
+        "skipped_degraded_read", "author_check"}``. ``author_check`` holds one
+        PubMed author decision per item sent to create (``pubmed`` /
+        ``confirmed`` / ``authors_unverified``, with a ``reason``).
 
         **``replaced`` counts PHYSICAL in-text citation LOCATIONS, not
         references.** Each is one increment: a converted foreign field
@@ -763,6 +1372,11 @@ def apply_unification(
     # refused on a degraded read.
     doi_index = None if lib_index is None else (lib_index.get("doi") or {})
 
+    # Validate decisions["intext_keys"] FIRST: everything above is a read, and a
+    # bad marker / identifier must stop the run before any Zotero write or
+    # document change (raises IntextKeysError).
+    intext_assignments = _validate_intext_keys(plan, decisions, lib_index)
+
     report: dict = {
         "out": None,
         "added": [],
@@ -774,6 +1388,9 @@ def apply_unification(
         # Surfaced by the CLI so a "added 0" is never silently ambiguous.
         "create_failed": [],
         "skipped_degraded_read": [],
+        # Per created item: PubMed author check (zotero.create_items
+        # verify_authors -> refresolve.reconcile_create_authors).
+        "author_check": [],
     }
 
     # -----------------------------------------------------------------------
@@ -907,6 +1524,17 @@ def apply_unification(
             to_create_back.append(placement)
         placements.append(placement)
 
+    # 3b. decisions["intext_keys"]: one placement per cited ITEM of each named
+    #     marker. Identifiers already in the library cite their key; missing
+    #     DOIs/PMIDs join to_create so step 4's gates (degraded read, add_missing,
+    #     write access, create_items dedup + index_degraded) apply unchanged. An
+    #     identifier needed by several items is resolved and created ONCE; the
+    #     other placements are its "_siblings" and take its key after step 4.
+    intext_placements = _intext_key_placements(
+        intext_assignments, lib_index, add_missing=add_missing,
+        report=report, to_create_metas=to_create_metas,
+        to_create_back=to_create_back)
+
     # -----------------------------------------------------------------------
     # 4. Create the missing items (confirm-gated, write-guarded).
     # -----------------------------------------------------------------------
@@ -918,7 +1546,7 @@ def apply_unification(
             # library is reachable. Fail closed — never create on uncertain reads.
             for pl in to_create_back:
                 report["needs_input"].append({
-                    "title": pl["title"],
+                    "title": pl["title"], **_intext_ref(pl),
                     "doi": _meta_doi(pl["meta"]),
                     "reason": "Zotero library could not be read (degraded/unavailable); "
                               "refusing to create to avoid duplicate writes to the "
@@ -927,7 +1555,7 @@ def apply_unification(
         elif not add_missing:
             for pl in to_create_back:
                 report["needs_input"].append({
-                    "title": pl["title"],
+                    "title": pl["title"], **_intext_ref(pl),
                     "doi": _meta_doi(pl["meta"]),
                     "reason": "missing from library; add_missing=False",
                 })
@@ -945,7 +1573,7 @@ def apply_unification(
                            "to the group library manually, then re-run.")
             for pl in to_create_back:
                 report["needs_input"].append({
-                    "title": pl["title"],
+                    "title": pl["title"], **_intext_ref(pl),
                     "doi": _meta_doi(pl["meta"]),
                     "reason": _reason,
                 })
@@ -959,7 +1587,9 @@ def apply_unification(
                 pmid_index=(lib_index.get("pmid") if lib_index else None),
                 attach_pdfs=attach_pdfs,
                 index_degraded=index_degraded,
+                verify_authors=True,
             )
+            report["author_check"] = list(created.get("author_check", []))
             # Surface the raw create failures / degraded-read refusals so a
             # "added 0" is never silently ambiguous (the CLI prints these).
             report["create_failed"] = list(created.get("failed", []))
@@ -1000,11 +1630,11 @@ def apply_unification(
                     sk = skipped_by_title.get(meta_title_l) or skipped_by_title.get(title_l)
                     if sk:
                         pl["key"] = sk
-                        report["matched"].append({"title": pl["title"], "key": sk})
+                        report["matched"].append({"title": pl["title"], "key": sk, **_intext_ref(pl)})
                         continue
                 if key is None and (meta_title_l in degraded_titles or title_l in degraded_titles):
                     report["needs_input"].append({
-                        "title": pl["title"],
+                        "title": pl["title"], **_intext_ref(pl),
                         "doi": doi,
                         "reason": "Zotero library read was degraded — refused to create "
                                   "(fail-closed) to avoid a duplicate write; re-run when "
@@ -1013,20 +1643,27 @@ def apply_unification(
                     continue
                 if key is None and (meta_title_l in failed_titles or title_l in failed_titles):
                     report["needs_input"].append({
-                        "title": pl["title"],
+                        "title": pl["title"], **_intext_ref(pl),
                         "doi": doi,
                         "reason": "Zotero create failed for this item.",
                     })
                     continue
                 if key is None:
                     report["needs_input"].append({
-                        "title": pl["title"],
+                        "title": pl["title"], **_intext_ref(pl),
                         "doi": doi,
                         "reason": "could not map a Zotero key to this item after create.",
                     })
                     continue
                 pl["key"] = key
-                report["added"].append({"title": pl["title"], "key": key})
+                report["added"].append({"title": pl["title"], "key": key, **_intext_ref(pl)})
+
+    # An identifier shared by several placements was queued ONCE (see
+    # _intext_key_placements); its siblings cite whatever key it ended with.
+    for pl in to_create_back:
+        for sib in pl.get("_siblings", []):
+            sib["key"] = pl["key"]
+            sib["meta"] = sib.get("meta") or pl["meta"]
 
     # -----------------------------------------------------------------------
     # 5. Rewrite the document.
@@ -1107,9 +1744,20 @@ def apply_unification(
     #
     # First pass: bucket every accepted, keyed, non-placeholder placement by the
     # identity of the physical inventory marker it resolves to (ref3 and ref4 both
-    # resolve to the SAME marker object, so ``id(marker)`` groups them). Author-year
-    # markers link to a single reference, so they form natural singleton groups.
+    # resolve to the SAME marker object, so ``id(marker)`` groups them). A grouped
+    # author-year marker gathers one member per linked item the same way.
+    #
+    # decisions["intext_keys"] placements are bucketed FIRST into groups flagged
+    # ``intext``: the user's explicit identifiers win for that physical marker, so
+    # a reference merely auto-linked to the same marker is NOT added to it (it is
+    # still placed at its other markers). Validation already refused a marker
+    # that is also linked to an explicitly ACCEPTED reference.
     marker_groups: Dict[int, dict] = {}
+    for pl in intext_placements:
+        for marker in _resolve_link_markers(pl, intext_by_text, intext_by_index):
+            g = marker_groups.setdefault(
+                id(marker), {"marker": marker, "members": [], "intext": True})
+            g["members"].append(pl)
     for pl in placements:
         if pl["is_ph"]:
             continue
@@ -1124,9 +1772,15 @@ def apply_unification(
             if g is None:
                 g = {"marker": marker, "members": []}
                 marker_groups[id(marker)] = g
+            elif g.get("intext"):
+                continue   # intext_keys owns this marker
             g["members"].append(pl)
 
     # Second pass: convert each physical marker once.
+    # The plan's whole reference list (every entry, accepted or not), so the
+    # author-year branch re-links each item exactly as plan time did.
+    ay_reflist = [{"index": r["ref_index"], "text": r.get("input") or ""}
+                  for r in references if r.get("ref_index") is not None]
     for g in marker_groups.values():
         marker = g["marker"]
         members = g["members"]
@@ -1141,7 +1795,31 @@ def apply_unification(
         # returns the YEAR for an author-year marker ("(Smith, 2020)" -> [2020]),
         # so it cannot distinguish numeric from author-year.
         targets = _numeric_marker_targets(anchor) if marker["kind"] == "numeric" else []
-        if marker["kind"] == "numeric":
+        if g.get("intext"):
+            # decisions["intext_keys"]: each member carries its item position;
+            # cite them in item order. All-or-nothing: an item whose identifier
+            # could not be keyed (skipped / refused / failed) leaves the whole
+            # marker as plain text.
+            n_items = _marker_item_count(marker)
+            by_pos: Dict[int, dict] = {}
+            for pl in members:
+                if pl.get("key") is not None:
+                    by_pos.setdefault(pl["item_pos"], pl)
+            missing = [i for i in range(n_items) if i not in by_pos]
+            if missing:
+                report["unresolved_in_doc"].append({
+                    "marker": anchor,
+                    "kind": marker["kind"],
+                    "intext_index": members[0].get("intext_index"),
+                    "reason": (
+                        f"intext_keys item(s) {missing} have no Zotero item (see "
+                        "needs_input); left as plain text (all-or-nothing) so no "
+                        "co-citation is silently dropped"
+                    ),
+                })
+                continue
+            ordered = [by_pos[i] for i in range(n_items)]
+        elif marker["kind"] == "numeric":
             # NUMERIC marker (single "[3]" or grouped "[3,4]"/"[5-7]"): cite EVERY
             # number, in the marker's printed order. Map each number to its keyed
             # placement via the carried printed reflist number.
@@ -1191,25 +1869,35 @@ def apply_unification(
                     continue
                 ordered = [by_num[n] for n in targets]
         else:
-            # Author-year (or otherwise non-numeric) marker: link is to a single
-            # reference (see _link_intext_to_reflist, whose author_year arm
-            # ``break``s after the first match). Cite the keyed member(s) in the
-            # order encountered.
-            ordered = [pl for pl in members if pl.get("key") is not None]
-            # All-or-nothing, symmetric with the numeric branch above. Today this
-            # cannot fire (single-member by construction), but it makes the
-            # no-silent-co-citation-drop invariant LOCAL instead of depending on a
-            # distant ``break``: if author-year linkage ever grows to group
-            # "(Smith 2020; Jones 2021)", an unkeyable member must leave the whole
-            # marker as plain text rather than silently citing the keyed subset.
-            if len(ordered) != len(members):
+            # Author-year marker: every item links to its own reference. Place
+            # each item by RE-RUNNING the plan's link owner over the plan's
+            # full reference list (_author_year_item_links: suffix-aware,
+            # ambiguous → None), then look up that reference's keyed placement.
+            # All-or-nothing, symmetric with the numeric branch: the marker is
+            # converted only when EVERY item resolves to its own keyed member and
+            # no two items share one (a collapsed "(Smith, 2020; Smith, 2020)"
+            # would cite fewer works than it prints). Otherwise plain text +
+            # unresolved_in_doc, never a silent subset.
+            items = _author_year_items(anchor)
+            n_items = max(1, len(items))
+            keyed = {pl["ref_index"]: pl for pl in members
+                     if pl.get("key") is not None and pl.get("ref_index") is not None}
+            item_refs = _author_year_item_links(anchor, ay_reflist)
+            ordered = [keyed[r] for r in item_refs if r is not None and r in keyed]
+            distinct = len({id(pl) for pl in ordered})
+            if len(item_refs) != n_items or len(ordered) != n_items or distinct != n_items:
+                collapsed = len(ordered) == n_items and distinct != n_items
                 report["unresolved_in_doc"].append({
                     "marker": anchor,
                     "kind": marker["kind"],
                     "reason": (
+                        "grouped citation has two items resolving to the same "
+                        "reference; left as plain text (all-or-nothing) so no "
+                        "co-citation is silently dropped" if collapsed else
                         "grouped citation not fully accepted/keyed (an author-year "
-                        "co-cited member is unaccepted or unkeyable); left as plain "
-                        "text (all-or-nothing) so no co-citation is silently dropped"
+                        "item is unlinked, ambiguous, unaccepted or unkeyable); left "
+                        "as plain text (all-or-nothing) so no co-citation is "
+                        "silently dropped"
                     ),
                 })
                 continue

@@ -61,11 +61,11 @@ is never modified in place.
 | Resolve a journal name to a CSL id | `zwc csl --resolve "Annals of Neurology"` |
 | Search the Zotero library | `zwc zotero --search "tuber asd"` |
 | Look up by DOI | `zwc zotero --doi 10.1234/abcd --format reference` |
-| Insert a live citation at an anchor | `zwc cite-into FILE.docx --doi 10.1234/abcd --anchor "needs a cite here" -o OUT.docx` |
+| Insert a live citation at an anchor | `zwc cite-into FILE.docx --doi 10.1234/abcd --anchor "needs a cite here" -o OUT.docx` (`--suppress-author` for a narrative cite; `--bib-under "References"` adds a pre-rendered bibliography after that heading) |
 | List the Zotero fields in a doc | `zwc zotero-scan FILE.docx --check-links` |
 | Citation integrity + retraction screen | `zwc cite-check FILE.docx` |
 | Convert foreign citations to Zotero | `zwc convert-to-zotero FILE.docx --track -o OUT.docx` |
-| Unify ad-hoc / manual references | `zwc unify-refs FILE.docx` (then `--apply`) |
+| Unify ad-hoc / manual references | `zwc unify-refs FILE.docx` (then `--apply`; author-year markers with no reference list: map them in `decisions.intext_keys`) |
 | **EndNote → Zotero migration** | `zwc endnote-migrate FILE.docx LIBRARY.ris` (dry-run) then `--apply -o OUT.docx` |
 
 The default `--style` everywhere is `vancouver-superscript` (NIH numbered

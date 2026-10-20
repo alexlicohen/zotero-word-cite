@@ -119,8 +119,11 @@ _NUMBERING_EXTRACT_RE = re.compile(r"^\s*(\[\d+\]|\(?\d+\)\.?|\d+\.)\s+")
 # Minimum number of consecutive reference-shaped paragraphs to form a "run"
 _RUN_MIN_LEN = 3
 
-# 4-digit year in bibliographic range
-_YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
+# 4-digit year in bibliographic range, with an optional same-author letter
+# suffix: an APA entry "Smith, A. (2020a)." carries no other year, and a bare
+# ``\b`` after the digits dropped such entries from the reference list.
+# The suffix excludes "s" so a decade ("the 1990s") is not read as a year.
+_YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})(?:[a-rt-z])?\b")
 
 # Leading enumerator: [1], (1), 1. or 1) — shared textpatterns.NUMBERED_REF_RE
 # (recall-superset of the old local copy; verified behaviour-preserving here).
@@ -291,21 +294,76 @@ def _is_contiguous_filler(txt: str, last_accepted_num: Optional[int]) -> bool:
 # In-text citation patterns
 # ---------------------------------------------------------------------------
 
-# Author-year: (Smith et al., 2020) or (Smith & Jones, 2020a; Brown, 2019)
-# Also catches: Author (2020) — the bare form with the year in parens
-_AUTHOR_YEAR_PAREN_RE = re.compile(
-    r"\(([A-Z][A-Za-z'\-]+(?:\s+et\s+al\.?)?(?:\s*(?:&|and)\s*[A-Z][A-Za-z'\-]+)?,"
-    r"?\s+\d{4}[a-z]?(?:\s*;\s*[^)]{0,60})?)\)",
+# Author-year building blocks.  SINGLE OWNER of the in-text author-name token:
+# :mod:`unify` reuses ``AY_NAME`` to split a marker into (surname, year) items,
+# so detection and linking agree on what a name is.
+#
+# Python ``re`` has no ``\p{Lu}``, so the uppercase class is generated: ASCII
+# A-Z plus every uppercase letter in Latin-1 Supplement and Latin Extended-A/B
+# (À..ɏ: Ç, Ø, Ł, Š, Ž, ...).  The continuation is any letter (``[^\W\d_]`` is
+# Unicode-aware), so "Pagán", "Ørsted", "Çelik", "García-López", "O’Brien" are
+# names.  Irish surnames written as two words take a fixed prefix ("Ó Briain",
+# "Ní Bhriain", "Mac Lochlainn"); any other two-word span is NOT one name (that
+# would read "In Smith (2020)" as a surname).
+_AY_UPPER = "A-Z" + "".join(
+    c for c in map(chr, range(0xC0, 0x250)) if c.isupper()
 )
-# Bare "Author (2020)" form — author immediately followed by year in parens
+_AY_WORD = rf"[{_AY_UPPER}](?:[^\W\d_]|['’\-])+"
+AY_NAME = rf"(?:(?:Ó|Ní|Nic|Mac)\s+)?{_AY_WORD}"
+# Capitalised words that open ordinary parenthetical prose with a year
+# ("(In 2019)", "(Since 2019)", "(Table 2019)") — never a cited surname.
+_AY_STOP = (
+    r"(?:In|Since|From|Until|Till|Through|Before|After|During|By|As|Of|At|On|For"
+    r"|Circa|Ca|Around|About|Mid|Late|Early|Spring|Summer|Autumn|Fall|Winter"
+    r"|Year|Years|Fiscal|FY|Table|Tables|Figure|Figures|Fig|Appendix|Supplement)\b"
+)
+# Month names are surnames too ("May", "March"), so they are refused only in the
+# SOLO date shape: "(March 2019)" / "(May, 2019)" / "in March (2019)".  "(May et
+# al., 2019)" and "(May and Smith, 2019)" stay citations.
+_AY_MONTH = (
+    r"(?:January|February|March|April|May|June|July|August|September|October"
+    r"|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\b"
+)
+# One author field: "Smith", "Smith et al.", "Smith and Jones", "Smith & Jones".
+_AY_AUTHORS = (
+    rf"(?!{_AY_STOP}){AY_NAME}(?:\s+et\s+al\.?)?"
+    rf"(?:\s*(?:&|and)\s*{AY_NAME})?"
+)
+_AY_YEAR = r"\d{4}[a-z]?"
+# One cited item: author field + year, e.g. "Alpha et al., 2022".
+_AY_ITEM = rf"(?!{_AY_MONTH},?\s+\d){_AY_AUTHORS},?\s+{_AY_YEAR}"
+# Items of a group are joined by ';' or by 'and' ("(Alpha et al., 2022 and Beta
+# et al., 2012)").  An 'and' joins two ITEMS only when a full item (name + year)
+# follows it — "(Alpha and Beta, 2020)" is one two-author item, matched by
+# _AY_AUTHORS; "(Smith, 2020 and references therein)" is not a citation.
+_AY_ITEM_SEP = r"(?:\s*;\s*|\s*,?\s+and\s+)"
+
+# Author-year: (Smith et al., 2020), (Smith & Jones, 2020a; Brown, 2019),
+# (Alpha et al., 2022 and Beta et al., 2012), (Pagán et al., 2021).  The
+# permissive ';' tail is kept for back-compat ("(Smith, 2020; see also ...)").
+_AUTHOR_YEAR_PAREN_RE = re.compile(
+    rf"\(({_AY_ITEM}(?:{_AY_ITEM_SEP}{_AY_ITEM})*(?:\s*;\s*[^)]{{0,60}})?)\)",
+)
+# Bare / narrative "Author (2020)" form — author field immediately followed by
+# the year in parens: "Smith (2020)", "Smith et al. (2020)", "Delta and Epsilon
+# (2019)" (one item; the old pattern matched only "Epsilon (2019)").
 _AUTHOR_YEAR_BARE_RE = re.compile(
-    r"([A-Z][A-Za-z'\-]+(?:\s+et\s+al\.?)?)\s+\((\d{4}[a-z]?)\)",
+    rf"(?!{_AY_MONTH}\s+\()({_AY_AUTHORS})\s+\(({_AY_YEAR})\)",
+)
+# Narrative "Gamma et al., in 2019" / "Gamma et al. in 2019".  Only the "et al."
+# shape: a bare "Smith in 2019" is too often prose to call a citation.
+_AUTHOR_YEAR_IN_RE = re.compile(
+    rf"(?!{_AY_STOP})({AY_NAME}\s+et\s+al\.?),?\s+in\s+({_AY_YEAR})\b",
 )
 
 # Numeric citations: [12], [3,4], [5-7], (12), (3,4)
 # Must look like citation markers, not measurements (no units after them).
+# A BRACKETED marker may sit directly after a digit ("p < 0.05[12]", "in 2019[3]"):
+# a square bracket after a number is a citation, never maths in prose. A
+# PARENTHESIS after a digit stays excluded: "x2(3)", "F(1, 2)" and sub-figure
+# labels like "2(3)" are statistics/labels far more often than citations.
 _NUMERIC_CITE_RE = re.compile(
-    r"(?<!\d)[\[\(](\d+(?:\s*[,\-–]\s*\d+)*)[\]\)](?!\s*(?:mg|ml|kg|cm|mm|µm|nm|%|°|g\b|s\b|h\b|d\b|yr\b|min\b|sec\b|kDa\b))",
+    r"(?:\[|(?<!\d)\()(\d+(?:\s*[,\-–]\s*\d+)*)[\]\)](?!\s*(?:mg|ml|kg|cm|mm|µm|nm|%|°|g\b|s\b|h\b|d\b|yr\b|min\b|sec\b|kDa\b))",
 )
 # Require at least one purely numeric token — filter out things like (p<0.05)
 _NUMERIC_DIGITS_ONLY_RE = re.compile(r"^\d+(?:\s*[,\-–]\s*\d+)*$")
@@ -562,6 +620,169 @@ def _enumerator_run_indices(matches: list, txt: str) -> set:
     return set()
 
 
+# ---------------------------------------------------------------------------
+# Superscript numeric citations ("...lesion mapping¹²", "...tubers³,⁴")
+# ---------------------------------------------------------------------------
+# Character styles that put a footnote/endnote number in superscript: their text
+# is a note reference, never a citation.
+_NOTE_REF_STYLES = ("footnotereference", "endnotereference")
+# Punctuation that may share the superscript formatting at a marker's END
+# ("tubers12," with the comma superscripted too) — trimmed, not part of the cite.
+_SUP_TRAILING_PUNCT = ",.;:"
+
+
+class _SupChar:
+    """Per-character formatting facts for the superscript scan (see
+    :func:`_superscript_char_map`)."""
+
+    __slots__ = ("sup", "sub", "eligible")
+
+    def __init__(self, sup: bool = False, sub: bool = False, eligible: bool = False):
+        self.sup = sup            # vertAlign=superscript on the run
+        self.sub = sub            # vertAlign=subscript on the run
+        self.eligible = eligible  # superscript AND plain prose text (not a field, not a note ref)
+
+
+def _run_vert_align(r: etree._Element) -> str:
+    va = r.find(f"{qn('w:rPr')}/{qn('w:vertAlign')}")
+    return (va.get(qn("w:val")) or "").lower() if va is not None else ""
+
+
+def _run_is_note_ref(r: etree._Element) -> bool:
+    if r.find(qn("w:footnoteReference")) is not None or r.find(qn("w:endnoteReference")) is not None:
+        return True
+    rs = r.find(f"{qn('w:rPr')}/{qn('w:rStyle')}")
+    return rs is not None and (rs.get(qn("w:val")) or "").lower() in _NOTE_REF_STYLES
+
+
+def _superscript_char_map(p: etree._Element, field_stack: list) -> Optional[List[_SupChar]]:
+    """One :class:`_SupChar` per character of ``paragraph_text(p)``, or ``None``
+    when this walk cannot reproduce that text exactly (the caller then skips the
+    paragraph: a misaligned map could point a marker at the wrong characters).
+
+    Mirrors :func:`paras.paragraph_text`'s accepted-view walk: ``w:t`` under a
+    tracked ``w:del`` / ``w:moveFrom`` or an ``mc:Fallback`` is dropped, a tab /
+    line break is one non-eligible character. ``field_stack`` carries the open
+    complex-field depth ACROSS paragraphs (a field can span several), so text
+    inside any field — a live Zotero/EndNote citation renders superscript too —
+    is never eligible; neither is text under a ``w:fldSimple`` nor a footnote /
+    endnote reference run."""
+    t_tag, tab_tag = qn("w:t"), qn("w:tab")
+    br_tags = (qn("w:br"), qn("w:cr"))
+    fld_tag, r_tag = qn("w:fldChar"), qn("w:r")
+    drop_tags = (qn("w:del"), qn("w:moveFrom"))
+    fallback_tag, simple_tag = qn("mc:Fallback"), qn("w:fldSimple")
+
+    def _ancestors(node):
+        anc = node.getparent()
+        while anc is not None and anc is not p:
+            yield anc
+            anc = anc.getparent()
+
+    chars: List[_SupChar] = []
+    pieces: List[str] = []
+    for node in p.iter(t_tag, tab_tag, *br_tags, fld_tag):
+        ancs = list(_ancestors(node))
+        if any(a.tag == fallback_tag for a in ancs):
+            continue
+        if node.tag == fld_tag:
+            kind = node.get(qn("w:fldCharType"))
+            if kind == "begin":
+                field_stack.append(1)
+            elif kind == "end" and field_stack:
+                field_stack.pop()
+            continue
+        if any(a.tag in drop_tags for a in ancs):
+            continue
+        if node.tag != t_tag:
+            pieces.append("\t" if node.tag == tab_tag else "\n")
+            chars.append(_SupChar())
+            continue
+        text = node.text or ""
+        run = node.getparent()
+        if run is None or run.tag != r_tag:
+            va, note = "", False
+        else:
+            va, note = _run_vert_align(run), _run_is_note_ref(run)
+        sup, sub = va == "superscript", va == "subscript"
+        eligible = (sup and not note and not field_stack
+                    and not any(a.tag == simple_tag for a in ancs))
+        pieces.append(text)
+        chars.extend(_SupChar(sup, sub, eligible) for _ in text)
+    if "".join(pieces) != paragraph_text(p):
+        return None
+    return chars
+
+
+def _superscript_numeric_spans(txt: str, chars: List[_SupChar], taken: List[tuple]) -> List[tuple]:
+    """``[(start, end)]`` of superscript numeric citation markers in *txt*.
+
+    A span is a maximal run of eligible superscript characters (adjacent
+    superscript runs merge, so a marker split across runs is one marker), trimmed
+    of surrounding whitespace and trailing ``, . ; :``, whose text passes
+    :func:`_is_numeric_cite` ("12", "3,4", "5–7"). Rejected as NOT a citation:
+
+    * a span at the very start of the paragraph (affiliation / note numbering);
+    * a superscript right after a DIGIT — an exponent ("10³", "2²") — or after a
+      SUBSCRIPT character ("ηp²");
+    * a superscript right after a letter token of at most two letters — a symbol
+      or unit exponent ("R²", "χ²", "η²", "m²", "cm³", "µm²");
+    * a span directly followed by a letter or digit (an ordinal or a number that
+      only starts superscript);
+    * a span overlapping a bracketed marker already found (``taken``), so
+      "[¹²]" is never counted twice;
+    * every span of an author BYLINE: a paragraph where at least two spans, and
+      at least half of them, follow a capitalised word ("Jane A. Doe¹,², John
+      Roe³") — those are affiliation numbers.
+    """
+    out: List[tuple] = []
+    n = len(txt)
+    i = 0
+    while i < n:
+        if not chars[i].eligible:
+            i += 1
+            continue
+        j = i
+        while j < n and chars[j].eligible:
+            j += 1
+        s, e = i, j
+        i = j
+        while s < e and txt[s].isspace():
+            s += 1
+        while e > s and (txt[e - 1].isspace() or txt[e - 1] in _SUP_TRAILING_PUNCT):
+            e -= 1
+        if s >= e or not _NUMERIC_DIGITS_ONLY_RE.match(txt[s:e]) or not _is_numeric_cite(txt[s:e]):
+            continue
+        if any(s < te and ts < e for ts, te in taken):
+            continue
+        if e < n and txt[e].isalnum():
+            continue
+        k = s - 1
+        while k >= 0 and txt[k] in "  ":
+            k -= 1
+        if k < 0:
+            continue                      # paragraph-initial
+        prev = txt[k]
+        if prev.isdigit() or chars[k].sub:
+            continue                      # exponent / subscripted symbol
+        cap_prev = False
+        if prev.isalpha():
+            w = k
+            while w >= 0 and txt[w].isalpha():
+                w -= 1
+            if k - w <= 2:
+                continue                  # symbol or unit exponent
+            cap_prev = txt[w + 1].isupper()
+        out.append((s, e, cap_prev))
+    # Author byline: affiliation numbers sit on capitalised NAMES ("Jane A.
+    # Doe1,2, John Roe3"). When at least two spans, and at least half of them,
+    # follow a capitalised word, the paragraph is a byline, not cited prose.
+    n_cap = sum(1 for _s, _e, c in out if c)
+    if n_cap >= 2 and 2 * n_cap >= len(out):
+        return []
+    return [(s, e) for s, e, _c in out]
+
+
 def _is_placeholder_bracket(inner: str) -> bool:
     """Return True if bracketed content looks like a citation placeholder."""
     if _DEFINITE_PLACEHOLDER_RE.search(inner):
@@ -575,13 +796,19 @@ def _is_placeholder_bracket(inner: str) -> bool:
 # Public API
 # ===========================================================================
 
-def extract_references(path) -> dict:
+def extract_references(path, *, superscript: bool = False) -> dict:
     """Inventory every citation-like thing in *path* (.docx).
 
     Parameters
     ----------
     path:
         Path to a .docx file (str or Path).
+    superscript:
+        Also detect SUPERSCRIPT-formatted numeric citations ("…mapping¹²") as
+        ``kind="numeric"`` markers flagged ``superscript=True``. Off by default:
+        a superscript marker's text ("12") is not a safe document-search anchor,
+        so only a caller that converts by LOCATION (``para`` + ``offset``, as
+        cite-link does) should ask for them.
 
     Returns
     -------
@@ -601,7 +828,14 @@ def extract_references(path) -> dict:
     ``intext``
         ``[{"index": int, "text": str, "kind": "author_year"|"numeric"}]`` —
         ad-hoc in-text citations in body paragraphs (not the reflist region).
-        Field-based citations are NOT counted here.
+        Field-based citations are NOT counted here. A numeric marker also
+        carries its LOCATION: ``para`` (index into
+        :func:`paras.iter_paragraphs` of the document — the same enumeration
+        :mod:`zoterofield` resolves) and ``offset`` (start of ``text`` in that
+        paragraph's accepted-view :func:`paras.paragraph_text`), plus
+        ``superscript: True`` for a superscript marker. List enumerators are
+        never markers, so a converter that works by location never touches
+        them even when the same token text is a citation elsewhere.
 
     ``placeholders``
         ``[{"location": str, "text": str, "kind": "bracket"|"comment",
@@ -749,8 +983,13 @@ def extract_references(path) -> dict:
     # -----------------------------------------------------------------------
     intext: List[dict] = []
     intext_counter = 0
+    # Open complex-field depth carried across paragraphs (superscript scan only).
+    field_stack: list = []
 
     for pi, p in enumerate(paras):
+        # The superscript map walks EVERY paragraph (before any skip) so the
+        # field depth it carries stays right across skipped paragraphs.
+        sup_chars = _superscript_char_map(p, field_stack) if superscript else None
         # Skip the heading paragraph and the reflist region
         if pi in reflist_para_indices:
             continue
@@ -764,26 +1003,24 @@ def extract_references(path) -> dict:
         if not txt.strip():
             continue
 
-        # Author-year: parenthetical form (Smith et al., 2020)
-        for m in _AUTHOR_YEAR_PAREN_RE.finditer(txt):
-            intext.append({
-                "index": intext_counter,
-                "text": m.group(0),
-                "kind": "author_year",
-            })
-            intext_counter += 1
-
-        # Author-year: bare form  Smith (2020)
-        for m in _AUTHOR_YEAR_BARE_RE.finditer(txt):
-            # Avoid double-counting if the bare form is inside a parenthetical
-            # already captured above. Check if the match start is just before
-            # a paren group already captured.
-            intext.append({
-                "index": intext_counter,
-                "text": m.group(0),
-                "kind": "author_year",
-            })
-            intext_counter += 1
+        # Author-year, in a fixed order: parenthetical "(Smith et al., 2020)",
+        # then bare "Smith (2020)", then narrative "Smith et al., in 2020".  A
+        # later form that OVERLAPS a span already taken is the same citation seen
+        # again (e.g. the "Smith (2020)" inside "(Jones, 2019; Smith (2020)") and
+        # is dropped, so one citation is counted once.
+        taken: List[tuple] = []
+        for rx in (_AUTHOR_YEAR_PAREN_RE, _AUTHOR_YEAR_BARE_RE, _AUTHOR_YEAR_IN_RE):
+            for m in rx.finditer(txt):
+                s, e = m.span()
+                if any(s < te and ts < e for ts, te in taken):
+                    continue
+                taken.append((s, e))
+                intext.append({
+                    "index": intext_counter,
+                    "text": m.group(0),
+                    "kind": "author_year",
+                })
+                intext_counter += 1
 
         # Numeric: [12], [3,4], (1,2) — but EXCLUDE list enumerators "(1) … (2) … (3)"
         # (single-number parentheticals running 1..k); those are prose, not citations.
@@ -794,14 +1031,26 @@ def extract_references(path) -> dict:
                            if _is_numeric_cite(m.group(1))
                            and (m.group(0)[0], m.group(0)[-1]) in (("[", "]"), ("(", ")"))]
         enum_idxs = _enumerator_run_indices(numeric_matches, txt)
-        for j, m in enumerate(numeric_matches):
-            if j in enum_idxs:
-                continue
-            intext.append({
+        # Each marker carries its location (para + accepted-text offset) so a
+        # converter rewrites exactly these occurrences — never an enumerator or
+        # any other same-text occurrence the scan did not classify as a cite.
+        found = [(m.start(), m.group(0), False)
+                 for j, m in enumerate(numeric_matches) if j not in enum_idxs]
+        if sup_chars is not None:
+            taken_num = [m.span() for m in numeric_matches]
+            found += [(s, txt[s:e], True)
+                      for s, e in _superscript_numeric_spans(txt, sup_chars, taken_num)]
+        for start, text, is_sup in sorted(found):
+            entry = {
                 "index": intext_counter,
-                "text": m.group(0),
+                "text": text,
                 "kind": "numeric",
-            })
+                "para": pi,
+                "offset": start,
+            }
+            if is_sup:
+                entry["superscript"] = True
+            intext.append(entry)
             intext_counter += 1
 
     # -----------------------------------------------------------------------
@@ -810,7 +1059,8 @@ def extract_references(path) -> dict:
     placeholders: List[dict] = []
 
     # Collect numeric cite texts so we don't flag them as placeholders
-    numeric_cite_texts = {e["text"] for e in intext if e["kind"] == "numeric"}
+    numeric_cite_texts = {e["text"] for e in intext
+                          if e["kind"] == "numeric" and not e.get("superscript")}
 
     for pi, p in enumerate(paras):
         if pi in reflist_para_indices:

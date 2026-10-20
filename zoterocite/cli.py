@@ -133,8 +133,10 @@ def cmd_cite_into(a):
         keys = [a.key]
     try:
         cite_into(a.file, a.anchor, keys=keys, items=items, doi=a.doi, style=a.style,
-                  add_bibliography=a.bibliography, out=out)
-    except (RuntimeError, ValueError) as exc:
+                  add_bibliography=a.bibliography, out=out,
+                  suppress_author=getattr(a, "suppress_author", False),
+                  bib_under=getattr(a, "bib_under", None))
+    except (RuntimeError, ValueError, LookupError) as exc:
         sys.exit(f"cite-into: {exc}")
     print(f"inserted live Zotero citation field -> {out}")
 
@@ -265,18 +267,34 @@ def cmd_unify_refs(a):
     as tracked changes. Human-in-the-loop: review the plan before --apply.
 
     --offline is a strict kill-switch: zero network calls (no Crossref/PubMed, no
-    Zotero library read — cache-only). Use for confidential documents."""
-    from .unify import plan_unification, apply_unification
+    Zotero library read — cache-only). Use for confidential documents.
+
+    The plan carries a ``decisions_template``. ``decisions["intext_keys"]`` maps an
+    in-text marker (plan ``intext`` index, or its exact text) to a DOI / PMID /
+    Zotero item key (a list, one per item, for a grouped marker), so an author-year
+    draft with NO reference list can still be converted. When fetch is allowed the
+    plan lists confirm-only PubMed candidates (first author + year) per unlinked
+    author-year item under ``intext_candidates``; they are never applied unless
+    copied into intext_keys. A bad intext_keys entry aborts before any write."""
+    from .unify import plan_unification, apply_unification, IntextKeysError
     offline = getattr(a, "offline", False)
     if a.apply:
         out = _require_out(a)
         decisions = _json_arg(a.decisions) if a.decisions else {}
+        # max_candidate_queries=0: PubMed candidates are confirm-only plan output;
+        # apply never reads them, so a re-plan here must not spend queries on them.
         plan = (_json_arg(a.plan) if getattr(a, "plan", None)
-                else plan_unification(a.file, fetch=not a.no_fetch, offline=offline))
-        rep = apply_unification(a.file, plan, decisions, out=out,
-                                add_missing=not a.no_add_missing, track=not a.no_track,
-                                source_label=Path(a.file).name,
-                                attach_pdfs=a.attach_pdfs)
+                else plan_unification(a.file, fetch=not a.no_fetch, offline=offline,
+                                      max_candidate_queries=0))
+        try:
+            rep = apply_unification(a.file, plan, decisions, out=out,
+                                    add_missing=not a.no_add_missing, track=not a.no_track,
+                                    source_label=Path(a.file).name,
+                                    attach_pdfs=a.attach_pdfs)
+        except IntextKeysError as e:
+            # Validated before any Zotero write or document change: nothing written.
+            print(f"error: {e} (nothing written)", file=sys.stderr)
+            sys.exit(2)
         print(json.dumps(rep, indent=2, default=str) if a.json else
               f"added {len(rep['added'])} to Zotero · matched {len(rep['matched'])} · "
               f"replaced {rep['replaced']} in doc · needs-input {len(rep['needs_input'])} · "
@@ -297,6 +315,14 @@ def cmd_unify_refs(a):
         inlib = "in-library" if r.get("in_library") else "MISSING"
         m = r.get("metadata") or {}
         print(f"  {r['tier']:<6} {inlib:<10} {r.get('confidence',''):<7}{flag}  {(m.get('title') or r['input'])[:72]}")
+    unlinked = [m for m in plan.get("intext", [])
+                if any(it.get("ref_index") is None for it in m.get("items") or [])]
+    if unlinked:
+        cs = s.get("intext_candidates")
+        tail = (f"; PubMed candidates for {cs['items']} item(s), {cs['queries']} "
+                f"quer{'y' if cs['queries'] == 1 else 'ies'} (confirm-only)" if cs else "")
+        print(f"author-year markers with an unlinked item: {len(unlinked)}{tail} — "
+              "cite them via decisions.intext_keys (see decisions_template in --json / -o)")
 
 
 def cmd_cite_check(a):
@@ -344,10 +370,19 @@ def build_parser():
     s = sub.add_parser("cite-into"); s.add_argument("file")
     s.add_argument("--anchor", required=True)
     s.add_argument("--key"); s.add_argument("--keys"); s.add_argument("--doi")
-    s.add_argument("--items", help='JSON list of {key,locator?,label?,prefix?,suffix?}')
+    s.add_argument("--items", help='JSON list of {key,locator?,label?,prefix?,suffix?,'
+                                   '"suppress-author"?}')
     s.add_argument("--locator"); s.add_argument("--label", help="page|chapter|figure|… (with --locator)")
+    s.add_argument("--suppress-author", action="store_true", dest="suppress_author",
+                   help="narrative cite: CSL suppress-author on every item (type the author "
+                        "before the anchor; the field shows '(2019)')")
     s.add_argument("--style", default="vancouver-superscript")
-    s.add_argument("--bibliography", action="store_true")
+    s.add_argument("--bibliography", action="store_true",
+                   help="also write ONE pre-rendered multi-paragraph ZOTERO_BIBL field "
+                        "(idempotent; 'Bibliography' paragraph style added when missing)")
+    s.add_argument("--bib-under", dest="bib_under", metavar="HEADING",
+                   help="place the bibliography after this existing heading paragraph "
+                        "(implies --bibliography; default: end of document)")
     s.add_argument("-o", "--out"); s.set_defaults(fn=cmd_cite_into)
 
     s = sub.add_parser("zotero-scan"); s.add_argument("file")

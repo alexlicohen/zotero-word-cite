@@ -769,7 +769,10 @@ def apply_endnote_migration(
     -------
     dict
         ``{"created", "matched", "unmatched", "collection", "doc_out",
-        "validation", "skipped_retracted"}``.
+        "validation", "skipped_retracted", "create_report", "author_check"}``.
+        ``author_check`` holds one PubMed author decision per created item
+        (``pubmed`` / ``confirmed`` / ``authors_unverified``; empty when
+        ``fetch=False`` — no PubMed call is made offline).
 
     Refuses the write (raises :class:`WriteRefusedError`) when the configured
     Zotero key is not write-enabled (:func:`zotero.key_can_write`) — same gate as
@@ -873,6 +876,7 @@ def apply_endnote_migration(
             doi_index=doi_index,
             pmid_index=pmid_index,
             attach_pdfs=attach_pdfs,
+            verify_authors=bool(fetch),
         )
         # Items create_items found already present count as matched, not created.
         for s in created_report.get("skipped_existing", []):
@@ -897,6 +901,7 @@ def apply_endnote_migration(
         "doc_out": convert_result.get("out") or str(out_path),
         "validation": plan["validation"],
         "create_report": created_report,
+        "author_check": created_report.get("author_check", []),
         "convert": {
             "converted": len(convert_result.get("converted", [])),
             "deduped": convert_result.get("deduped", 0),

@@ -45,7 +45,7 @@ from .findings import Finding
 from .ooxml import NS, qn
 from .paras import iter_paragraphs, paragraph_text
 from .sections import REFERENCES_HEADING_RE, split_body_vs_references
-from .zoterofield import replace_field_with_zotero, _field_codes
+from .zoterofield import grouped_citation_render, replace_field_with_zotero, _field_codes
 
 W = NS["w"]
 B_NS = "http://schemas.openxmlformats.org/officeDocument/2006/bibliography"
@@ -1140,9 +1140,12 @@ def convert_to_zotero(
         # the per-item markers with "; " (the old behaviour) fabricated a
         # separator Zotero never produces for one field ("(1); (2)"), corrupting
         # both first-open display and the dedup guard. For a single resolved key
-        # the per-item marker IS correct; for a GROUP we store a neutral
-        # placeholder (the live field carries the real citationItems and Word/
-        # Zotero regenerate the true grouped marker on refresh).
+        # the per-item marker IS correct; a GROUP in an author-date style is
+        # pre-rendered the way that style prints it (per-item renders without
+        # their parentheses, sorted, "; "-joined: zoterofield.grouped_citation_render);
+        # a numeric group keeps the neutral placeholder (Word/Zotero regenerate
+        # the true grouped marker on refresh from the live citationItems).
+        rendered_html = None
         if len(resolved_keys) == 1:
             try:
                 rendered = (
@@ -1158,6 +1161,8 @@ def convert_to_zotero(
                 rendered = "(citation)"
         else:
             rendered = "(citation)"
+            grouped = grouped_citation_render(resolved_keys, style=style)
+            rendered_html = grouped if grouped != rendered else None
 
         locator = {"runs": f["runs"]} if f["carrier"] == "complex" else {"sdt": f.get("sdt")}
         if f["carrier"] == "fldSimple":
@@ -1166,7 +1171,7 @@ def convert_to_zotero(
         replace_field_with_zotero(
             doc, locator,
             keys=resolved_keys, itemdata=resolved_itemdata, uris=resolved_uris,
-            rendered=rendered, style=style, track=track,
+            rendered=rendered, rendered_html=rendered_html, style=style, track=track,
             # Per-field discriminator so two fields citing the SAME item(s) get
             # distinct citationIDs (Zotero requires per-field-unique IDs).
             seed=f["index"],

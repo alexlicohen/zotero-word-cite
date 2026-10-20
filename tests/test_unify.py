@@ -546,7 +546,7 @@ def apply_patches(patched_network, monkeypatch):
     replace_text_with_zotero_field."""
     calls = {"create": [], "insert": []}
 
-    def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, pmid_index=None, attach_pdfs=False, index_degraded=False):
+    def fake_create_items(metas, *, collection=None, tags=None, dedup=True, doi_index=None, pmid_index=None, attach_pdfs=False, index_degraded=False, verify_authors=False):
         calls["create"].append({"metas": metas, "collection": collection, "tags": tags,
                                 "dedup": dedup, "doi_index": doi_index})
         created = []
@@ -861,7 +861,7 @@ class TestIdempotency:
 
         def dynamic_create(metas, *, collection=None, tags=None, dedup=True,
                            doi_index=None, pmid_index=None, attach_pdfs=False,
-                           index_degraded=False):
+                           index_degraded=False, verify_authors=False):
             # Mirror real dedup: skip any meta whose DOI is already in the index;
             # create the rest and ADD them to the shared index (so a re-read sees them).
             out = {"created": [], "skipped_existing": [], "failed": []}
@@ -1245,6 +1245,10 @@ class TestF7Integration:
         ])
 
         monkeypatch.setattr(unify.refresolve, "resolve_reference", _fake_resolve)
+        # "(Foreign, 1999)" has no reflist link, so the plan asks PubMed for
+        # candidates: keep that offline.
+        monkeypatch.setattr(unify.entrez, "esearch_pmids_status",
+                            lambda *a, **k: ([], {"degraded": False, "reason": None}))
         monkeypatch.setattr(
             unify.zotero, "library_index",
             lambda **kw: {"doi": {"10.1/smith2020": "SMITHKEY"}, "pmid": {}, "title": {}})

@@ -19,6 +19,8 @@ import hashlib
 import html
 import json
 import re
+import unicodedata
+import warnings
 from pathlib import Path
 from typing import List, Optional
 
@@ -27,7 +29,8 @@ from lxml import etree
 from . import csldb
 from .docxio import DOCUMENT, Docx
 from .ooxml import NS, now_iso, qn
-from .paras import ParaIndex, find_paragraph, find_paragraphs, get_body
+from .paras import (ParaIndex, find_paragraph, find_paragraphs, get_body,
+                    iter_paragraphs, paragraph_text)
 
 W = NS["w"]
 CSL_SCHEMA = "https://github.com/citation-style-language/schema/raw/master/csl-citation.json"
@@ -101,15 +104,22 @@ def _esc(s: str) -> str:
     return html.escape(s, quote=False)
 
 
+_FLD_BEGIN = '<w:r><w:fldChar w:fldCharType="begin"/></w:r>'
+_FLD_SEPARATE = '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
+_FLD_END = '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
+
+
+def _field_code(instr: str) -> str:
+    return f'<w:r><w:instrText xml:space="preserve"> {_esc(instr)} </w:instrText></w:r>'
+
+
 def _field_runs(instr: str, result_xml: Optional[str]) -> str:
     """XML run string for a Word complex field. ``result_xml`` is the visible
     result runs (Zotero overwrites on refresh); ``None`` => code-only."""
-    s = '<w:r><w:fldChar w:fldCharType="begin"/></w:r>'
-    s += f'<w:r><w:instrText xml:space="preserve"> {_esc(instr)} </w:instrText></w:r>'
+    s = _FLD_BEGIN + _field_code(instr)
     if result_xml is not None:
-        s += '<w:r><w:fldChar w:fldCharType="separate"/></w:r>'
-        s += result_xml
-    s += '<w:r><w:fldChar w:fldCharType="end"/></w:r>'
+        s += _FLD_SEPARATE + result_xml
+    s += _FLD_END
     return s
 
 
@@ -269,6 +279,10 @@ def _build_zotero_field_xml(
         for k in ("prefix", "suffix"):
             if ex.get(k):
                 ci[k] = ex[k]
+        if _suppresses_author(ex):
+            # CSL citation-item flag: the author is printed as plain text before
+            # the field ("Smith et al. (2019)"), so the field renders the year only.
+            ci["suppress-author"] = True
         citation_items.append(ci)
     if rendered_html:
         plain = _strip_html(rendered_html) or "(citation)"
@@ -286,6 +300,148 @@ def _build_zotero_field_xml(
     }
     instr = "ADDIN ZOTERO_ITEM CSL_CITATION " + json.dumps(citation, ensure_ascii=False)
     return _field_runs(instr, result_xml)
+
+
+def _suppresses_author(extra: Optional[dict]) -> bool:
+    """True when a citation item's extras ask for CSL ``suppress-author`` (the
+    JSON spelling ``"suppress-author"`` or the Python-friendly ``suppress_author``)."""
+    return bool(extra) and bool(extra.get("suppress-author") or extra.get("suppress_author"))
+
+
+# -- grouped / narrative pre-render (shown until the first Zotero Refresh) -----
+PLACEHOLDER = "(citation)"
+# An author-date in-text render always carries a year-like token; a numeric one
+# ("(1)", "[3]", superscript "1") never does. Grouping by "; " is only what an
+# author-date style prints, so a render without one keeps the placeholder.
+_YEARISH = re.compile(r"\b\d{4}[a-z]?\b|\bn\.\s?d\.|\bin press\b|\bforthcoming\b", re.IGNORECASE)
+_LETTER = re.compile(r"[^\W\d_]")
+_TAG_SPLIT = re.compile(r"(<[^>]+>)")
+
+
+def _fold(s: str) -> str:
+    """Accent-folded, case-folded sort key (``Ó`` sorts with ``O``), the order an
+    author-date style uses to sort the items of one citation."""
+    return unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().casefold()
+
+
+def _strip_outer_parens_html(h: str) -> Optional[str]:
+    """Remove the outer ``(`` and ``)`` from a rendered citation's HTML, leaving
+    tags (``<i>``) intact. ``None`` when the visible text is not parenthesised."""
+    plain = _strip_html(h)
+    if not (plain.startswith("(") and plain.endswith(")")):
+        return None
+    parts = _TAG_SPLIT.split(h or "")
+    texts = [i for i, s in enumerate(parts) if s and not s.startswith("<") and s.strip()]
+    if not texts:
+        return None
+    first, last = texts[0], texts[-1]
+    parts[first] = parts[first].replace("(", "", 1)
+    i = parts[last].rfind(")")
+    parts[last] = parts[last][:i] + parts[last][i + 1:]
+    return "".join(parts)
+
+
+def _year_part(inner_plain: str) -> Optional[str]:
+    """The year part of an author-date item ("Smith et al., 2019a" -> "2019a"),
+    for a suppress-author item whose author is printed outside the field."""
+    tail = (inner_plain.rsplit(",", 1)[-1] if "," in inner_plain
+            else (inner_plain.split() or [""])[-1]).strip()
+    return tail if tail and _YEARISH.search(tail) else None
+
+
+def group_citation_html(renders: List[str], *,
+                        suppress_author: Optional[List[bool]] = None) -> Optional[str]:
+    """One pre-rendered citation from per-item author-date renders, or ``None``.
+
+    Each render (Zotero ``include=citation`` HTML, e.g. ``(Smith et al., 2019)``)
+    loses its outer parentheses; the items are sorted by an accent-folded key and
+    joined with ``"; "`` inside one pair of parentheses, which is how APA and
+    similar author-date styles print a group. A ``suppress_author`` item keeps
+    only its year part (``(2019)``). Returns ``None`` (keep the placeholder) when
+    any render is missing, not parenthesised, or has no author and year-like
+    token (a numeric style's ``(1)``: its group would be ``(1,2)``, which per-item
+    renders cannot produce)."""
+    if not renders:
+        return None
+    flags = list(suppress_author or [False] * len(renders))
+    if len(flags) != len(renders):
+        return None
+    items = []
+    for h, sup in zip(renders, flags):
+        inner = _strip_outer_parens_html(h or "")
+        if inner is None:
+            return None
+        inner_plain = _strip_html(inner)
+        if not (_LETTER.search(inner_plain) and _YEARISH.search(inner_plain)):
+            return None
+        if sup:
+            year = _year_part(inner_plain)
+            if year is None:
+                return None
+            inner = _esc(year)
+            inner_plain = year
+        items.append((_fold(inner_plain), inner))
+    items.sort(key=lambda t: t[0])
+    return "(" + "; ".join(h for _, h in items) + ")"
+
+
+def grouped_citation_render(keys: List[str], *, style: str = DEFAULT_STYLE,
+                            suppress_author: Optional[List[bool]] = None) -> str:
+    """Pre-rendered HTML for ONE field citing ``keys`` (a group, or any item with
+    ``suppress-author``): per-item ``zotero.formatted_citations(kind="citation")``
+    grouped by :func:`group_citation_html`. Returns :data:`PLACEHOLDER` when the
+    style's renders have no grouped form (numeric styles: by design, silent) and
+    also, with a ``UserWarning`` so a shared draft is not silently left showing
+    it, when the renders are unavailable (offline, degraded read, an omitted
+    item)."""
+    from . import zotero
+    try:
+        renders = zotero.formatted_citations(keys, style=style, kind="citation", strip=False)
+    except Exception as exc:  # noqa: BLE001 - display value only; never fail the write
+        renders, why = None, f"renders unavailable ({type(exc).__name__}: {exc})"
+    else:
+        why = (None if len(renders) == len(keys)
+               else f"Zotero returned {len(renders)} render(s) for {len(keys)} item(s)")
+    if why:
+        warnings.warn(
+            f"grouped citation pre-render skipped: {why}; the field shows "
+            f"{PLACEHOLDER!r} until a Zotero Refresh", UserWarning, stacklevel=2)
+        return PLACEHOLDER
+    return group_citation_html(renders, suppress_author=suppress_author) or PLACEHOLDER
+
+
+def _clean_bib_entry_html(h: str) -> str:
+    """One bibliography entry's inline HTML from Zotero's ``include=bib`` output:
+    the ``csl-entry`` content without the wrapping ``div``s, a numeric style's
+    left-margin label joined to its text by a space, layout whitespace removed."""
+    s = h or ""
+    m = re.search(r'<div[^>]*class="csl-entry"[^>]*>(.*)</div>', s, re.S)
+    if m:
+        s = m.group(1)
+    s = re.sub(r'</div>\s*<div[^>]*class="csl-right-inline"[^>]*>', " ", s)
+    s = re.sub(r"</?div\b[^>]*>", "", s)
+    return re.sub(r"\s*\n\s*", " ", s).strip()
+
+
+def bibliography_entries_html(keys: List[str], *, style: str = DEFAULT_STYLE,
+                              sort: bool = True) -> List[str]:
+    """Per-item bibliography entry HTML for ``keys`` (``formatted_citations(
+    kind="bib")``), cleaned for :func:`_runs_from_html`. ``sort`` orders the
+    entries by an accent-folded key unless they are numbered (a numeric style's
+    entries keep request order). Returns ``[]`` and warns when the renders are
+    unavailable; the caller then writes a code-only bibliography field."""
+    from . import zotero
+    try:
+        raw = zotero.formatted_citations(keys, style=style, kind="bib", strip=False)
+    except Exception as exc:  # noqa: BLE001 - display value only
+        warnings.warn(f"bibliography pre-render skipped ({type(exc).__name__}: {exc}); "
+                      "the field stays empty until a Zotero Refresh", UserWarning, stacklevel=2)
+        return []
+    entries = [e for e in (_clean_bib_entry_html(h) for h in raw) if _strip_html(e)]
+    numbered = entries and all(re.match(r"\s*[\[(]?\d", _strip_html(e)) for e in entries)
+    if sort and not numbered:
+        entries.sort(key=lambda e: _fold(_strip_html(e)))
+    return entries
 
 
 def insert_citation(
@@ -341,6 +497,97 @@ def has_bibliography_field(root: etree._Element) -> bool:
     return any("ZOTERO_BIBL" in (code or "") for code in _field_codes(root))
 
 
+_STYLES_PART = "word/styles.xml"
+BIBLIOGRAPHY_STYLE_ID = "Bibliography"
+_HANGING_INDENT = '<w:ind w:left="720" w:hanging="720"/>'
+
+
+def ensure_bibliography_style(doc: Docx) -> Optional[str]:
+    """The styleId of the document's ``Bibliography`` paragraph style, adding one
+    (hanging indent, based on the default paragraph style) to ``word/styles.xml``
+    when it is missing. Idempotent. A style NAMED "Bibliography" under another id
+    is reused. Returns ``None`` when there is no styles part or the id is taken by
+    a non-paragraph style; the caller then indents the entries directly."""
+    if not doc.has(_STYLES_PART):
+        return None
+    styles = doc.tree(_STYLES_PART)
+    default_id = None
+    for st in styles.iter(qn("w:style")):
+        sid, typ = st.get(qn("w:styleId")), st.get(qn("w:type"))
+        if sid == BIBLIOGRAPHY_STYLE_ID:
+            return sid if typ == "paragraph" else None
+        name = st.find(qn("w:name"))
+        if (typ == "paragraph" and name is not None
+                and (name.get(qn("w:val")) or "").casefold() == "bibliography"):
+            return sid
+        if (typ == "paragraph" and default_id is None
+                and st.get(qn("w:default")) in ("1", "true", "on")):
+            default_id = sid
+    based = f'<w:basedOn w:val="{_esc(default_id)}"/>' if default_id else ""
+    styles.append(etree.fromstring(
+        f'<w:style xmlns:w="{W}" w:type="paragraph" w:styleId="{BIBLIOGRAPHY_STYLE_ID}">'
+        f'<w:name w:val="Bibliography"/>{based}<w:uiPriority w:val="37"/><w:unhideWhenUsed/>'
+        f'<w:pPr><w:spacing w:after="120" w:line="276" w:lineRule="auto"/>'
+        f'{_HANGING_INDENT}</w:pPr></w:style>'))
+    return BIBLIOGRAPHY_STYLE_ID
+
+
+def _bibliography_paragraphs(entries_html: List[str], style_id: Optional[str]) -> List[etree._Element]:
+    """One paragraph per entry carrying ONE multi-paragraph ``ZOTERO_BIBL`` field:
+    begin/code/separate open the first entry, end closes the last. Each paragraph
+    takes ``style_id`` (or a direct hanging indent when there is no style)."""
+    out = []
+    n = len(entries_html)
+    for i, h in enumerate(entries_html):
+        xml = (_FLD_BEGIN + _field_code(_BIBL_INSTR) + _FLD_SEPARATE) if i == 0 else ""
+        xml += _runs_from_html(h) or _plain_run(_strip_html(h))
+        if i == n - 1:
+            xml += _FLD_END
+        ppr = (f'<w:pPr><w:pStyle w:val="{_esc(style_id)}"/></w:pPr>' if style_id
+               else f"<w:pPr>{_HANGING_INDENT}</w:pPr>")
+        out.append(_paragraph(ppr + xml))
+    return out
+
+
+def _track_inserted_paragraph(p: etree._Element, ids, author: str, date: str) -> None:
+    """Mark a NEW paragraph as a tracked insertion in place: its content runs go
+    into one ``<w:ins>`` and its paragraph mark gets ``<w:pPr><w:rPr><w:ins/>``, so
+    Reject removes the whole paragraph (no orphan empty one)."""
+    ppr = p.find(qn("w:pPr"))
+    if ppr is None:
+        ppr = etree.Element(qn("w:pPr"))
+        p.insert(0, ppr)
+    ins = etree.Element(qn("w:ins"))
+    ins.set(qn("w:id"), ids.next()); ins.set(qn("w:author"), author); ins.set(qn("w:date"), date)
+    for c in [c for c in p if c is not ppr]:
+        p.remove(c); ins.append(c)
+    p.append(ins)
+    rpr = ppr.find(qn("w:rPr"))
+    if rpr is None:
+        rpr = etree.SubElement(ppr, qn("w:rPr"))
+    mark = etree.SubElement(rpr, qn("w:ins"))
+    mark.set(qn("w:id"), ids.next()); mark.set(qn("w:author"), author); mark.set(qn("w:date"), date)
+
+
+def _find_heading_paragraph(root: etree._Element, heading: str) -> etree._Element:
+    """The ONE paragraph whose whole accepted-view text is ``heading`` (whitespace
+    and case insensitive), a TOC entry losing a tie to the body heading."""
+    want = re.sub(r"\s+", " ", heading or "").strip().casefold()
+    if not want:
+        raise ValueError("bibliography heading is empty")
+    hits = [p for p in iter_paragraphs(root)
+            if re.sub(r"\s+", " ", paragraph_text(p)).strip().casefold() == want]
+    if len(hits) > 1:
+        idx = ParaIndex(root)
+        body = [p for p in hits if not idx.is_toc(p)]
+        if len(body) == 1:
+            hits = body
+    if len(hits) != 1:
+        raise LookupError(f"bibliography heading {heading!r} matched {len(hits)} "
+                          "paragraphs (need exactly 1)")
+    return hits[0]
+
+
 def append_bibliography_field(
     doc: Docx,
     *,
@@ -350,25 +597,43 @@ def append_bibliography_field(
     track: bool = False,
     author: str = "zotero-word-cite",
     date: Optional[str] = None,
+    entries_html: Optional[List[str]] = None,
+    under_heading: Optional[str] = None,
 ) -> bool:
-    """Append a Zotero ``ZOTERO_BIBL`` bibliography field at the end of the body
-    (before the trailing ``sectPr``), so a single Zotero Refresh renders the
-    bibliography from the cited items. Idempotent: returns ``False`` without
-    writing if a ``ZOTERO_BIBL`` field already exists.
+    """Write a Zotero ``ZOTERO_BIBL`` bibliography field, so a single Zotero Refresh
+    renders the bibliography from the cited items. Idempotent: returns ``False``
+    without writing if a ``ZOTERO_BIBL`` field already exists.
 
-    Registers the CSL ``style`` prefs (so Refresh knows the style). The field
-    starts code-only (``None`` result) unless ``bib_rendered`` is given; Zotero
-    fills the rendered list on Refresh. An optional ``heading`` paragraph (e.g.
-    "References") is inserted before the field. With ``track=True`` the inserted
-    paragraph(s) are wrapped as a tracked insertion.
+    Placement: at the end of the body (before the trailing ``sectPr``), or, with
+    ``under_heading``, directly after the one existing paragraph whose text is that
+    heading (``LookupError`` before any write when it is missing or ambiguous).
+    ``heading`` instead creates a new heading paragraph before the field (not with
+    ``under_heading``).
+
+    Content: with ``entries_html`` (per-entry HTML, e.g.
+    :func:`bibliography_entries_html`) the field is PRE-RENDERED across one
+    paragraph per entry (begin in the first, end in the last; ``<i>``/``<b>``/
+    ``<sup>`` kept via :func:`_runs_from_html`), each in the ``Bibliography``
+    paragraph style (added with a hanging indent when missing,
+    :func:`ensure_bibliography_style`). Otherwise one paragraph: code-only, or
+    ``bib_rendered`` as its plain result. Registers the CSL ``style`` prefs.
+
+    ``track=True`` inserts every new paragraph as a tracked insertion (runs and
+    paragraph mark) and spreads this op's marks (one per paragraph) into distinct,
+    ordered ``w:date``s ending at ``date``; marks that existed before are never
+    re-stamped.
 
     This is intentionally ADDITIVE — it never deletes a manual bibliography (a
     caller that wants the manual block removed must do so explicitly, and only
     when the block is unambiguously located).
     """
+    if heading and under_heading:
+        raise ValueError("pass heading (new heading paragraph) or under_heading "
+                         "(an existing one), not both")
     root = doc.tree(DOCUMENT)
     if has_bibliography_field(root):
         return False
+    target = _find_heading_paragraph(root, under_heading) if under_heading else None
     ensure_pref(doc, style)
     date = date or now_iso()
     body = get_body(root)
@@ -377,33 +642,32 @@ def append_bibliography_field(
     new_paras: List[etree._Element] = []
     if heading:
         new_paras.append(_paragraph(_plain_run(heading)))
-    bib_p = _paragraph(_field_runs(
-        _BIBL_INSTR, _plain_run(bib_rendered) if bib_rendered else None))
-    new_paras.append(bib_p)
+    entries = [e for e in (entries_html or []) if _strip_html(e)]
+    if entries:
+        new_paras.extend(_bibliography_paragraphs(entries, ensure_bibliography_style(doc)))
+    else:
+        new_paras.append(_paragraph(_field_runs(
+            _BIBL_INSTR, _plain_run(bib_rendered) if bib_rendered else None)))
 
+    pre_marks = _snapshot_marks(doc, author) if track else None
     if track:
-        rev_id = _next_rev_id(root)
+        ids = _RevIds(root)
         for p in new_paras:
-            # Wrap each inserted paragraph's runs in <w:ins>; the paragraph mark
-            # itself is marked inserted via <w:rPr><w:ins/></w:rPr> in <w:pPr>.
-            ins = etree.Element(qn("w:ins"))
-            ins.set(qn("w:id"), str(rev_id)); rev_id += 1
-            ins.set(qn("w:author"), author); ins.set(qn("w:date"), date)
-            for r in list(p):
-                p.remove(r); ins.append(r)
-            p.append(ins)
-            ppr = etree.SubElement(p, qn("w:pPr"))
-            p.remove(ppr); p.insert(0, ppr)
-            rpr = etree.SubElement(ppr, qn("w:rPr"))
-            mark_ins = etree.SubElement(rpr, qn("w:ins"))
-            mark_ins.set(qn("w:id"), str(rev_id)); rev_id += 1
-            mark_ins.set(qn("w:author"), author); mark_ins.set(qn("w:date"), date)
+            _track_inserted_paragraph(p, ids, author, date)
 
-    for p in new_paras:
-        if sect is not None:
-            sect.addprevious(p)
-        else:
-            body.append(p)
+    if target is not None:
+        prev = target
+        for p in new_paras:
+            prev.addnext(p)
+            prev = p
+    else:
+        for p in new_paras:
+            if sect is not None:
+                sect.addprevious(p)
+            else:
+                body.append(p)
+    if track and len(new_paras) > 1:
+        _spread_op_marks(doc, author, date, pre_marks)
     return True
 
 
@@ -417,13 +681,23 @@ def cite_into(
     style: str = DEFAULT_STYLE,
     add_bibliography: bool = False,
     out=None,
+    suppress_author: bool = False,
+    bib_under: Optional[str] = None,
 ) -> Path:
     """High-level: resolve item(s) in the Zotero group library and insert ONE live
     citation field at ``anchor`` (grouping multiple items).
 
     Provide one of: ``items`` (list of ``{"key","locator?","label?","prefix?",
-    "suffix?"}`` for full control incl. page locators), ``keys`` (list), or
-    ``doi`` (single). Fetches CSL-JSON + URIs + a placeholder marker.
+    "suffix?","suppress-author?"}`` for full control incl. page locators),
+    ``keys`` (list), or ``doi`` (single). Fetches CSL-JSON + URIs + a pre-rendered
+    marker. ``suppress_author`` sets CSL ``suppress-author`` on every item (a
+    narrative cite: the author is typed before the field, which shows "(2019)").
+
+    A group (several keys) or a suppress-author item is pre-rendered by
+    :func:`grouped_citation_render` (author-date styles; else the placeholder
+    plus a warning). ``add_bibliography`` writes ONE pre-rendered multi-paragraph
+    ``ZOTERO_BIBL`` field (:func:`append_bibliography_field`; idempotent), at the
+    body end or, with ``bib_under``, after that existing heading paragraph.
     """
     from . import zotero
     if items:
@@ -453,23 +727,28 @@ def cite_into(
             f"(keys={len(keys)}, itemdata={len(itemdata)}, uris={len(uris)}); "
             "refusing to insert a citation that could bind the wrong reference."
         )
-    if len(keys) > 1:
-        # A grouped citation field renders as ONE marker (e.g. "(1,2)"/"(1-3)");
-        # Zotero's per-item ``include=citation`` API cannot synthesise that, and
-        # "; ".join fabricates a separator Zotero never produces, corrupting the
-        # cached display + the existing_renderings dedup guard. Store a neutral
-        # placeholder — the live field carries the real citationItems and
-        # Word/Zotero regenerate the true grouped marker on refresh. (Single-key
-        # path is unchanged: a one-element join has no separator.)
-        rendered_html = "(citation)"
+    if suppress_author:
+        extras = [dict(ex, **{"suppress-author": True}) for ex in extras]
+    suppress = [_suppresses_author(ex) for ex in extras]
+    if len(keys) > 1 or any(suppress):
+        # A group renders as ONE marker. For an author-date style that marker is
+        # the per-item renders without their parentheses, sorted and joined by
+        # "; " (APA's citation order); a numeric style's "(1,2)" cannot be built
+        # from per-item renders, so it keeps the neutral placeholder (warned). The
+        # live field carries the real citationItems either way and Zotero
+        # regenerates the marker on Refresh.
+        rendered_html = grouped_citation_render(keys, style=style, suppress_author=suppress)
     else:
         rendered_html = "; ".join(
             zotero.formatted_citations(keys, style=style, kind="citation", strip=False)) or None
-    bib = "\n".join(zotero.formatted_citations(keys, style=style, kind="bib")) if add_bibliography else ""
+    if bib_under:
+        add_bibliography = True
     doc = Docx(path)
     insert_citation(doc, anchor, keys, itemdata=itemdata, uris=uris, extras=extras,
-                    rendered_html=rendered_html, style=style, add_bibliography=add_bibliography,
-                    bib_rendered=bib)
+                    rendered_html=rendered_html, style=style)
+    if add_bibliography:
+        append_bibliography_field(doc, style=style, under_heading=bib_under,
+                                  entries_html=bibliography_entries_html(keys, style=style))
     return doc.save(Path(out) if out else Path(path))
 
 
@@ -601,15 +880,55 @@ def check_links(path) -> List[dict]:
 _TRACK_DATE = "2026-01-01T00:00:00Z"
 
 
+_REV_TAGS = (qn("w:ins"), qn("w:del"), qn("w:moveFrom"), qn("w:moveTo"))
+
+
 def _next_rev_id(root) -> int:
+    # ins/del/moveFrom/moveTo share ONE w:id space in Word: scan all four so a new
+    # id can never collide with a move's.
     mx = 0
-    for el in root.iter():
-        if el.tag in (qn("w:ins"), qn("w:del")):
-            try:
-                mx = max(mx, int(el.get(qn("w:id"), 0)))
-            except (TypeError, ValueError):
-                pass
+    for el in root.iter(*_REV_TAGS):
+        try:
+            mx = max(mx, int(el.get(qn("w:id"), 0)))
+        except (TypeError, ValueError):
+            pass
     return mx + 1
+
+
+class _RevIds:
+    """Revision-id allocator (``next()`` -> str), seeded past the document's max;
+    the same interface as ``revisions._Ids`` so revisions primitives can share it."""
+
+    def __init__(self, root) -> None:
+        self.n = _next_rev_id(root) - 1
+
+    def next(self) -> str:
+        self.n += 1
+        return str(self.n)
+
+
+def _snapshot_marks(doc: Docx, author: str):
+    """``revisions.snapshot_dated_marks`` (the author's marks BEFORE this op), or
+    ``None`` when it is unavailable — the trailing spread is then skipped rather
+    than run with a date-value-only scope that could re-stamp an older mark."""
+    try:
+        from .revisions import snapshot_dated_marks
+        return snapshot_dated_marks(doc, author)
+    except Exception:  # noqa: BLE001 - best effort; a missing owner skips the spread
+        return None
+
+
+def _spread_op_marks(doc: Docx, author: str, date: str, pre_marks) -> int:
+    """Spread the marks THIS op stamped at ``date`` into distinct, ordered times
+    (``revisions.spread_own_marks``, provenance-scoped by ``pre_marks``). Marks
+    that existed before the op are never touched. Best effort: never fails a write."""
+    if pre_marks is None:
+        return 0
+    try:
+        from .revisions import spread_own_marks
+        return spread_own_marks(doc, author, date, pre_existing=pre_marks)
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _wrap_runs_as_del(runs: List[etree._Element], rev_id: int, author: str, date: str) -> etree._Element:
@@ -723,30 +1042,52 @@ def replace_field_with_zotero(
 
 
 # -- in-place ad-hoc-marker replacement (text -> live Zotero field) ----------
-def _text_run_segments(para: etree._Element):
-    """Yield ``(run, w:t, text)`` for each *non-deleted* text-bearing run of
-    ``para`` in document order, reassembling the visible (accepted-view) text.
+_FIELD_MASK = "\x00"
+_W_INS = qn("w:ins")
 
-    Runs already inside a ``<w:del>`` (a pending deletion) are skipped so we
-    never try to re-strike text that's already struck. Only ``<w:t>``-bearing
-    runs are considered — that is where an ad-hoc author-year / [CITE] marker
-    lives; field runs and breaks are not part of a literal text marker.
+
+def _text_run_segments(para: etree._Element, *, mask_fields: bool = True):
+    """Yield ``(run, w:t, text)`` for each accepted-view text-bearing run of
+    ``para`` in document order.
+
+    Runs inside a ``<w:del>`` or ``<w:moveFrom>`` (gone from the accepted view)
+    are skipped so we never re-strike struck text. Only the FIRST ``<w:t>`` of a
+    run is read — that is where an ad-hoc author-year / [CITE] marker lives.
+
+    ``mask_fields`` (default): text inside an existing field — between a complex
+    field's ``begin`` and ``end``, or inside a ``<w:fldSimple>`` — is yielded as
+    the same number of ``\\x00`` characters. Offsets stay aligned with the
+    accepted text, but no anchor can match a field's result (a converted citation
+    whose result equals its old text is never found again) or straddle one.
     """
-    del_tag = qn("w:del")
+    skip = (qn("w:del"), qn("w:moveFrom"))
+    simple, fld, t_tag = qn("w:fldSimple"), qn("w:fldChar"), qn("w:t")
+    depth = 0
     for r in para.iter(qn("w:r")):
-        t = r.find(qn("w:t"))
+        anc, dropped, in_simple = r.getparent(), False, False
+        while anc is not None and anc is not para:
+            if anc.tag in skip:
+                dropped = True
+                break
+            if anc.tag == simple:
+                in_simple = True
+            anc = anc.getparent()
+        if dropped:
+            continue
+        fc = r.find(fld)
+        if fc is not None:
+            kind = fc.get(qn("w:fldCharType"))
+            if kind == "begin":
+                depth += 1
+            elif kind == "end" and depth:
+                depth -= 1
+        t = r.find(t_tag)
         if t is None:
             continue
-        anc = r.getparent()
-        deleted = False
-        while anc is not None and anc is not para:
-            if anc.tag == del_tag:
-                deleted = True
-                break
-            anc = anc.getparent()
-        if deleted:
-            continue
-        yield r, t, (t.text or "")
+        text = t.text or ""
+        if mask_fields and (depth or in_simple):
+            text = _FIELD_MASK * len(text)
+        yield r, t, text
 
 
 def _clone_text_run(run: etree._Element, text: str) -> etree._Element:
@@ -759,32 +1100,63 @@ def _clone_text_run(run: etree._Element, text: str) -> etree._Element:
     return new
 
 
-def _isolate_marker_runs(para: etree._Element, anchor: str):
-    """Locate the literal ``anchor`` substring within ``para``'s visible text and
-    split boundary runs so the marker is isolated into its own contiguous list of
-    sibling ``<w:r>`` elements.
+def _has_ancestor(el: etree._Element, stop: etree._Element, tags) -> bool:
+    anc = el.getparent()
+    while anc is not None and anc is not stop:
+        if anc.tag in tags:
+            return True
+        anc = anc.getparent()
+    return False
 
-    Returns ``(marker_runs, parent, idx)`` where ``marker_runs`` are the runs that
-    together contain exactly ``anchor`` (left in the tree, in order), ``parent`` is
-    their shared parent element, and ``idx`` is the position of the first marker
-    run in ``parent`` (where the replacement field is spliced).
 
-    Run-splitting: the run holding the marker's start is replaced by up to two
-    runs (the text before the marker, then the marker head); likewise the run
-    holding the marker's end is split into (marker tail, text after). Each split
-    fragment is a clone of the original run, so its ``rPr`` formatting is
-    preserved on every piece. Runs wholly inside the marker are reused as-is.
+def _marker_level(run: etree._Element) -> etree._Element:
+    """Where a NEW sibling ``<w:ins>`` for this marker run would live: the run's
+    parent, or, for a run directly inside a ``<w:ins>``, that insertion's parent."""
+    par = run.getparent()
+    return par.getparent() if par.tag == _W_INS else par
 
-    Raises ``LookupError`` if ``anchor`` is not found as a contiguous substring of
-    the paragraph's visible text (mirrors :func:`paras.find_paragraph`).
+
+def _isolate_marker_runs(para: etree._Element, anchor: str, start: Optional[int] = None,
+                         *, allow_tracked: bool = False):
+    """Locate the literal ``anchor`` substring within ``para``'s accepted-view text
+    (:func:`_text_run_segments`, field results masked) and split boundary runs so
+    the marker is isolated into its own list of ``<w:r>`` elements.
+
+    ``start`` pins the occurrence: an offset into the joined segment text where
+    ``anchor`` must begin (``LookupError`` otherwise). ``None`` (the default) takes
+    the FIRST occurrence outside any existing field.
+
+    Returns ``(marker_runs, parent, idx)``: the runs that together contain exactly
+    ``anchor`` (left in the tree, in order), the first one's parent, and its index
+    there. Each split fragment is a clone of its run, so ``rPr`` is preserved.
+
+    Shapes (all checked BEFORE any mutation; a refusal is a ``LookupError`` and the
+    tree is untouched):
+
+    * all marker runs share one parent — always isolated (the ordinary case);
+    * the marker crosses tracked-change containers — base runs and runs directly
+      inside ``<w:ins>`` elements, all at ONE level (an earlier review corrected a
+      year inside the citation) — isolated only with ``allow_tracked`` (the
+      tracked splice can strike/drop each run where it is);
+    * a marker inside a ``<w:moveTo>``, inside an existing field result, crossing
+      a hyperlink / content-control boundary, or inside a nested tracked change
+      is refused.
     """
     segs = list(_text_run_segments(para))
     if not segs:
         raise LookupError(f"anchor {anchor!r} not found in paragraph (no text runs)")
     full = "".join(s[2] for s in segs)
-    start = full.find(anchor)
-    if start < 0:
-        raise LookupError(f"anchor {anchor!r} not found in paragraph text")
+    raw = "".join((s[1].text or "") for s in segs)
+    if start is None:
+        start = full.find(anchor)
+        if start < 0:
+            if anchor in raw:
+                raise LookupError(f"anchor {anchor!r} occurs only inside an existing field result")
+            raise LookupError(f"anchor {anchor!r} not found in paragraph text")
+    elif start < 0 or full[start:start + len(anchor)] != anchor:
+        if start >= 0 and raw[start:start + len(anchor)] == anchor:
+            raise LookupError(f"marker {anchor!r} is inside an existing field result")
+        raise LookupError(f"anchor {anchor!r} not found at offset {start}")
     end = start + len(anchor)  # exclusive
 
     # Build (run, t, text, span_start, span_end) per segment over the joined text.
@@ -793,39 +1165,45 @@ def _isolate_marker_runs(para: etree._Element, anchor: str):
     for run, t, text in segs:
         spans.append((run, t, text, pos, pos + len(text)))
         pos += len(text)
+    overlap = [sp for sp in spans if not (sp[4] <= start or sp[3] >= end)]
 
-    # Cross-container guard — MUST run before any mutation below. _text_run_segments
-    # descends through <w:ins>/<w:hyperlink>/<w:sdt> (para.iter(w:r)), so when a
-    # marker straddles a container boundary the runs it overlaps sit under DIFFERENT
-    # parents. The strike/splice step (_wrap_runs_as_del, _splice_field_at_marker)
-    # removes every marker run from a SINGLE parent, so a mixed-parent set raises an
-    # lxml ValueError MID-mutation, corrupting the doc. Detect it here while the tree
-    # is still pristine and refuse cleanly with LookupError (which
-    # _splice_field_at_marker turns into a skippable no-op) instead. Uses the EXACT
-    # same "entirely outside" predicate as the mutation loop, so the overlap set it
-    # checks is identical to the set that loop would touch. Parents are compared by
-    # identity (`is`) — lxml's proxy caching keeps this reliable while refs are held;
-    # id() would not be.
-    overlap_parents: List[etree._Element] = []
-    for run, _t, _text, s0, s1 in spans:
-        if s1 <= start or s0 >= end:
-            continue  # run entirely outside the marker
-        par = run.getparent()
-        if not any(par is q for q in overlap_parents):
-            overlap_parents.append(par)
-    if len(overlap_parents) > 1:
-        raise LookupError(
-            f"anchor {anchor!r} spans an inline container "
-            "(ins/hyperlink/sdt) — not supported"
-        )
+    # Shape guard — MUST run before any mutation below (the strike/splice step
+    # removes runs from their parents; an unsupported mixed-parent set would
+    # otherwise fail MID-mutation). Parents are compared by identity (`is`).
+    if any(_has_ancestor(sp[0], para, (qn("w:moveTo"),)) for sp in overlap):
+        raise LookupError(f"marker {anchor!r} is inside a tracked move destination "
+                          "(w:moveTo) — not supported")
+    parents: List[etree._Element] = []
+    for sp in overlap:
+        par = sp[0].getparent()
+        if not any(par is q for q in parents):
+            parents.append(par)
+    if len(parents) > 1 or allow_tracked:
+        levels: List[etree._Element] = []
+        for sp in overlap:
+            lv = _marker_level(sp[0])
+            if not any(lv is q for q in levels):
+                levels.append(lv)
+        if len(levels) != 1:
+            raise LookupError(
+                f"anchor {anchor!r} spans an inline container "
+                "(hyperlink/sdt/smartTag) — not supported"
+            )
+        lv = levels[0]
+        if lv.tag in _REV_TAGS or (lv is not para and _has_ancestor(lv, para, _REV_TAGS)):
+            # A new w:ins here would nest inside another tracked change.
+            raise LookupError(f"marker {anchor!r} is inside a nested tracked change — not supported")
+        if len(parents) > 1 and not allow_tracked:
+            raise LookupError(
+                f"anchor {anchor!r} spans an inline container (a tracked insertion "
+                "boundary) — not supported without track=True"
+            )
 
     marker_runs: List[etree._Element] = []
     parent = para
     insert_idx = None
 
-    for run, t, text, s0, s1 in spans:
-        if s1 <= start or s0 >= end:
-            continue  # run entirely outside the marker
+    for run, t, text, s0, s1 in overlap:
         run_parent = run.getparent()
         idx = run_parent.index(run)
         local_start = max(start, s0) - s0      # marker start within this run's text
@@ -856,6 +1234,112 @@ def _isolate_marker_runs(para: etree._Element, anchor: str):
     return marker_runs, parent, insert_idx
 
 
+def _field_result_text(runs: List[etree._Element]) -> str:
+    """Visible text of a built field's result (the ``w:t`` runs between its
+    ``separate`` and ``end`` fldChars)."""
+    out, state = [], None
+    for r in runs:
+        fc = r.find(qn("w:fldChar"))
+        if fc is not None:
+            kind = fc.get(qn("w:fldCharType"))
+            state = "result" if kind == "separate" else (None if kind == "end" else state)
+            continue
+        if state == "result":
+            out.extend(t.text or "" for t in r.iter(qn("w:t")))
+    return "".join(out)
+
+
+def _plain_contiguous(runs: List[etree._Element], para: etree._Element) -> bool:
+    """True when ``runs`` are consecutive siblings of ONE parent, none inside a
+    tracked change (ins/del/moveFrom/moveTo) — an untracked edit there is invisible
+    to both views when the new text equals the old."""
+    parent = runs[0].getparent()
+    if any(r.getparent() is not parent for r in runs):
+        return False
+    if any(_has_ancestor(r, para, _REV_TAGS) for r in runs):
+        return False
+    return all(a.getnext() is b for a, b in zip(runs, runs[1:]))
+
+
+def _rejected_text(para: etree._Element) -> str:
+    """The paragraph's rejected-view text: ``w:t``/``w:delText`` outside any
+    insertion (``w:ins``/``w:moveTo``) — for the post-splice self-check."""
+    hide = (_W_INS, qn("w:moveTo"), qn("mc:Fallback"))
+    return "".join(n.text or "" for n in para.iter(qn("w:t"), qn("w:delText"))
+                   if not _has_ancestor(n, para, hide))
+
+
+def _own_insertion(run: etree._Element, para: etree._Element, author: str):
+    """The active ``author``'s own pending ``<w:ins>`` holding ``run`` (the single
+    owner is ``revisions._own_ins_host``: exact author, plain ins, not nested), or
+    ``None``. A revisions build without that owner treats every insertion as
+    foreign: the run is then struck instead of dropped (same views, more marks)."""
+    from . import revisions
+    owner = getattr(revisions, "_own_ins_host", None)
+    return owner(run, para, author) if owner is not None else None
+
+
+def _tracked_run_splice(root, para, marker_runs, new_runs, *, author: str, date: str) -> None:
+    """Tracked replacement of a marker whose runs may sit in different tracked
+    containers (all at one level, see :func:`_isolate_marker_runs`):
+
+    * a run in the active author's OWN pending insertion is removed outright
+      (rejecting it would remove it anyway; striking it would only add noise);
+    * every other run — base text or another author's insertion — is struck in
+      place (``revisions._wrap_run_as_deletion``; inside a foreign ``w:ins`` that
+      is the valid ins>del nesting Word writes);
+    * the field goes right after the marker: into the author's own insertion when
+      the marker's LAST run is in one, else as a NEW ``w:ins`` after the struck
+      span — a foreign insertion holding the last run is split there first, so the
+      new ``w:ins`` is a sibling (never nested) and lands exactly at the marker.
+    """
+    from . import revisions
+    ids = _RevIds(root)
+    own = [_own_insertion(r, para, author) for r in marker_runs]
+    last = marker_runs[-1]
+    new_ins = after = None
+    if own[-1] is not None:
+        prev = last
+        for x in new_runs:
+            prev.addnext(x)
+            prev = x
+    else:
+        new_ins = etree.Element(_W_INS)
+        new_ins.set(qn("w:id"), ids.next())
+        new_ins.set(qn("w:author"), author)
+        new_ins.set(qn("w:date"), date)
+        for x in new_runs:
+            new_ins.append(x)
+        host = last.getparent()
+        if host.tag == _W_INS:
+            tail = list(last.itersiblings())
+            if tail:
+                frag = etree.Element(_W_INS, dict(host.attrib))
+                frag.set(qn("w:id"), ids.next())
+                for el in tail:
+                    frag.append(el)
+                host.addnext(frag)
+            after = host
+    for r, host in zip(marker_runs, own):
+        if host is not None:
+            host.remove(r)
+            if len(host) == 0:
+                host.getparent().remove(host)
+        else:
+            revisions._wrap_run_as_deletion(r, ids, author, date)
+    if new_ins is not None:
+        (after if after is not None else last.getparent()).addnext(new_ins)
+
+
+def _restore_children(para: etree._Element, snapshot: etree._Element) -> None:
+    """Put ``para`` back to ``snapshot`` (a deep copy) IN PLACE, keeping the
+    element's identity for callers that hold it."""
+    for c in list(para):
+        para.remove(c)
+    for c in list(snapshot):
+        para.append(c)
+
+
 def _splice_field_at_marker(
     doc: Docx,
     root: etree._Element,
@@ -866,31 +1350,66 @@ def _splice_field_at_marker(
     track: bool,
     author: str,
     date: str,
+    start: Optional[int] = None,
+    reason_out: Optional[List[str]] = None,
 ) -> bool:
-    """Isolate the FIRST occurrence of ``anchor`` in ``para`` and splice the
+    """Isolate the FIRST occurrence of ``anchor`` in ``para`` (or the one at
+    segment-text offset ``start``, see :func:`_isolate_marker_runs`) and splice the
     pre-built ``field_xml`` (a complete begin/instr/sep/result/end field) in its
-    place, striking the marker. Returns ``True`` on a successful splice, ``False``
-    if ``anchor`` is not present in this paragraph's visible text.
+    place. Returns ``True`` on a successful splice, ``False`` (tree untouched; the
+    reason appended to ``reason_out``) when the marker is absent or its shape is
+    refused.
 
-    Shared inner step of :func:`replace_text_with_zotero_field` (single occurrence)
-    and :func:`replace_all_text_with_zotero_field` (paragraph-iterating loop). It
-    converts exactly ONE occurrence so a caller can re-scan and convert the next:
-    after a splice the marker text is gone (struck or removed) and replaced by the
-    field's result runs, so a fresh :func:`_isolate_marker_runs` lands on the next
-    genuine occurrence and never re-matches the one just converted.
+    Modes, chosen per occurrence:
+
+    * **untracked swap** — the field's result text equals ``anchor`` and the
+      marker is plain contiguous untracked runs: swapped without redlines (both
+      views read the same text before and after), even when ``track`` is on;
+    * ``track=False`` — the marker runs are removed and the field spliced there;
+    * ``track=True``, contiguous runs of one non-insertion parent — the marker is
+      struck as one ``w:del`` with the field in a ``w:ins`` right after it;
+    * ``track=True``, any other shape (crossing an earlier review's ins/del, or
+      inside an insertion) — :func:`_tracked_run_splice`.
+
+    A post-splice self-check compares the accepted text (the marker replaced by
+    the field result, nothing else) and, for every mode that must not change it,
+    the rejected text; a mismatch restores the paragraph and refuses.
+
+    Shared inner step of every marker-to-field writer. After a splice the marker
+    is gone and the field's result is masked from matching (see
+    :func:`_text_run_segments`), so a re-scan lands on the next genuine
+    occurrence and never re-matches the one just converted.
     """
+    snapshot = copy.deepcopy(para)
+    acc_before = "".join(s[2] for s in _text_run_segments(para, mask_fields=False))
+    rej_before = _rejected_text(para)
     try:
-        marker_runs, parent, idx = _isolate_marker_runs(para, anchor)
-    except LookupError:
+        marker_runs, parent, idx = _isolate_marker_runs(para, anchor, start, allow_tracked=track)
+    except LookupError as exc:
+        if reason_out is not None:
+            reason_out.append(str(exc))
         return False
+    first = marker_runs[0]
+    pos = 0
+    for run, _t, text in _text_run_segments(para, mask_fields=False):
+        if run is first:
+            break
+        pos += len(text)
     new_runs = _runs(field_xml)
-    if track:
+    result = _field_result_text(new_runs)
+    swap = result == anchor and _plain_contiguous(marker_runs, para)
+    if swap or not track:
+        for r in marker_runs:
+            parent.remove(r)
+        for offset, r in enumerate(new_runs):
+            parent.insert(idx + offset, r)
+    elif (parent.tag != _W_INS and all(r.getparent() is parent for r in marker_runs)
+          and all(a.getnext() is b for a, b in zip(marker_runs, marker_runs[1:]))):
+        # Strike the marker (one tracked deletion), then splice the field as a
+        # tracked insertion immediately after it.
         rev_id = _next_rev_id(root)
-        # Strike the marker (tracked deletion), then splice the field as a
-        # tracked insertion immediately after it (so document order is
-        # del-marker then ins-field at the marker's former position).
         d = _wrap_runs_as_del(marker_runs, rev_id, author, date)
-        ins = etree.Element(qn("w:ins"))
+        ins = etree.Element(_W_INS)
         ins.set(qn("w:id"), str(rev_id + 1))
         ins.set(qn("w:author"), author)
         ins.set(qn("w:date"), date)
@@ -898,11 +1417,186 @@ def _splice_field_at_marker(
             ins.append(r)
         d.addnext(ins)
     else:
-        for r in marker_runs:
-            parent.remove(r)
-        for offset, r in enumerate(new_runs):
-            parent.insert(idx + offset, r)
+        _tracked_run_splice(root, para, marker_runs, new_runs, author=author, date=date)
+    acc_after = "".join(s[2] for s in _text_run_segments(para, mask_fields=False))
+    ok = acc_after == acc_before[:pos] + result + acc_before[pos + len(anchor):]
+    if ok and (track or swap):
+        ok = _rejected_text(para) == rej_before
+    if not ok:
+        _restore_children(para, snapshot)
+        if reason_out is not None:
+            reason_out.append(f"post-splice check failed for {anchor!r} (accepted/rejected "
+                              "view would change beyond the marker); left unchanged")
+        return False
     return True
+
+
+def _segment_start_for(para: etree._Element, offset: int, anchor: str,
+                       superscript: bool = False):
+    """Translate ``offset`` (into ``paragraph_text(para)``, the accepted view
+    refextract scans) to the matching offset in :func:`_text_run_segments`' joined
+    text, which :func:`_isolate_marker_runs` splits on. The two views differ: tabs
+    and breaks count in the first only; ``w:moveFrom`` / ``mc:Fallback`` text and a
+    run's second ``w:t`` count in one only. Returns ``(segment_offset, None)`` or
+    ``(None, reason)``.
+
+    The marker's characters must all come from ``w:t`` elements that are each the
+    FIRST ``w:t`` of a ``w:r`` (the only text the splitter sees); with
+    ``superscript`` every such run must also carry ``vertAlign=superscript``.
+    :func:`_isolate_marker_runs` then re-checks that the segment text at the
+    returned offset IS ``anchor``, so a moved/fallback run between marker pieces
+    refuses instead of striking the wrong text."""
+    t_tag, tab_tag, r_tag = qn("w:t"), qn("w:tab"), qn("w:r")
+    br_tags = (qn("w:br"), qn("w:cr"))
+    drop_tags = (qn("w:del"), qn("w:moveFrom"), qn("mc:Fallback"))
+
+    def _dropped(node) -> bool:
+        anc = node.getparent()
+        while anc is not None and anc is not para:
+            if anc.tag in drop_tags:
+                return True
+            anc = anc.getparent()
+        return False
+
+    pieces: List[str] = []
+    owners: List[Optional[etree._Element]] = []   # per char: its w:t, or None (tab/br)
+    for node in para.iter(t_tag, tab_tag, *br_tags):
+        if _dropped(node):
+            continue
+        if node.tag == t_tag:
+            text = node.text or ""
+            pieces.append(text)
+            owners.extend([node] * len(text))
+        else:
+            pieces.append("\t" if node.tag == tab_tag else "\n")
+            owners.append(None)
+    full = "".join(pieces)
+    if full != paragraph_text(para):
+        return None, "paragraph text could not be mapped to its runs"
+    end = offset + len(anchor)
+    if offset < 0 or full[offset:end] != anchor:
+        return None, "marker not found at its recorded location"
+    covering: List[etree._Element] = []
+    for t in owners[offset:end]:
+        if t is None:
+            return None, "marker spans a tab or line break"
+        if not covering or covering[-1] is not t:
+            covering.append(t)
+    for t in covering:
+        run = t.getparent()
+        if run is None or run.tag != r_tag or run.find(t_tag) is not t:
+            return None, "marker text is not in a plain text run"
+        if superscript:
+            va = run.find(f"{qn('w:rPr')}/{qn('w:vertAlign')}")
+            if va is None or (va.get(qn("w:val")) or "").lower() != "superscript":
+                return None, "marker run is no longer superscript"
+    first_t = covering[0]
+    first_run = first_t.getparent()
+    # Characters of first_t before the marker (first_t may hold earlier text too).
+    t_pos = offset
+    while t_pos > 0 and owners[t_pos - 1] is first_t:
+        t_pos -= 1
+    pos = 0
+    for run, t, text in _text_run_segments(para):
+        if run is first_run:
+            return pos + (offset - t_pos), None
+        pos += len(text)
+    return None, "marker run not found among the paragraph's text runs"
+
+
+def replace_occurrences_with_zotero_fields(
+    doc: Docx,
+    occurrences: List[dict],
+    *,
+    style: str = DEFAULT_STYLE,
+    track: bool = False,
+    author: str = "zotero-word-cite",
+    date: Optional[str] = None,
+) -> List[Optional[str]]:
+    """Convert EXACTLY the given marker occurrences, located by position, into
+    live Zotero ``ZOTERO_ITEM`` fields. The location-scoped counterpart of
+    :func:`replace_all_text_with_zotero_field` (which converts every occurrence
+    of a text): use it when only some same-text occurrences are citations — a
+    list enumerator "(2)" in one paragraph while "(2)" cites reference 2 in
+    another — or when the marker text is not a safe search anchor at all (a
+    superscript "12" also matches inside "2012").
+
+    Each occurrence is a dict:
+
+    * ``para`` — index into :func:`paras.iter_paragraphs` of the document (the
+      enumeration :func:`refextract.extract_references` reports);
+    * ``offset`` — where ``anchor`` starts in that paragraph's accepted-view
+      :func:`paras.paragraph_text`;
+    * ``anchor`` — the marker text, re-verified at that location;
+    * ``keys`` / ``itemdata`` / ``uris`` and optional ``rendered`` /
+      ``rendered_html`` / ``extras`` — as for :func:`replace_text_with_zotero_field`;
+    * ``superscript`` (optional) — the marker's runs must still be superscript.
+
+    Returns a list aligned with ``occurrences``: ``None`` where the occurrence
+    was converted, else the reason it was refused (the document is untouched for
+    a refused occurrence). Paragraph indices are resolved once, before any
+    mutation, and each paragraph's occurrences are spliced RIGHT TO LEFT so an
+    earlier offset stays valid after a later splice. Each field gets its own
+    citationID (seeded by anchor + location).
+
+    A marker crossing an earlier review's tracked changes converts with
+    ``track=True`` (see :func:`_splice_field_at_marker`); a marker inside an
+    existing field's result is refused. With ``track=True`` the whole call shares
+    ONE op date and its marks are then spread into distinct, ordered ``w:date``s
+    (one event per paragraph); marks that existed before are never re-stamped."""
+    date = date or now_iso()
+    root = doc.tree(DOCUMENT)
+    paras = iter_paragraphs(root)
+    pre_marks = _snapshot_marks(doc, author) if track else None
+    status: List[Optional[str]] = ["not attempted"] * len(occurrences)
+    by_para: dict = {}
+    for i, occ in enumerate(occurrences):
+        pi = occ.get("para")
+        if not isinstance(pi, int) or not 0 <= pi < len(paras):
+            status[i] = "paragraph index out of range"
+            continue
+        if not occ.get("anchor"):
+            status[i] = "empty anchor"
+            continue
+        if not isinstance(occ.get("offset"), int):
+            status[i] = "no marker offset"
+            continue
+        by_para.setdefault(pi, []).append(i)
+    prefs_done = False
+    for pi, idxs in by_para.items():
+        para = paras[pi]
+        idxs.sort(key=lambda i: occurrences[i]["offset"], reverse=True)
+        floor = None   # start of the occurrence spliced just before (to its right)
+        for i in idxs:
+            occ = occurrences[i]
+            off, anchor = occ["offset"], occ["anchor"]
+            if floor is not None and off + len(anchor) > floor:
+                status[i] = "overlaps another marker"
+                continue
+            seg_start, reason = _segment_start_for(
+                para, off, anchor, bool(occ.get("superscript")))
+            if reason:
+                status[i] = reason
+                continue
+            if not prefs_done:
+                ensure_pref(doc, style)
+                prefs_done = True
+            field_xml = _build_zotero_field_xml(
+                [anchor, f"p{pi}", f"o{off}"], occ["keys"], occ["itemdata"], occ["uris"],
+                rendered=occ.get("rendered", "(citation)"),
+                rendered_html=occ.get("rendered_html"), extras=occ.get("extras"),
+            )
+            why: List[str] = []
+            if _splice_field_at_marker(doc, root, para, anchor, field_xml,
+                                       track=track, author=author, date=date,
+                                       start=seg_start, reason_out=why):
+                status[i] = None
+                floor = off
+            else:
+                status[i] = why[0] if why else "marker could not be isolated"
+    if track and any(st is None for st in status):
+        _spread_op_marks(doc, author, date, pre_marks)
+    return status
 
 
 def replace_text_with_zotero_field(
@@ -942,25 +1636,56 @@ def replace_text_with_zotero_field(
     rendered text where the marker was (and not the marker); the rejected view
     shows the original marker text (and not the field).
 
-    Raises ``LookupError`` if ``anchor`` does not match exactly one paragraph, or
-    is not found as a contiguous substring of that paragraph's visible text.
+    Existing field results are not searched (:func:`_find_marker_paragraph`), so
+    a marker already converted to a field whose result equals the old text is not
+    found again. A marker crossing an earlier review's tracked changes converts
+    with ``track=True``; when the field's result equals ``anchor`` over plain
+    untracked runs the swap is untracked (see :func:`_splice_field_at_marker`).
+
+    Raises ``LookupError`` if ``anchor`` does not match exactly one paragraph
+    outside field results, or its shape is refused (the reason is the message;
+    the document is unchanged).
     """
     date = date or now_iso()
     root = doc.tree(DOCUMENT)
     # Locate the marker BEFORE any mutation (prefs/field), so a missing anchor
     # raises LookupError without leaving the document half-modified.
-    para = find_paragraph(root, anchor)  # raises LookupError unless exactly 1
-    ensure_pref(doc, style)
+    para = _find_marker_paragraph(root, anchor)  # raises LookupError unless exactly 1
     field_xml = _build_zotero_field_xml(
         [anchor], keys, itemdata, uris,
         rendered=rendered, rendered_html=rendered_html, extras=extras,
     )
+    why: List[str] = []
     if not _splice_field_at_marker(
         doc, root, para, anchor, field_xml,
-        track=track, author=author, date=date,
-    ):  # pragma: no cover — find_paragraph already guaranteed a contiguous match
-        raise LookupError(f"anchor {anchor!r} could not be isolated in paragraph")
+        track=track, author=author, date=date, reason_out=why,
+    ):
+        raise LookupError(why[0] if why else f"anchor {anchor!r} could not be isolated in paragraph")
+    ensure_pref(doc, style)
     return doc
+
+
+def _masked_contains(para: etree._Element, anchor: str) -> bool:
+    return anchor in "".join(s[2] for s in _text_run_segments(para))
+
+
+def _find_marker_paragraph(root: etree._Element, anchor: str,
+                           index: Optional[ParaIndex] = None) -> etree._Element:
+    """The ONE paragraph holding ``anchor`` OUTSIDE existing field results
+    (:func:`paras.ParaIndex` candidates, then masked by
+    :func:`_text_run_segments`; a TOC entry loses a tie to a body paragraph)."""
+    index = index or ParaIndex(root)
+    hits = index.find_all(anchor)
+    live = [p for p in hits if _masked_contains(p, anchor)]
+    if len(live) > 1:
+        body = [p for p in live if not index.is_toc(p)]
+        if len(body) == 1:
+            live = body
+    if len(live) != 1:
+        extra = (f" ({len(hits) - len(live)} more only inside existing field results)"
+                 if len(hits) > len(live) else "")
+        raise LookupError(f"anchor {anchor!r} matched {len(live)} paragraphs (need exactly 1){extra}")
+    return live[0]
 
 
 def replace_all_text_with_zotero_field(
@@ -1030,6 +1755,7 @@ def replace_all_text_with_zotero_field(
         [anchor], keys, itemdata, uris,
         rendered=rendered, rendered_html=rendered_html, extras=extras,
     )
+    pre_marks = _snapshot_marks(doc, author) if track else None
     converted = 0
     # When a caller converts MANY distinct tokens against one document (cite-link's
     # token loop), it can pass a prebuilt ``index`` so the whole-doc paragraph scan
@@ -1053,4 +1779,6 @@ def replace_all_text_with_zotero_field(
             ):
                 break
             converted += 1
+    if track and converted:
+        _spread_op_marks(doc, author, date, pre_marks)
     return converted
