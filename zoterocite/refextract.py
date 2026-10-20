@@ -626,6 +626,7 @@ def _enumerator_run_indices(matches: list, txt: str) -> set:
 # Character styles that put a footnote/endnote number in superscript: their text
 # is a note reference, never a citation.
 _NOTE_REF_STYLES = ("footnotereference", "endnotereference")
+_STYLES_PART = "word/styles.xml"
 # Punctuation that may share the superscript formatting at a marker's END
 # ("tubers12," with the comma superscripted too) — trimmed, not part of the cite.
 _SUP_TRAILING_PUNCT = ",.;:"
@@ -638,8 +639,8 @@ class _SupChar:
     __slots__ = ("sup", "sub", "eligible")
 
     def __init__(self, sup: bool = False, sub: bool = False, eligible: bool = False):
-        self.sup = sup            # vertAlign=superscript on the run
-        self.sub = sub            # vertAlign=subscript on the run
+        self.sup = sup            # effective vertAlign=superscript on the run
+        self.sub = sub            # effective vertAlign=subscript on the run
         self.eligible = eligible  # superscript AND plain prose text (not a field, not a note ref)
 
 
@@ -648,14 +649,114 @@ def _run_vert_align(r: etree._Element) -> str:
     return (va.get(qn("w:val")) or "").lower() if va is not None else ""
 
 
-def _run_is_note_ref(r: etree._Element) -> bool:
+def _run_is_note_ref(r: etree._Element, styles: "Optional[_SupStyles]" = None) -> bool:
     if r.find(qn("w:footnoteReference")) is not None or r.find(qn("w:endnoteReference")) is not None:
         return True
     rs = r.find(f"{qn('w:rPr')}/{qn('w:rStyle')}")
-    return rs is not None and (rs.get(qn("w:val")) or "").lower() in _NOTE_REF_STYLES
+    if rs is None:
+        return False
+    sid = rs.get(qn("w:val")) or ""
+    return sid.lower() in _NOTE_REF_STYLES or (styles is not None and sid in styles.note_ref_ids)
 
 
-def _superscript_char_map(p: etree._Element, field_stack: list) -> Optional[List[_SupChar]]:
+class _SupStyles:
+    """Effective ``w:vertAlign`` for the superscript scan, resolved from
+    ``word/styles.xml`` with Word's precedence: direct run ``rPr`` (an explicit
+    ``baseline`` cancels a styled superscript) > the run's character style
+    (``rStyle``) ``basedOn`` chain > the paragraph style's (``pStyle``, else the
+    default paragraph style) ``rPr`` chain > ``docDefaults/rPrDefault``.
+
+    Private on purpose: refextract is a brand-only synced module, so it cannot
+    import a grant-only or intentional-diff style helper. Chains are cycle-guarded
+    and a dangling ``basedOn``/``rStyle``/``pStyle`` id just ends its chain.
+    ``note_ref_ids`` are the style ids that mark a footnote/endnote reference:
+    named ``footnote reference``/``endnote reference`` (any id), or ``basedOn``
+    one."""
+
+    _NOTE_REF_NAMES = ("footnote reference", "endnote reference")
+
+    def __init__(self, styles_root: etree._Element):
+        self._by_id: dict = {}           # styleId -> (basedOn | None, vertAlign | None)
+        self._default_para: Optional[str] = None
+        self._doc_default = ""
+        names: dict = {}
+        for st in styles_root.iter(qn("w:style")):
+            sid = st.get(qn("w:styleId"))
+            if not sid:
+                continue
+            based = st.find(qn("w:basedOn"))
+            va = st.find(f"{qn('w:rPr')}/{qn('w:vertAlign')}")
+            self._by_id.setdefault(sid, (
+                based.get(qn("w:val")) if based is not None else None,
+                (va.get(qn("w:val")) or "").lower() if va is not None else None))
+            name = st.find(qn("w:name"))
+            names.setdefault(sid, ((name.get(qn("w:val")) or "") if name is not None else "").lower())
+            if (self._default_para is None and st.get(qn("w:type")) == "paragraph"
+                    and st.get(qn("w:default")) in ("1", "true", "on")):
+                self._default_para = sid
+        dd = styles_root.find(
+            f"{qn('w:docDefaults')}/{qn('w:rPrDefault')}/{qn('w:rPr')}/{qn('w:vertAlign')}")
+        if dd is not None:
+            self._doc_default = (dd.get(qn("w:val")) or "").lower()
+        self.note_ref_ids = {
+            sid for sid in self._by_id
+            if any(names.get(s, "") in self._NOTE_REF_NAMES or s.lower() in _NOTE_REF_STYLES
+                   for s in self._chain(sid))}
+        self._para_cache: dict = {}
+
+    def _chain(self, sid: Optional[str]):
+        """Style ids from *sid* up its ``basedOn`` chain (cycle-guarded; stops at
+        an unknown id)."""
+        seen = set()
+        while sid and sid in self._by_id and sid not in seen:
+            seen.add(sid)
+            yield sid
+            sid = self._by_id[sid][0]
+
+    def _chain_vert_align(self, sid: Optional[str]) -> Optional[str]:
+        for s in self._chain(sid):
+            va = self._by_id[s][1]
+            if va is not None:
+                return va
+        return None
+
+    def para_base(self, p: etree._Element) -> str:
+        """vertAlign every run of *p* inherits before its own character style:
+        the paragraph style chain, else docDefaults."""
+        ps = p.find(f"{qn('w:pPr')}/{qn('w:pStyle')}")
+        sid = ps.get(qn("w:val")) if ps is not None else None
+        if not sid or sid not in self._by_id:
+            sid = self._default_para
+        if sid not in self._para_cache:
+            va = self._chain_vert_align(sid)
+            self._para_cache[sid] = va if va is not None else self._doc_default
+        return self._para_cache[sid]
+
+    def run_vert_align(self, r: etree._Element, para_base: str) -> str:
+        va = r.find(f"{qn('w:rPr')}/{qn('w:vertAlign')}")
+        if va is not None:
+            return (va.get(qn("w:val")) or "").lower()
+        rs = r.find(f"{qn('w:rPr')}/{qn('w:rStyle')}")
+        if rs is not None:
+            styled = self._chain_vert_align(rs.get(qn("w:val")))
+            if styled is not None:
+                return styled
+        return para_base
+
+
+def _load_sup_styles(doc: Docx) -> Optional[_SupStyles]:
+    """The styles resolver for *doc*, or ``None`` (direct-formatting-only scan)
+    when the styles part is missing or unreadable — never raises."""
+    try:
+        if not doc.has(_STYLES_PART):
+            return None
+        return _SupStyles(doc.read_tree(_STYLES_PART))
+    except Exception:  # malformed/odd styles part: degrade, don't fail extraction
+        return None
+
+
+def _superscript_char_map(p: etree._Element, field_stack: list,
+                          styles: Optional[_SupStyles] = None) -> Optional[List[_SupChar]]:
     """One :class:`_SupChar` per character of ``paragraph_text(p)``, or ``None``
     when this walk cannot reproduce that text exactly (the caller then skips the
     paragraph: a misaligned map could point a marker at the wrong characters).
@@ -666,7 +767,11 @@ def _superscript_char_map(p: etree._Element, field_stack: list) -> Optional[List
     complex-field depth ACROSS paragraphs (a field can span several), so text
     inside any field — a live Zotero/EndNote citation renders superscript too —
     is never eligible; neither is text under a ``w:fldSimple`` nor a footnote /
-    endnote reference run."""
+    endnote reference run.
+
+    ``styles`` (from :func:`_load_sup_styles`) makes vertAlign the EFFECTIVE value
+    (character / paragraph style chains, docDefaults) and recognises note-reference
+    styles by name; ``None`` reads direct run formatting only."""
     t_tag, tab_tag = qn("w:t"), qn("w:tab")
     br_tags = (qn("w:br"), qn("w:cr"))
     fld_tag, r_tag = qn("w:fldChar"), qn("w:r")
@@ -679,6 +784,7 @@ def _superscript_char_map(p: etree._Element, field_stack: list) -> Optional[List
             yield anc
             anc = anc.getparent()
 
+    para_base = styles.para_base(p) if styles is not None else ""
     chars: List[_SupChar] = []
     pieces: List[str] = []
     for node in p.iter(t_tag, tab_tag, *br_tags, fld_tag):
@@ -703,7 +809,9 @@ def _superscript_char_map(p: etree._Element, field_stack: list) -> Optional[List
         if run is None or run.tag != r_tag:
             va, note = "", False
         else:
-            va, note = _run_vert_align(run), _run_is_note_ref(run)
+            va = (_run_vert_align(run) if styles is None
+                  else styles.run_vert_align(run, para_base))
+            note = _run_is_note_ref(run, styles)
         sup, sub = va == "superscript", va == "subscript"
         eligible = (sup and not note and not field_stack
                     and not any(a.tag == simple_tag for a in ancs))
@@ -985,11 +1093,13 @@ def extract_references(path, *, superscript: bool = False) -> dict:
     intext_counter = 0
     # Open complex-field depth carried across paragraphs (superscript scan only).
     field_stack: list = []
+    # styles.xml parsed once, and only for the opt-in superscript scan.
+    sup_styles = _load_sup_styles(doc) if superscript else None
 
     for pi, p in enumerate(paras):
         # The superscript map walks EVERY paragraph (before any skip) so the
         # field depth it carries stays right across skipped paragraphs.
-        sup_chars = _superscript_char_map(p, field_stack) if superscript else None
+        sup_chars = _superscript_char_map(p, field_stack, sup_styles) if superscript else None
         # Skip the heading paragraph and the reflist region
         if pi in reflist_para_indices:
             continue

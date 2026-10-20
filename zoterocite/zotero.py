@@ -2033,7 +2033,9 @@ def csljson_to_zotero_item(
     ``extra`` as ``"DOI: <doi>"``.
 
     Authors are mapped from ``{"family", "given"}`` → Zotero
-    ``{"creatorType": "author", "lastName", "firstName"}``.
+    ``{"creatorType": "author", "lastName", "firstName"}``; a group author
+    ``{"literal"}`` (or ``{"name"}``) with no family/given → the single-field
+    ``{"creatorType": "author", "name"}``, keeping author order.
     ``year`` → ``date``.
 
     ``collections`` is a list of Zotero collection keys (not names).
@@ -2056,6 +2058,12 @@ def csljson_to_zotero_item(
                 "firstName": first,
                 "lastName": last,
             })
+            continue
+        # A group/institutional author (CSL ``literal``, or a Zotero-style
+        # ``name``) becomes Zotero's single-field creator, in place.
+        single = str(author.get("literal") or author.get("name") or "").strip()
+        if single:
+            creators.append({"creatorType": "author", "name": single})
 
     # Common (type-agnostic) fields — valid for every target itemType.
     item: dict[str, Any] = {

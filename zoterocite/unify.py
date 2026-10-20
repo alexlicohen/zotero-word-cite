@@ -50,6 +50,7 @@ from . import zotero
 from . import citecheck
 from . import citeconvert
 from . import zoterofield
+from .ooxml import now_iso, qn
 
 # The dedicated collection + tag every added item gets (confirmed design).
 IMPORTED_COLLECTION = "Imported — review"
@@ -899,7 +900,10 @@ def _itemdata_from_meta(meta: Optional[dict], key: str) -> dict:
     meta = meta or {}
     authors = []
     for a in meta.get("authors") or []:
-        if isinstance(a, dict):
+        lit = refresolve.author_literal(a)
+        if lit:
+            authors.append({"literal": lit})    # group author, in place
+        elif isinstance(a, dict):
             authors.append({
                 "family": (a.get("family") or "").strip(),
                 "given": (a.get("given") or "").strip(),
@@ -939,8 +943,9 @@ def _resolve_link_markers(
        longer exists in the mutated file (e.g. it WAS a foreign field that got
        converted) is silently dropped rather than mis-resolved to a coincidental
        same-index marker. When a text occurs multiple times in the mutated file
-       the first unconsumed inventory marker is taken; uniqueness is still gated
-       downstream by ``_anchor_is_unique`` before any write.
+       the first unconsumed inventory marker is taken; a located (numeric)
+       marker is then converted at its own ``para``/``offset``, and a marker
+       without a location is gated downstream by ``_anchor_is_unique``.
     2. Otherwise (old or JSON-roundtripped plan with only ``intext_links``), fall
        back to the raw index into the rewrite_src inventory — the legacy
        behaviour, kept for back-compat.
@@ -1255,6 +1260,28 @@ def _intext_ref(pl: dict) -> dict:
     if pl.get("intext_index") is None:
         return {}
     return {"intext_index": pl["intext_index"], "item": pl.get("item_pos")}
+
+
+def _mark_key(el) -> tuple:
+    """A mark's identity that survives a save + re-open: tag, revision/comment id
+    and date. A mark written later in the same op can never share it — new
+    tracked-change ids are allocated past the document's maximum."""
+    return (el.tag, el.get(qn("w:id")), el.get(qn("w:date")))
+
+
+def _pre_mark_keys(doc, author: str) -> Optional[set]:
+    """Keys of ``author``'s dated marks that exist BEFORE this op, or ``None``
+    when they cannot be snapshotted (the op-level spread is then skipped rather
+    than run with a scope that could re-stamp an older mark)."""
+    snap = zoterofield._snapshot_marks(doc, author)
+    return None if snap is None else {_mark_key(el) for el in snap}
+
+
+def _rebind_pre_marks(doc, author: str, keys: set) -> Optional[set]:
+    """The elements of the (re-opened) ``doc`` that are the pre-op marks named by
+    ``keys`` — the ``pre_existing`` scope for ``spread_own_marks``."""
+    snap = zoterofield._snapshot_marks(doc, author)
+    return None if snap is None else {el for el in snap if _mark_key(el) in keys}
 
 
 def apply_unification(
@@ -1674,17 +1701,35 @@ def apply_unification(
     out_path = Path(out)
     n_foreign = plan.get("summary", {}).get("n_foreign_fields", 0)
 
+    # Tracked apply = ONE op: every write below (foreign-field swaps, location
+    # batch, text-path markers, placeholders) is stamped with this pinned date and
+    # the active author, and the op's marks are spread ONCE at the end (step 6).
+    # INVARIANT: marks that existed before the op — any author, including this
+    # author's earlier rounds — keep their exact w:date. They are snapshotted
+    # here, BEFORE any write. The foreign-field pass writes to out_path and the
+    # file is re-opened, so the snapshot is carried as stable mark keys and
+    # re-bound to the re-opened tree's elements (_rebind_pre_marks).
+    op_date = now_iso()
+    spread_author = author if author is not None else "zotero-word-cite"
+    pre_mark_keys = None
+    if track:
+        pre_mark_keys = _pre_mark_keys(zoterofield.Docx(path), spread_author)
+
     convert_result = None
     rewrite_src = Path(path)
     if n_foreign:
         # Convert foreign fields straight into the final output, then re-open
-        # that file for the plain-text insertion pass.
-        convert_result = citeconvert.convert_to_zotero(path, out=out_path, track=track)
+        # that file for the plain-text insertion pass. spread=False: this op
+        # spreads once, at the end, over all of its marks.
+        convert_result = citeconvert.convert_to_zotero(
+            path, out=out_path, track=track, date=op_date, spread=False, **_author_kw)
         report["replaced"] += len(convert_result.get("converted", []))
         rewrite_src = out_path
 
     doc = zoterofield.Docx(rewrite_src)
     root = doc.read_tree(zoterofield.DOCUMENT)
+    pre_marks = (_rebind_pre_marks(doc, spread_author, pre_mark_keys)
+                 if pre_mark_keys is not None else None)
     # One anchor index for every uniqueness check below: each marker would
     # otherwise re-walk the whole document (O(markers*doc)). Each PHYSICAL marker
     # is now converted EXACTLY ONCE (the group-by-marker pass below), replacing
@@ -1781,6 +1826,17 @@ def apply_unification(
     # author-year branch re-links each item exactly as plan time did.
     ay_reflist = [{"index": r["ref_index"], "text": r.get("input") or ""}
                   for r in references if r.get("ref_index") is not None]
+    # Markers that carry their LOCATION (refextract numeric markers: ``para`` +
+    # ``offset`` into the very tree being mutated) are converted exactly there,
+    # all in ONE batched call after this loop (offsets are resolved before any
+    # splice and spliced right to left — zoterofield owns that). A text search
+    # would convert the FIRST same-text copy in the paragraph (a list enumerator
+    # before the real cite) and refuse a marker cited in two paragraphs.
+    # Markers without a location (author-year) keep the text path + uniqueness
+    # gate, deferred until AFTER the batch so no text write shifts an offset.
+    loc_occurrences: List[dict] = []
+    loc_meta: List[dict] = []
+    text_jobs: List[dict] = []
     for g in marker_groups.values():
         marker = g["marker"]
         members = g["members"]
@@ -1908,6 +1964,26 @@ def apply_unification(
             # surfaced via needs_input from the create pass.
             continue
 
+        keys = [pl["key"] for pl in ordered]
+        itemdata = [_itemdata_from_meta(pl["meta"], pl["key"]) for pl in ordered]
+        # Degrade-safe: a matched-key placement under a DEGRADED read (offline /
+        # creds missing) must still write the field (carries the KEY; Word rebinds
+        # the URI on Refresh) rather than crash on item_uri. See zotero single owner.
+        uris = [zotero.item_uri_offline_safe(k) for k in keys]
+        # rendered is the pre-Refresh placeholder text; for one key this is
+        # byte-identical to the old "({key})". Keys are alphanumeric so the
+        # render can never re-introduce a numeric marker into the tree.
+        rendered = "(" + "; ".join(keys) + ")"
+
+        if isinstance(marker.get("para"), int) and isinstance(marker.get("offset"), int):
+            occ = {"para": marker["para"], "offset": marker["offset"], "anchor": anchor,
+                   "keys": keys, "itemdata": itemdata, "uris": uris, "rendered": rendered}
+            if marker.get("superscript"):
+                occ["superscript"] = True
+            loc_occurrences.append(occ)
+            loc_meta.append(marker)
+            continue
+
         if not _anchor_is_unique(anchor):
             report["unresolved_in_doc"].append({
                 "marker": anchor,
@@ -1915,24 +1991,41 @@ def apply_unification(
                 "reason": "anchor not uniquely located in document",
             })
             continue
+        text_jobs.append({"marker": marker, "keys": keys, "itemdata": itemdata,
+                          "uris": uris, "rendered": rendered})
 
-        keys = [pl["key"] for pl in ordered]
-        itemdata = [_itemdata_from_meta(pl["meta"], pl["key"]) for pl in ordered]
-        # Degrade-safe: a matched-key placement under a DEGRADED read (offline /
-        # creds missing) must still write the field (carries the KEY; Word rebinds
-        # the URI on Refresh) rather than crash on item_uri. See zotero single owner.
-        uris = [zotero.item_uri_offline_safe(k) for k in keys]
+    # ONE batched location call for every located marker (before any text-path
+    # write, so every recorded offset still describes the tree). A refused
+    # occurrence is left as plain text and reported with zoterofield's reason.
+    if loc_occurrences:
+        try:
+            loc_status = zoterofield.replace_occurrences_with_zotero_fields(
+                doc, loc_occurrences, track=track, date=op_date, spread=False,
+                **_author_kw,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort, never fail the run
+            loc_status = [f"replace failed: {exc}"] * len(loc_occurrences)
+        for marker, occ, st in zip(loc_meta, loc_occurrences, loc_status):
+            if st is None:
+                # Per-PHYSICAL-marker count: one grouped "[3,4]" -> +1, not +len(keys).
+                report["replaced"] += 1
+            else:
+                report["unresolved_in_doc"].append({
+                    "marker": occ["anchor"],
+                    "kind": marker["kind"],
+                    "reason": f"not converted at its location (para {occ['para']}): {st}",
+                })
+
+    for job in text_jobs:
+        marker = job["marker"]
+        anchor = marker["text"]
         try:
             zoterofield.replace_text_with_zotero_field(
-                doc, anchor, keys,
-                itemdata=itemdata, uris=uris,
-                # rendered is the pre-Refresh placeholder text; for one key this is
-                # byte-identical to the old "({key})". Keys are alphanumeric so the
-                # render can never re-introduce a numeric marker into the tree.
-                rendered="(" + "; ".join(keys) + ")",
-                track=track, **_author_kw,
+                doc, anchor, job["keys"],
+                itemdata=job["itemdata"], uris=job["uris"],
+                rendered=job["rendered"],
+                track=track, date=op_date, **_author_kw,
             )
-            # Per-PHYSICAL-marker count: one grouped "[3,4]" -> +1, not +len(keys).
             report["replaced"] += 1
         except Exception as exc:  # noqa: BLE001 — best-effort, never fail the run
             report["unresolved_in_doc"].append({
@@ -1963,7 +2056,7 @@ def apply_unification(
             zoterofield.replace_text_with_zotero_field(
                 doc, anchor, [key],
                 itemdata=[idata], uris=[uri],
-                rendered=f"({key})", track=track, **_author_kw,
+                rendered=f"({key})", track=track, date=op_date, **_author_kw,
             )
             report["replaced"] += 1
         except Exception as exc:  # noqa: BLE001
@@ -1974,8 +2067,11 @@ def apply_unification(
             })
 
     # -----------------------------------------------------------------------
-    # 6. Save the rewritten document.
+    # 6. Spread THIS op's marks once (distinct, ordered w:dates ending at the
+    #    pinned op date; pre-op marks excluded by provenance), then save.
     # -----------------------------------------------------------------------
+    if track:
+        zoterofield._spread_op_marks(doc, spread_author, op_date, pre_marks)
     doc.save(out_path)
     report["out"] = str(out_path)
     return report

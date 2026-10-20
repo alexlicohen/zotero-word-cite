@@ -406,13 +406,20 @@ def _parse_crossref_item(item: dict) -> dict:
     titles = item.get("title") or []
     title = titles[0].strip() if titles else None
 
-    # Authors
+    # Authors.  A Crossref group/consortium author carries only ``name`` (no
+    # family/given): it becomes the CSL-JSON institutional shape
+    # ``{"literal": name}`` IN PLACE, so author order is kept and the create
+    # path posts it as a single-field Zotero creator instead of dropping it.
     authors = []
     for a in (item.get("author") or []):
         if not isinstance(a, dict):
             continue
         family = (a.get("family") or "").strip()
         given = (a.get("given") or "").strip()
+        name = (a.get("name") or "").strip()
+        if not family and not given and name:
+            authors.append({"literal": name})
+            continue
         authors.append({"family": family, "given": given})
 
     # Year — prefer published-print, then published-online, then issued.
@@ -675,6 +682,20 @@ def _is_corporate_author(family: str, given: str = "") -> bool:
     return False
 
 
+def author_literal(author) -> str:
+    """The single-field name of a group/institutional author entry, else ``""``.
+
+    A SHAPE check, not a corporate detector (that is
+    :func:`_is_corporate_author`): an entry with no family/given but a CSL
+    ``literal`` (or a Zotero-style ``name``) is one single-field author.
+    """
+    if not isinstance(author, dict):
+        return ""
+    if str(author.get("family") or "").strip() or str(author.get("given") or "").strip():
+        return ""
+    return str(author.get("literal") or author.get("name") or "").strip()
+
+
 def _author_family_compare(cited: list, actual: list) -> dict:
     """Family-by-family + count cross-check of two author lists.
 
@@ -728,8 +749,8 @@ def _author_family_compare(cited: list, actual: list) -> dict:
     def _persons(lst: list) -> list:
         out = []
         for i, e in enumerate(lst):
-            if not isinstance(e, dict):
-                continue
+            if not isinstance(e, dict) or author_literal(e):
+                continue                  # a single-field group author
             fam = (e.get("family") or "").strip()
             if _is_corporate_author(fam, e.get("given") or ""):
                 continue
@@ -1130,6 +1151,13 @@ def _author_from_string(text: str) -> Optional[dict]:
         return {"family": fam.strip(), "given": giv.strip()}
     toks = s.split()
     if len(toks) >= 2 and _PUBMED_INITIALS_RE.match(toks[-1]):
+        # A collective is never split into surname + "initials"
+        # (``EXAMPLE CONSORTIUM ABC`` must not become family/given). Only a
+        # multi-word head can be a collective: one surname token plus initials
+        # is always a person, even when the surname is an org keyword
+        # ("Nice AB", "Group JM").
+        if len(toks) >= 3 and _is_corporate_author(" ".join(toks[:-1]), ""):
+            return {"family": s, "given": ""}
         return {"family": " ".join(toks[:-1]), "given": toks[-1]}
     return {"family": s, "given": ""}
 
@@ -1140,8 +1168,15 @@ def _normalize_author(author):
         author = _author_from_string(author)
     if not isinstance(author, dict):
         return author
-    if "family" not in author and "given" not in author:
-        return dict(author)
+    if author_literal(author) or ("family" not in author and "given" not in author):
+        # A single-field group author (CSL ``literal`` / ``name``) keeps its
+        # letter case and is never split into family/given; only HTML entities
+        # are decoded.
+        out = dict(author)
+        for k in ("literal", "name"):
+            if isinstance(out.get(k), str):
+                out[k] = html.unescape(out[k]).strip()
+        return out
     fam = html.unescape(str(author.get("family") or "")).strip()
     giv = html.unescape(str(author.get("given") or "")).strip()
     # A family name with NO given name is treated as a possible collective /
@@ -1224,10 +1259,83 @@ def _n_named(authors) -> int:
     n = 0
     for a in authors or []:
         if isinstance(a, dict):
-            n += bool(str(a.get("family") or "").strip() or str(a.get("given") or "").strip())
+            n += bool(str(a.get("family") or "").strip()
+                      or str(a.get("given") or "").strip()
+                      or author_literal(a))
         elif isinstance(a, str):
             n += bool(a.strip())
     return n
+
+
+def _group_key(name: str) -> str:
+    """Comparable key for a group author's name: :func:`_normalize_surname`
+    folding plus a dropped leading ``the`` (``The X Consortium`` == ``X
+    CONSORTIUM``)."""
+    k = _normalize_surname(name)
+    return k[4:] if k.startswith("the ") else k
+
+
+def _align_pubmed_groups(cr: list, pm: list) -> list:
+    """PubMed's list with each given-less entry whose name matches (by
+    :func:`_group_key`) one of the meta's single-field group authors replaced
+    by THAT meta entry.  PubMed's ``<CollectiveName>`` arrives as
+    ``{"family": name, "given": ""}``; without this, a collective name lacking
+    an org keyword would be compared as a person and make the meta's list look
+    mismatched/shorter."""
+    lit = {}
+    for a in cr:
+        name = author_literal(a)
+        if name and _group_key(name):
+            lit.setdefault(_group_key(name), a)
+    out = []
+    for a in pm:
+        fam = str(a.get("family") or "").strip()
+        giv = str(a.get("given") or "").strip()
+        key = _group_key(fam) if fam and not giv else ""
+        out.append(dict(lit[key]) if key in lit else a)
+    return out
+
+
+def _keep_meta_groups(cr: list, pm: list) -> tuple:
+    """Insert into PubMed's (aligned) list every single-field group author of
+    the meta that PubMed lacks, so a PubMed replacement never drops one.
+
+    A kept group goes right after the same number of PERSONS it followed in the
+    meta's list (after earlier kept groups at that spot, so their relative
+    order holds); past the end of PubMed's persons it is appended.  Returns
+    ``(merged, kept_names)``."""
+    have = {_group_key(author_literal(a)) for a in pm if author_literal(a)}
+    merged = list(pm)
+    inserted: set = set()
+    kept: list = []
+    persons_before = 0
+    for a in cr:
+        name = author_literal(a)
+        if not name:
+            if isinstance(a, dict) and (str(a.get("family") or "").strip()
+                                        or str(a.get("given") or "").strip()):
+                persons_before += 1
+            continue
+        if _group_key(name) in have:
+            continue
+        idx, seen = 0, 0
+        if persons_before:
+            idx = len(merged)
+            for j, b in enumerate(merged):
+                if id(b) in inserted or author_literal(b):
+                    continue
+                seen += 1
+                if seen == persons_before:
+                    idx = j + 1
+                    break
+        while idx < len(merged) and id(merged[idx]) in inserted:
+            idx += 1
+        entry = dict(a)
+        merged.insert(idx, entry)
+        inserted.add(id(entry))
+        have.add(_group_key(name))
+        kept.append(name)
+    return merged, kept
 
 
 def reconcile_create_authors(metas: list, *, fetch: bool = True) -> list:
@@ -1246,6 +1354,12 @@ def reconcile_create_authors(metas: list, *, fetch: bool = True) -> list:
     authors, PubMed's list is the SHORTER one, PMID/DOI disagree, over the
     per-call cap, or ``fetch=False``).  ``authors`` (internal) is the list to
     use, only on a ``"pubmed"`` decision; callers strip it from reports.
+
+    Group authors (single-field ``{"literal"}`` entries) are never counted as
+    persons and never lost: a PubMed ``<CollectiveName>`` of the same
+    :func:`_group_key` is the same author (the meta's entry is used), and on a
+    ``"pubmed"`` decision a group PubMed lacks is KEPT at its position among
+    the persons and named in ``groups_kept``.
 
     Bounded network: at most ONE ESearch (DOI->PMID, for metas with a DOI but no
     PMID) and ONE EFetch call of <= ``entrez._BATCH`` PMIDs; ``fetch=False``
@@ -1342,8 +1456,13 @@ def reconcile_create_authors(metas: list, *, fetch: bool = True) -> list:
             _set(i, AUTHOR_CHECK_UNVERIFIED,
                  "pubmed_unavailable" if degraded else "no_pubmed_record", before)
             continue
-        pm = [dict(a) for a in (rec.get("authors_structured") or []) if isinstance(a, dict)]
         cr = [a for a in (m.get("authors") or []) if isinstance(a, dict)]
+        # A PubMed collective that names one of the meta's group authors IS that
+        # author (kept in the meta's single-field shape), so it never counts as
+        # a person in the comparison below.
+        pm = _align_pubmed_groups(
+            cr, [dict(a) for a in (rec.get("authors_structured") or [])
+                 if isinstance(a, dict)])
         cmp = _author_family_compare(cr, pm)
         if cmp["actual_count"] == 0:
             _set(i, AUTHOR_CHECK_UNVERIFIED, "pubmed_no_authors", before, pmid=pmid)
@@ -1364,6 +1483,12 @@ def reconcile_create_authors(metas: list, *, fetch: bool = True) -> list:
         else:
             _set(i, AUTHOR_CHECK_CONFIRMED, "match", before, pmid=pmid)
             continue
-        _set(i, AUTHOR_CHECK_PUBMED, reason, before, after=len(pm), authors=pm,
-             pmid=pmid)
+        # PubMed's list wins, but never at the cost of a group author: one the
+        # meta has and PubMed lacks is kept in place and named in
+        # ``groups_kept`` for review.
+        merged, kept = _keep_meta_groups(cr, pm)
+        _set(i, AUTHOR_CHECK_PUBMED, reason, before, after=_n_named(merged),
+             authors=merged, pmid=pmid)
+        if kept:
+            out[i]["groups_kept"] = kept
     return out

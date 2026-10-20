@@ -899,6 +899,9 @@ def convert_to_zotero(
     add_missing: bool = False,
     track: bool = False,
     style: str = None,
+    author: Optional[str] = None,
+    date: Optional[str] = None,
+    spread: bool = True,
 ) -> dict:
     """Convert foreign field-based citations to live Zotero fields, with dedup.
 
@@ -935,17 +938,34 @@ def convert_to_zotero(
       :func:`citelink.apply_cite_link`. Add the missing member to the library and
       re-run to convert the group.
 
+    Tracked marks (``track=True``)
+    ------------------------------
+    Every swap is stamped with ``author`` (``None`` keeps zoterofield's own
+    default) and ONE op date (``date``, else ``now_iso()`` pinned once per call).
+    With ``spread`` (default) this call's marks are then spread into distinct,
+    ordered ``w:date``s (``zoterofield._spread_op_marks``); marks that existed
+    before the call, by any author, keep their exact date. A caller that writes
+    more marks under the same pinned date and spreads its whole op once at the
+    end (``unify.apply_unification``) passes ``spread=False``.
+
     Returns ``{out, converted, unmatched, left_unconverted, manual_skipped,
     deduped, classification}`` and writes the converted doc to ``out`` (nothing is
     saved when ``out`` is None → dry-run/report only).
     """
     from . import zotero
-    from .zoterofield import DEFAULT_STYLE
+    from .zoterofield import DEFAULT_STYLE, _snapshot_marks, _spread_op_marks
+    from .ooxml import now_iso
     if style is None:
         style = DEFAULT_STYLE
 
     doc = Docx(path)
     root = doc.tree(DOCUMENT)
+    # One op date for every swap; zoterofield's default author unless given.
+    date = date or now_iso()
+    author_kw = {} if author is None else {"author": author}
+    spread_author = author if author is not None else "zotero-word-cite"
+    # Marks that exist BEFORE this call: the trailing spread never moves them.
+    pre_marks = _snapshot_marks(doc, spread_author) if track and spread else None
     source_index = _word_source_index(doc)
 
     converted: List[dict] = []
@@ -1172,6 +1192,7 @@ def convert_to_zotero(
             doc, locator,
             keys=resolved_keys, itemdata=resolved_itemdata, uris=resolved_uris,
             rendered=rendered, rendered_html=rendered_html, style=style, track=track,
+            date=date, **author_kw,
             # Per-field discriminator so two fields citing the SAME item(s) get
             # distinct citationIDs (Zotero requires per-field-unique IDs).
             seed=f["index"],
@@ -1193,6 +1214,8 @@ def convert_to_zotero(
         "deduped": deduped,
         "classification": classify_citation_sources(path),
     }
+    if track and spread and converted:
+        _spread_op_marks(doc, spread_author, date, pre_marks)
     if out is not None and converted:
         result["out"] = str(doc.save(Path(out)))
     elif out is not None:

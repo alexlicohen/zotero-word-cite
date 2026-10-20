@@ -45,7 +45,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Union
+from typing import Dict, Iterable, Iterator, List, Optional, Set, Union
 
 from . import _http
 from .findings import Finding
@@ -336,6 +336,53 @@ def _reset_retraction_cache() -> None:
     _RW_DB_CACHE.clear()
 
 
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+# Header columns that identify a Retraction Watch CSV. Checked on download
+# (first 2 KB) AND on load: tolerant decoding means a corrupt cache (an HTML
+# error page, a truncated binary) no longer raises a UnicodeDecodeError, so the
+# load must reject it explicitly or it would parse to {} and screen nothing.
+_RW_REQUIRED_COLUMNS = ("RetractionNature", "OriginalPaperDOI")
+
+
+def _decode_rw_line(raw: bytes) -> str:
+    """Decode ONE line of the Retraction Watch feed; never raises.
+
+    The live feed is mostly UTF-8 but carries thousands of Windows-1252 lines
+    (e.g. a raw ``0x92`` right single quote). A strict whole-file decode raised on
+    the first such byte and disabled retraction screening for every run, so each
+    line is decoded on its own: UTF-8 first, cp1252 for that line only, and a
+    cp1252 ``errors="replace"`` last resort (its five undefined bytes).
+    """
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return raw.decode("cp1252")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")
+
+
+def _iter_rw_lines(chunks: Iterable[bytes]) -> Iterator[str]:
+    """THE tolerant text view of Retraction Watch feed bytes (single owner).
+
+    ``chunks`` is any iterable of bytes — an ``open(path, "rb")`` handle (streams
+    the 60+ MB file line by line) or ``[data]``. Strips a leading UTF-8 BOM, splits
+    on ``\\r``/``\\n``/``\\r\\n`` exactly as text mode with ``newline=""`` does
+    (line endings kept, so :mod:`csv` reassembles quoted multi-line fields), and
+    decodes each line with :func:`_decode_rw_line`.
+    """
+    first = True
+    for chunk in chunks:
+        if first:
+            first = False
+            if chunk.startswith(_UTF8_BOM):
+                chunk = chunk[len(_UTF8_BOM):]
+        for raw in chunk.splitlines(keepends=True):
+            yield _decode_rw_line(raw)
+
+
 # Formats seen in the Retraction Watch ``RetractionDate`` column across the
 # GitLab/Crossref distributions (ISO in the shipped fixtures; ``M/D/YYYY H:MM``
 # in the historical Labs feed). ``strptime`` accepts non-zero-padded fields, so
@@ -450,8 +497,14 @@ def load_retraction_db(csv_path: Union[str, Path]) -> Dict[str, dict]:
         _key = None
 
     db: Dict[str, dict] = {}
-    with open(csv_path, newline="", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
+    with open(csv_path, "rb") as fh:
+        reader = csv.DictReader(_iter_rw_lines(fh))
+        missing = [c for c in _RW_REQUIRED_COLUMNS
+                   if c not in (reader.fieldnames or ())]
+        if missing:
+            raise ValueError(
+                f"{csv_path}: not a Retraction Watch CSV (header lacks {missing})"
+            )
         for row in reader:
             doi = _normalise_doi(row.get("OriginalPaperDOI", "") or "")
             if not doi:
@@ -677,12 +730,8 @@ def refresh_retraction_db(dest: Optional[Union[str, Path]] = None, *,
             f"Unexpected error downloading Retraction Watch CSV from {url!r}: {exc}"
         ) from exc
     # Sanity-check: the bytes should look like the expected CSV header
-    sample = data[:2048]
-    try:
-        sample_text = sample.decode("utf-8-sig", errors="replace")
-    except Exception:
-        sample_text = ""
-    if "RetractionNature" not in sample_text or "OriginalPaperDOI" not in sample_text:
+    sample_text = "".join(_iter_rw_lines([data[:2048]]))
+    if any(c not in sample_text for c in _RW_REQUIRED_COLUMNS):
         raise RuntimeError(
             f"Downloaded content from {url!r} does not look like the Retraction Watch CSV "
             f"(expected headers 'RetractionNature' and 'OriginalPaperDOI' in first 2 KB). "

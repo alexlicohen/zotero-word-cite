@@ -559,7 +559,17 @@ def apply_patches(patched_network, monkeypatch):
         calls["insert"].append({"anchor": anchor, "keys": list(keys), "track": kw.get("track")})
         return doc
 
+    # Located (numeric) markers are converted by LOCATION in one batched call;
+    # record each occurrence in the same shape as a text-path insert.
+    def fake_occurrences(doc, occurrences, **kw):
+        for occ in occurrences:
+            calls["insert"].append({"anchor": occ["anchor"], "keys": list(occ["keys"]),
+                                    "track": kw.get("track")})
+        return [None] * len(occurrences)
+
     monkeypatch.setattr(unify.zotero, "create_items", fake_create_items)
+    monkeypatch.setattr(unify.zoterofield, "replace_occurrences_with_zotero_fields",
+                        fake_occurrences)
     # apply_unification gates on key_can_write_status (tri-state, F6); patch both
     # the status fn (the real gate) and the legacy boolean for belt-and-braces.
     monkeypatch.setattr(unify.zotero, "key_can_write_status", lambda: True)
@@ -1269,7 +1279,7 @@ class TestF7Integration:
         # author-year/numeric cite), so Smith shifts from original index 1 → 0.
         # An index-keyed lookup against the plan's stale index would therefore
         # mis-resolve or drop Smith; the text join must still find it.
-        def fake_convert(path, *, out, track=True):
+        def fake_convert(path, *, out, track=True, **kw):
             new_doc(out, [
                 "Background per a converted field.",  # foreign marker dropped out
                 "Tuberous sclerosis is associated with ASD (Smith et al., 2020).",
@@ -1599,10 +1609,13 @@ class TestGroupedMarkerCoCitation:
         p = self._grouped_draft(tmp_path)
         self._base_patches(monkeypatch)
         calls = []
+        # A located numeric marker is converted by LOCATION (one batched call);
+        # record each occurrence it is asked to convert.
         monkeypatch.setattr(
-            unify.zoterofield, "replace_text_with_zotero_field",
-            lambda doc, anchor, keys, **kw:
-                calls.append({"anchor": anchor, "keys": list(keys)}) or doc)
+            unify.zoterofield, "replace_occurrences_with_zotero_fields",
+            lambda doc, occs, **kw: [
+                calls.append({"anchor": o["anchor"], "keys": list(o["keys"])})
+                for o in occs] and [None] * len(occs))
         plan = unify.plan_unification(p)
         out = tmp_path / "count_out.docx"
         report = unify.apply_unification(

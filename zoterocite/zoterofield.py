@@ -1512,6 +1512,7 @@ def replace_occurrences_with_zotero_fields(
     track: bool = False,
     author: str = "zotero-word-cite",
     date: Optional[str] = None,
+    spread: bool = True,
 ) -> List[Optional[str]]:
     """Convert EXACTLY the given marker occurrences, located by position, into
     live Zotero ``ZOTERO_ITEM`` fields. The location-scoped counterpart of
@@ -1543,11 +1544,14 @@ def replace_occurrences_with_zotero_fields(
     ``track=True`` (see :func:`_splice_field_at_marker`); a marker inside an
     existing field's result is refused. With ``track=True`` the whole call shares
     ONE op date and its marks are then spread into distinct, ordered ``w:date``s
-    (one event per paragraph); marks that existed before are never re-stamped."""
+    (one event per paragraph); marks that existed before are never re-stamped.
+    ``spread=False`` skips that trailing spread: for a caller that makes several
+    writes under one pinned ``date`` and spreads its whole op once at the end
+    (``unify.apply_unification``)."""
     date = date or now_iso()
     root = doc.tree(DOCUMENT)
     paras = iter_paragraphs(root)
-    pre_marks = _snapshot_marks(doc, author) if track else None
+    pre_marks = _snapshot_marks(doc, author) if track and spread else None
     status: List[Optional[str]] = ["not attempted"] * len(occurrences)
     by_para: dict = {}
     for i, occ in enumerate(occurrences):
@@ -1594,7 +1598,7 @@ def replace_occurrences_with_zotero_fields(
                 floor = off
             else:
                 status[i] = why[0] if why else "marker could not be isolated"
-    if track and any(st is None for st in status):
+    if track and spread and any(st is None for st in status):
         _spread_op_marks(doc, author, date, pre_marks)
     return status
 

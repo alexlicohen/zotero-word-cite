@@ -482,13 +482,17 @@ def _meta_to_zotero_meta(meta: Optional[dict], rec: dict) -> dict:
     out["volume"] = (meta.get("volume") or rec.get("volume") or "")
     out["pages"] = (meta.get("pages") or rec.get("pages") or "")
 
-    # Authors: resolved meta carries {family, given}; the parsed record carries
+    # Authors: resolved meta carries {family, given} (a group author:
+    # {literal}, kept as such); the parsed record carries
     # flat "Last, First" strings — normalize both to {family, given}.
     authors: List[dict] = []
     meta_authors = meta.get("authors") or []
     if meta_authors:
         for a in meta_authors:
-            if isinstance(a, dict):
+            lit = refresolve.author_literal(a)
+            if lit:
+                authors.append({"literal": lit})    # group author, in place
+            elif isinstance(a, dict):
                 authors.append({
                     "family": (a.get("family") or "").strip(),
                     "given": (a.get("given") or "").strip(),

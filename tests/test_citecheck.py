@@ -1916,3 +1916,159 @@ class TestRefreshRetractionDbSchemeCheck:
         with pytest.raises(RuntimeError, match="stubbed-network"):
             refresh_retraction_db(dest=tmp_path / "rw.csv",
                                   url="https://example.com/retraction.csv")
+
+
+# ---------------------------------------------------------------------------
+# Retraction Watch feed encoding: the live feed mixes UTF-8 with Windows-1252
+# lines (raw 0x92 etc.); a strict decode disabled screening for every run.
+# ---------------------------------------------------------------------------
+
+# The live feed's real header (column order matters: the BOM attaches to col 1).
+_RW_REAL_HEADER = (
+    "Record ID,Title,Subject,Institution,Journal,Publisher,Country,Author,URLS,"
+    "ArticleType,RetractionDate,RetractionDOI,RetractionPubMedID,OriginalPaperDate,"
+    "OriginalPaperDOI,OriginalPaperPubMedID,RetractionNature,Reason,Paywalled,Notes"
+)
+
+
+def _rw_real_row(rec_id: str, title: bytes, ret_date: str, ret_doi: str,
+                 orig_doi: str, nature: str, reason: bytes = b"") -> bytes:
+    cols = [rec_id.encode(), title, b"", b"", b"", b"", b"", b"", b"", b"",
+            ret_date.encode(), ret_doi.encode(), b"", b"", orig_doi.encode(),
+            b"", nature.encode(), reason, b"No", b""]
+    return b",".join(cols) + b"\n"
+
+
+def _write_mixed_rw_csv(path: Path) -> Path:
+    """BOM + real header; one UTF-8 non-ASCII title, one raw cp1252 0x92 title,
+    one quoted multi-line field (with a cp1252 byte on its continuation line)."""
+    data = (
+        b"\xef\xbb\xbf" + _RW_REAL_HEADER.encode() + b"\n"
+        + _rw_real_row("1", "Café résumé ∆".encode("utf-8"),
+                       "2020-01-02", "10.1/ret-utf8", "10.1111/utf8-title",
+                       "Retraction")
+        + _rw_real_row("2", b"Authors\x92 cp1252 title", "2021-03-04",
+                       "10.1/ret-cp", "10.2222/CP1252-Title", "Expression of concern")
+        + _rw_real_row("3", b'"Multi-line title"', "2022-05-06", "10.1/ret-ml",
+                       "10.3333/multiline", "Correction",
+                       reason=b'"+Reason line one;\nline two\x96 continued"')
+        + _rw_real_row("4", b"After the multi-line row", "2023-07-08",
+                       "10.1/ret-after", "10.4444/after", "Retraction")
+    )
+    path.write_bytes(data)
+    return path
+
+
+class TestRetractionFeedEncoding:
+    def test_mixed_encoding_loads_every_doi(self, tmp_path):
+        db = load_retraction_db(_write_mixed_rw_csv(tmp_path / "rw.csv"))
+        assert set(db) == {"10.1111/utf8-title", "10.2222/cp1252-title",
+                           "10.3333/multiline", "10.4444/after"}
+
+    def test_utf8_title_intact(self, tmp_path):
+        db = load_retraction_db(_write_mixed_rw_csv(tmp_path / "rw.csv"))
+        assert db["10.1111/utf8-title"]["title"] == "Café résumé ∆"
+
+    def test_cp1252_title_decodes_to_right_single_quote(self, tmp_path):
+        db = load_retraction_db(_write_mixed_rw_csv(tmp_path / "rw.csv"))
+        assert db["10.2222/cp1252-title"]["title"] == "Authors’ cp1252 title"
+
+    def test_nature_date_and_retraction_doi_fields(self, tmp_path):
+        db = load_retraction_db(_write_mixed_rw_csv(tmp_path / "rw.csv"))
+        assert db["10.1111/utf8-title"]["nature"] == "Retraction"
+        assert db["10.1111/utf8-title"]["date"] == "2020-01-02"
+        assert db["10.1111/utf8-title"]["retraction_doi"] == "10.1/ret-utf8"
+        assert db["10.2222/cp1252-title"]["nature"] == "Expression of concern"
+        assert db["10.2222/cp1252-title"]["date"] == "2021-03-04"
+        # The quoted multi-line Reason did not split or swallow a record.
+        assert db["10.3333/multiline"]["nature"] == "Correction"
+        assert db["10.3333/multiline"]["title"] == "Multi-line title"
+        assert db["10.4444/after"]["date"] == "2023-07-08"
+        assert is_retraction("10.4444/after", db)
+
+    def test_multiline_field_and_header_via_shared_reader(self, tmp_path):
+        from zoterocite.citecheck import _iter_rw_lines
+        path = _write_mixed_rw_csv(tmp_path / "rw.csv")
+        with open(path, "rb") as fh:
+            reader = csv.DictReader(_iter_rw_lines(fh))
+            rows = list(reader)
+        # BOM stripped: the first column key is the bare header name.
+        assert reader.fieldnames[0] == "Record ID"
+        assert rows[2]["Reason"] == "+Reason line one;\nline two– continued"
+
+    def test_bom_stripped_when_doi_is_first_column(self, tmp_path):
+        """A BOM left on the header would rename col 1 to '\\ufeffOriginalPaperDOI'
+        and silently load nothing."""
+        path = tmp_path / "rw.csv"
+        path.write_bytes(
+            b"\xef\xbb\xbfOriginalPaperDOI,RetractionDOI,RetractionNature,Title,RetractionDate\n"
+            b"10.5555/bom-first,10.1/r,Retraction,T\x92s,2020-01-01\n"
+        )
+        db = load_retraction_db(path)
+        assert list(db) == ["10.5555/bom-first"]
+        assert db["10.5555/bom-first"]["title"] == "T’s"
+
+    def test_cp1252_undefined_byte_never_raises(self, tmp_path):
+        path = tmp_path / "rw.csv"
+        # 0x81 is undefined in cp1252 and invalid as UTF-8.
+        path.write_bytes(
+            b"OriginalPaperDOI,RetractionDOI,RetractionNature,Title,RetractionDate\n"
+            b"10.6666/undef,10.1/r,Retraction,Bad\x81byte,2020-01-01\n"
+        )
+        db = load_retraction_db(path)
+        assert db["10.6666/undef"]["title"] == "Bad�byte"
+
+    @pytest.mark.parametrize("body", [
+        b"<html><body>404 Not Found</body></html>\n",  # pure ASCII: decodes fine
+        b"",
+    ])
+    def test_non_feed_cache_is_unreadable_not_empty(self, tmp_path, body):
+        """Tolerant decoding must not turn a corrupt cache into a silent {}:
+        a file without the feed's header columns is rejected on load."""
+        bad = tmp_path / "rw.csv"
+        bad.write_bytes(body)
+        with pytest.raises(ValueError, match="not a Retraction Watch CSV"):
+            load_retraction_db(bad)
+        doc = _build_doc(
+            tmp_path, ["Some claim here."],
+            [{"anchor": "Some claim", "keys": ["K1"], "dois": ["10.1/a"],
+              "add_bibliography": True}],
+        )
+        checks = [f.check for f in cite_check(doc, rw_csv=bad, check_existence=False)]
+        assert "CITE-RW-UNREADABLE" in checks
+
+    def test_cite_check_screens_mixed_feed(self, tmp_path):
+        rw = _write_mixed_rw_csv(tmp_path / "rw.csv")
+        doc = _build_doc(
+            tmp_path, ["Retracted claim here."],
+            [{"anchor": "Retracted claim", "keys": ["RKEY"],
+              "dois": ["10.4444/after"], "add_bibliography": True}],
+        )
+        checks = [f.check for f in cite_check(doc, rw_csv=rw, check_existence=False)]
+        assert "CITE-RW-UNREADABLE" not in checks
+        assert "CITE-RETRACTED" in checks
+
+    def test_refresh_header_check_accepts_mixed_feed(self, monkeypatch, tmp_path):
+        import zoterocite.citecheck as cc
+        payload = _write_mixed_rw_csv(tmp_path / "src.csv").read_bytes()
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return payload
+
+        monkeypatch.setattr(cc.urllib.request, "urlopen", lambda *a, **k: _Resp())
+        dest = cc.refresh_retraction_db(tmp_path / "rw.csv",
+                                        url="https://example.com/rw.csv")
+        assert dest.read_bytes() == payload
+        # The header check is still required: a non-feed payload is refused.
+        payload = b"\x92not,the,feed\n" * 10
+        with pytest.raises(RuntimeError, match="does not look like"):
+            cc.refresh_retraction_db(tmp_path / "rw2.csv",
+                                     url="https://example.com/rw.csv")
+        assert not (tmp_path / "rw2.csv").exists()
