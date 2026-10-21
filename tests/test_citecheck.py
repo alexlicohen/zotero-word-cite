@@ -20,6 +20,26 @@ from zoterocite.citecheck import (
 )
 from zoterocite.findings import Finding
 
+
+@pytest.fixture(autouse=True)
+def _no_live_retraction_feed(tmp_path, monkeypatch):
+    """No test here downloads the live Retraction Watch feed (~65 MB) into the
+    repo's data/ cache or reads the cached copy. ``cite_check`` auto-refreshes a
+    missing or stale feed, so the default path points at a per-test tmp file and
+    every real ``urlopen`` fails. Tests that fake ``urlopen`` or the path patch
+    after this fixture runs, so theirs wins."""
+    import urllib.error
+    import urllib.request
+    import zoterocite.citecheck as cc
+
+    def _offline(*_a, **_k):
+        raise urllib.error.URLError("network disabled in test_citecheck")
+
+    monkeypatch.setattr(cc, "default_rw_path",
+                        lambda: tmp_path / "rw_cache" / "retraction_watch.csv")
+    monkeypatch.setattr(urllib.request, "urlopen", _offline)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
