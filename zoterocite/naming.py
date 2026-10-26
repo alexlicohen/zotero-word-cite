@@ -51,16 +51,39 @@ def rename_to_convention(path: str | Path, *, apply: bool = False,
 
 MAX_NAME_LEN = 50
 _SAFE_RE = __import__("re").compile(r"[^A-Za-z0-9_\-]")
+_FILLER_RE = __import__("re").compile(r"^(draft|final|copy|version|ver|rev|v\d+)$", __import__("re").I)
+_COUNTER_RE = __import__("re").compile(r"^\d{1,3}$")
+
+
+def _filler_groups(tokens):
+    """Index groups of version-ish tokens: a filler word plus the counter right after
+    it, or a trailing bare counter (``draft_1``, ``v_3``, ``..._2``)."""
+    groups, i = [], 0
+    while i < len(tokens):
+        if _FILLER_RE.match(tokens[i]):
+            j = i + 1
+            if j < len(tokens) and _COUNTER_RE.match(tokens[j]):
+                j += 1
+            groups.append(list(range(i, j)))
+            i = j
+        elif i == len(tokens) - 1 and i > 0 and _COUNTER_RE.match(tokens[i]):
+            groups.append([i])
+            i += 1
+        else:
+            i += 1
+    return groups
 
 
 def short_name(name: str, *, max_len: int = MAX_NAME_LEN, taken=()) -> str:
     """Deterministically shorten *name* to <= *max_len* chars incl. extension.
 
-    Keeps the extension and the END of the stem (the distinguishing suffix: doctype,
-    draft number), disallowed characters become ``_``, and a 6-hex digest of the full
-    original name is spliced in so two long names never collapse onto one. A name that
-    already fits and is clean is returned unchanged. Names in *taken* are avoided
-    (a further digest round, deterministic)."""
+    Order: (1) a clean name that fits is returned unchanged; (2) disallowed chars
+    become ``_``; (3) whole filler words go first, last to first (``draft``, ``final``,
+    ``copy``, ``version``, ``v2``, plus the counter after them or a trailing one);
+    (4) then whole words from the MIDDLE of the stem (first and last words stay);
+    (5) only if that cannot reach *max_len*, or the result is in *taken*, a 6-hex digest
+    of the original name is prefixed to as many whole trailing words as fit (a word is
+    cut only when the last word alone is too long). Extension kept."""
     import hashlib
     import os
     stem, ext = os.path.splitext(name)
@@ -69,11 +92,35 @@ def short_name(name: str, *, max_len: int = MAX_NAME_LEN, taken=()) -> str:
     cand = clean + ext
     if len(cand) <= max_len and clean == stem and cand not in taken:
         return cand
+    tokens = [t for t in clean.split("_") if t] or ["file"]
+
+    def fits(toks):
+        return len("_".join(toks)) + len(ext) <= max_len
+
+    for group in reversed(_filler_groups(tokens)):
+        if fits(tokens):
+            break
+        drop = set(group)
+        if len(drop) < len(tokens):
+            tokens = [t for k, t in enumerate(tokens) if k not in drop]
+    while not fits(tokens) and len(tokens) > 2:
+        del tokens[len(tokens) // 2]
+    cand = "_".join(tokens) + ext
+    if fits(tokens) and cand not in taken:
+        return cand
     salt = ""
     while True:
         h = hashlib.sha1((name + salt).encode("utf-8")).hexdigest()[:6]
         room = max_len - len(ext) - len(h) - 1
-        tail = clean[-room:] if room > 0 else ""
+        keep = []
+        for t in reversed(tokens):
+            if len("_".join([t] + keep)) <= room:
+                keep.insert(0, t)
+            else:
+                break
+        if not keep and room > 0:
+            keep = [tokens[-1][-room:]]
+        tail = "_".join(keep)
         cand = f"{h}_{tail}{ext}" if tail else f"{h}{ext}"
         if cand not in taken:
             return cand
