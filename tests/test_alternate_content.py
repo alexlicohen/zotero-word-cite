@@ -16,11 +16,12 @@ and PASS after the mc:Fallback-skip fix.
 import io
 import zipfile
 
+import pytest
 from lxml import etree
 
 from zoterocite.docxio import DOCUMENT, Docx
 from zoterocite.ooxml import qn
-from zoterocite.paras import find_paragraph, iter_paragraphs, paragraph_text
+from zoterocite.paras import TEXTBOX_ANCHOR_REASON, find_paragraph, iter_paragraphs, paragraph_text
 from zoterocite.sections import get_paragraphs_ooxml
 from zoterocite.views import read_views
 
@@ -135,11 +136,17 @@ def test_iter_paragraphs_yields_textbox_text_once(tmp_path):
     assert len(with_widget) == 1, [paragraph_text(p) for p in paras]
 
 
-def test_find_paragraph_resolves_textbox_anchor(tmp_path):
+def test_textbox_anchor_resolves_to_no_paragraph_body_text_to_the_host(tmp_path):
     root = Docx(str(_make_docx(tmp_path))).read_tree(DOCUMENT)
-    # Baseline raised LookupError("matched 3 paragraphs"); now it resolves to one.
-    p = find_paragraph(root, "Widget Diagram")
-    assert "Widget Diagram" in paragraph_text(p)
+    # Baseline e11dafc raised LookupError("matched 3 paragraphs"). Bug #5b: the caption
+    # lives in the text box's own story, so it resolves to NO paragraph (not the host,
+    # whose runs cannot reach it) and the error says why; body text resolves to the host.
+    with pytest.raises(LookupError) as ei:
+        find_paragraph(root, "Widget Diagram")
+    assert "matched 0 paragraphs" in str(ei.value)
+    assert TEXTBOX_ANCHOR_REASON in str(ei.value)
+    p = find_paragraph(root, "Intro")
+    assert "Widget Diagram" in paragraph_text(p)          # views/reconstruction read
 
 
 def test_ooxml_and_views_word_counts_agree_on_textbox(tmp_path):
@@ -150,3 +157,41 @@ def test_ooxml_and_views_word_counts_agree_on_textbox(tmp_path):
     accepted = read_views(str(docx))["accepted"]
     assert ooxml_text.split().count("Widget") == 1, ooxml_text
     assert ooxml_text.split().count("Widget") == accepted.split().count("Widget")
+
+
+# -- Bug #5b: text-box text is a separate story for anchor matching -------------------
+# (the edit primitives' refusals are pinned in tests/test_textbox_anchor_edits.py, which
+# is grant-only: this file is brand-synced to the public mirror, whose revisions module
+# has no span/insert-after primitives.)
+def test_body_text_around_a_textbox_is_not_glued(tmp_path):
+    # The text box stands between "Intro" and "Outro": they never glue into a match, and
+    # body text on either side still resolves to the host paragraph.
+    xml = _DOCUMENT_XML.replace(
+        "</w:r>\n    </w:p>",
+        '</w:r><w:r><w:t xml:space="preserve"> Outro words.</w:t></w:r>\n    </w:p>', 1)
+    root = etree.fromstring(xml.encode())
+    (host,) = iter_paragraphs(root)
+    with pytest.raises(LookupError) as ei:
+        find_paragraph(root, "Intro Outro")
+    assert TEXTBOX_ANCHOR_REASON not in str(ei.value)
+    assert find_paragraph(root, "Outro words") is host
+    assert find_paragraph(root, "Intro") is host
+
+
+def test_struck_textbox_does_not_split_body_text(tmp_path):
+    # A text box inside a tracked deletion is gone from the accepted view: it neither
+    # stands between the body words around it nor counts as a text-box hit.
+    from zoterocite.paras import ParaIndex
+
+    struck = ('<w:r><w:t xml:space="preserve">Intro </w:t></w:r>'
+              '<w:del w:id="5" w:author="A" w:date="2026-01-01T00:00:00Z">'
+              + _DOCUMENT_XML.split("<w:r><w:t>Intro </w:t></w:r>")[1].split("</w:p>\n  </w:body>")[0]
+              + '</w:del><w:r><w:t xml:space="preserve">Outro words.</w:t></w:r>')
+    xml = (f'<w:document xmlns:w="{W}" xmlns:mc="{MC}" xmlns:wps="{WPS}" xmlns:v="{V}">'
+           f'<w:body><w:p>{struck}</w:p></w:body></w:document>')
+    root = etree.fromstring(xml.encode())
+    assert root.find(".//" + qn("w:del") + "//" + qn("w:txbxContent")) is not None
+    idx = ParaIndex(root)
+    (host,) = iter_paragraphs(root)
+    assert idx.find("Intro Outro words") is host
+    assert idx.in_textbox("Widget Diagram") == []

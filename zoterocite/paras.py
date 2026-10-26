@@ -7,7 +7,7 @@ then operate on the element tree.
 from __future__ import annotations
 
 import re
-from typing import List
+from typing import List, Optional
 
 from lxml import etree
 
@@ -55,7 +55,7 @@ def iter_paragraphs(root: etree._Element) -> List[etree._Element]:
     return [p for p in root.iter(qn("w:p")) if not _in_textbox(p)]
 
 
-def paragraph_text(p: etree._Element) -> str:
+def paragraph_text(p: etree._Element, *, txbx_marker: Optional[str] = None) -> str:
     """Visible text of a paragraph in the accepted view (tracked deletions excluded).
 
     Flow-affecting children are rendered exactly as :func:`zoterocite.views._extract`
@@ -72,14 +72,23 @@ def paragraph_text(p: etree._Element) -> str:
     fallback). Per markup-compatibility a consumer uses the Choice and IGNORES the
     Fallback, never both, so ``<w:t>`` inside an ``mc:Fallback`` subtree is skipped —
     otherwise every such textbox's text would be read twice.
+
+    ``txbx_marker`` (anchor matching only): a text box's ``w:txbxContent`` is a
+    SEPARATE story whose paragraphs are their own ``w:p`` elements. By default its
+    text is read in place (the views/reconstruction contract above). When
+    ``txbx_marker`` is given, text-box text is NOT read; each outermost visible text
+    box contributes ``txbx_marker`` once instead, so body text on either side of it is
+    never glued together into a match.
     """
     out = []
     t_tag = qn("w:t")
     del_tag = qn("w:del")
     move_from_tag = qn("w:moveFrom")
     fallback_tag = qn("mc:Fallback")
+    txbx_tag = qn("w:txbxContent")
     tab_tag = qn("w:tab")
     br_tags = (qn("w:br"), qn("w:cr"))
+    skip_txbx = txbx_marker is not None
 
     def _drop(node, *, also_del: bool) -> bool:
         # True if this node lives under an mc:Fallback (duplicate of the Choice we
@@ -87,18 +96,22 @@ def paragraph_text(p: etree._Element) -> str:
         # are excluded from the accepted view, mirroring views._extract's <w:t> handling
         # (deletions gone; the tracked-move SOURCE gone, since moveFrom uses ordinary
         # <w:t> and would otherwise double the moved text at source AND destination).
+        # With a txbx_marker, also under a w:txbxContent (a separate story).
         anc = node.getparent()
         while anc is not None and anc is not p:
             if anc.tag == fallback_tag or (
                 also_del and anc.tag in (del_tag, move_from_tag)
-            ):
+            ) or (skip_txbx and anc.tag == txbx_tag):
                 return True
             anc = anc.getparent()
         return False
 
     for node in p.iter():
         tag = node.tag
-        if tag == t_tag:
+        if tag == txbx_tag:
+            if skip_txbx and not _drop(node, also_del=True):
+                out.append(txbx_marker)
+        elif tag == t_tag:
             if not _drop(node, also_del=True):
                 out.append(node.text or "")
         elif tag == tab_tag:
@@ -118,6 +131,18 @@ def paragraph_text(p: etree._Element) -> str:
 
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
+
+
+# Anchor matching reads a paragraph's OWN story: a text box (``w:txbxContent``) is a
+# separate story, so its text never matches the host paragraph. The text box stands in
+# as one OBJECT REPLACEMENT CHARACTER, which no anchor contains, so an anchor can
+# neither match inside the text box nor glue the body text on its two sides together.
+_TXBX_MARK = "\ufffc"
+TEXTBOX_ANCHOR_REASON = (
+    "anchor is inside a text box: text-box text is a separate story and is not "
+    "edited, commented or cited through its host paragraph (edit it in Word, or "
+    "anchor on body text)"
+)
 
 
 # -- Table-of-contents detection (anchor tie-break) --------------------------
@@ -231,6 +256,13 @@ class ParaIndex:
     identical ``LookupError``). The module functions now delegate here, so there is
     a SINGLE matching implementation.
 
+    Matching reads each paragraph's OWN story (``paragraph_text(p,
+    txbx_marker=_TXBX_MARK)``): text that lives only in a text box never resolves to
+    the host body paragraph, whose runs cannot reach it (every edit then failed with
+    a misleading reason). :meth:`in_textbox` names the hosts such an anchor would
+    have hit, so callers can refuse with :data:`TEXTBOX_ANCHOR_REASON`; :meth:`find`
+    appends that reason to its not-found ``LookupError``.
+
     Caching contract (the caller's responsibility): the cached normalized text is a
     SNAPSHOT taken at construction. Build the index on a stable tree and resolve
     before mutating, OR only under mutations that leave BOTH the paragraph SET
@@ -245,16 +277,30 @@ class ParaIndex:
     invariant.
     """
 
-    __slots__ = ("_entries", "_root", "_toc_fields")
+    __slots__ = ("_entries", "_root", "_toc_fields", "_txbx_entries")
 
     def __init__(self, root: etree._Element) -> None:
         self._root = root
-        self._entries = [(p, _norm(paragraph_text(p))) for p in iter_paragraphs(root)]
+        self._entries = []
+        self._txbx_entries = []   # (p, own text, full text incl. text boxes)
+        for p in iter_paragraphs(root):
+            own = _norm(paragraph_text(p, txbx_marker=_TXBX_MARK))
+            self._entries.append((p, own))
+            if _TXBX_MARK in own:
+                self._txbx_entries.append((p, own, _norm(paragraph_text(p))))
         self._toc_fields = None   # lazily built on the first ambiguous anchor
 
     def find_all(self, anchor: str) -> List[etree._Element]:
         a = _norm(anchor)
         return [p for (p, t) in self._entries if a in t]
+
+    def in_textbox(self, anchor: str) -> List[etree._Element]:
+        """Host paragraphs the anchor matches ONLY when their text-box text is read
+        (it lies inside a text box, or spans from body text into one). These are never
+        :meth:`find_all` hits; a caller that finds nothing uses this to refuse with
+        :data:`TEXTBOX_ANCHOR_REASON` instead of a plain "not found"."""
+        a = _norm(anchor)
+        return [p for (p, own, full) in self._txbx_entries if a in full and a not in own]
 
     def is_toc(self, p: etree._Element) -> bool:
         """Is *p* a table-of-contents paragraph? True if its pStyle starts with
@@ -284,7 +330,10 @@ class ParaIndex:
     def find(self, anchor: str) -> etree._Element:
         hits = self.candidates(anchor)
         if len(hits) != 1:
-            raise LookupError(f"anchor {anchor!r} matched {len(hits)} paragraphs (need exactly 1)")
+            msg = f"anchor {anchor!r} matched {len(hits)} paragraphs (need exactly 1)"
+            if not hits and self.in_textbox(anchor):
+                msg += f": {TEXTBOX_ANCHOR_REASON}"
+            raise LookupError(msg)
         return hits[0]
 
 
@@ -295,6 +344,20 @@ def find_paragraphs(root: etree._Element, anchor: str) -> List[etree._Element]:
 def find_paragraph_candidates(root: etree._Element, anchor: str) -> List[etree._Element]:
     """:meth:`ParaIndex.candidates` for a one-off lookup."""
     return ParaIndex(root).candidates(anchor)
+
+
+def in_textbox_text(p: etree._Element, s: str) -> bool:
+    """True when ``s`` occurs in ``p``'s accepted-view text ONLY because its text-box
+    text is read (``s`` lies inside a text box, or spans from body text into one) —
+    the same rule as :meth:`ParaIndex.in_textbox`, on raw (unnormalized) text."""
+    return bool(s) and s in paragraph_text(p) and s not in paragraph_text(
+        p, txbx_marker=_TXBX_MARK)
+
+
+def anchor_in_textbox(root: etree._Element, anchor: str) -> bool:
+    """:meth:`ParaIndex.in_textbox` for a one-off lookup: does the anchor match only
+    text-box text (so no body paragraph is its home)?"""
+    return bool(ParaIndex(root).in_textbox(anchor))
 
 
 def find_paragraph(root: etree._Element, anchor: str) -> etree._Element:

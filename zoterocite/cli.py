@@ -8,7 +8,7 @@ Invoke as ``python -m zoterocite.cli <subcommand>`` (or via the ``zwc`` wrapper)
     zwc cite (--record JSON | --bibliography FILE) [--from-pubmed] [--style ..]
     zwc zotero (--doi DOI | --search QUERY | --all) [--count] [--style ..]
     zwc cite-into FILE --anchor A (--key K | --keys K,.. | --doi DOI) -o OUT
-    zwc zotero-scan FILE [--check-links]
+    zwc zotero-scan FILE [--check-links | --fix-tracking -o OUT]
     zwc csl (--list | --resolve JOURNAL | --check CSL_ID [--online])
     zwc convert-to-zotero FILE [-o OUT] [--managers ..] [--track] [--json]
     zwc unify-refs FILE [--no-fetch|--offline] [--json] | --apply --decisions @d.json -o OUT
@@ -143,6 +143,8 @@ def cmd_cite_into(a):
 
 def cmd_zotero_scan(a):
     from .zoterofield import scan_citations, check_links
+    if getattr(a, "fix_tracking", False):
+        return _zotero_scan_fix_tracking(a)
     if a.check_links:
         rows = check_links(a.file)
         for r in rows:
@@ -159,6 +161,28 @@ def cmd_zotero_scan(a):
         for it in c["items"]:
             print(f"     - {it['key']}: {(it['title'] or '')[:70]}")
     print(f"# {len(cits)} citation field(s)")
+
+
+def _zotero_scan_fix_tracking(a):
+    """zotero-scan FILE --fix-tracking -o OUT: re-wrap the runs of tracked fields
+    that escaped their tracked change (validate's ``field_tracking_mismatch``)."""
+    out = _require_out(a)
+    from .docxio import Docx
+    from .zoterofield import field_tracking_issues, fix_field_tracking
+    try:
+        doc = Docx(a.file)
+    except DocxLoadError as exc:
+        sys.exit(f"zotero-scan: {exc}")
+    for i in field_tracking_issues(doc):
+        print(f"[{i['tracked']:7}] {i['field'] or '?'} in {i['part']}: "
+              f"{i['loose_runs']} loose run(s) {i['loose_text']!r} "
+              f"-> {i['author']} {i['date'] or ''}"
+              + ("" if i["fixable"] else "  (needs a manual fix)"))
+    st = fix_field_tracking(doc)
+    doc.save(out)
+    print(f"# {st['fields']} field(s) repaired: {st['runs']} run(s) re-wrapped in "
+          f"{st['wrappers']} new tracked change(s); {st['unfixed']} left -> {out}")
+    sys.exit(1 if st["unfixed"] else 0)
 
 
 def cmd_csl(a):
@@ -387,6 +411,12 @@ def build_parser():
 
     s = sub.add_parser("zotero-scan"); s.add_argument("file")
     s.add_argument("--check-links", action="store_true", dest="check_links")
+    s.add_argument("--fix-tracking", action="store_true", dest="fix_tracking",
+                   help="re-wrap field runs left outside their field's tracked "
+                        "insertion/deletion (e.g. by a Zotero Refresh), keeping the "
+                        "mark's author and date (validate: field_tracking_mismatch); "
+                        "needs -o")
+    s.add_argument("-o", "--out")
     s.set_defaults(fn=cmd_zotero_scan)
 
     s = sub.add_parser("csl", help="journal citation-style (CSL) catalog: resolve/list/check")

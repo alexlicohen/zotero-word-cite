@@ -111,6 +111,34 @@ def _is_comment_story_part(name: str) -> bool:
     return not name.rsplit("/", 1)[-1].startswith("comments")
 
 
+def _check_field_tracking(doc: Docx) -> List[str]:
+    """ERROR for complex fields whose ``begin`` run is tracked (``w:ins``/``w:del``)
+    while runs up to their ``end`` are not removed with it (``field_tracking_mismatch``).
+
+    The shape in the wild: a Zotero Refresh in Word rewrites the result runs of a
+    tracked-inserted citation OUTSIDE its ``w:ins``, so Reject All leaves a stray
+    citation number (a tracked-deleted field: Accept All leaves it). ERROR, like
+    ``orphan_comments``: tracked-change integrity damage Word never writes itself,
+    invisible in the markup view; the repair is mechanical
+    (``zwc zotero-scan FILE --fix-tracking -o OUT``). The walker and the rule live
+    in :mod:`zoterocite.zoterofield` (the field-structure owner)."""
+    from .zoterofield import field_tracking_issues
+    issues = field_tracking_issues(doc)
+    if not issues:
+        return []
+    kinds = sorted({i["field"] or "?" for i in issues})
+    parts = sorted({i["part"] for i in issues})
+    runs = sum(i["loose_runs"] for i in issues)
+    unfixable = sum(1 for i in issues if not i["fixable"])
+    tail = f"; {unfixable} need a manual fix" if unfixable else ""
+    return [
+        f"{len(issues)} tracked field(s) ({', '.join(kinds)}) have {runs} run(s) "
+        f"outside the field's own tracked change in {', '.join(parts)}: resolving "
+        f"the change leaves a stray result (e.g. a citation number after Reject "
+        f"All); repair with `zwc zotero-scan FILE --fix-tracking -o OUT`{tail}"
+    ]
+
+
 def _check_orphan_comments(doc: Docx) -> List[str]:
     """Comment ids in ``word/comments.xml`` with no ``w:commentReference`` in ANY
     story part. Word does not display such a comment, so the reviewer's note is
@@ -233,6 +261,10 @@ def validate(
     # 2b. Comment integrity: every comment must be anchored -------------------
     info["checks"].append("orphan_comments")
     errors.extend(_check_orphan_comments(doc))
+
+    # 2c. Tracked fields whose runs escape their tracked change ---------------
+    info["checks"].append("field_tracking_mismatch")
+    errors.extend(_check_field_tracking(doc))
 
     # 3. Limits -------------------------------------------------------------
     if limits:

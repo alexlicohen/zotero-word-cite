@@ -63,6 +63,7 @@ is never modified in place.
 | Look up by DOI | `zwc zotero --doi 10.1234/abcd --format reference` |
 | Insert a live citation at an anchor | `zwc cite-into FILE.docx --doi 10.1234/abcd --anchor "needs a cite here" -o OUT.docx` (`--suppress-author` for a narrative cite; `--bib-under "References"` adds a pre-rendered bibliography after that heading) |
 | List the Zotero fields in a doc | `zwc zotero-scan FILE.docx --check-links` |
+| Repair tracked citations a Zotero Refresh left half-untracked (validate: `field_tracking_mismatch`) | `zwc zotero-scan FILE.docx --fix-tracking -o OUT.docx` |
 | Citation integrity + retraction screen | `zwc cite-check FILE.docx` |
 | Convert foreign citations to Zotero | `zwc convert-to-zotero FILE.docx --track -o OUT.docx` |
 | Unify ad-hoc / manual references | `zwc unify-refs FILE.docx` (then `--apply`; author-year markers with no reference list: map them in `decisions.intext_keys`) |

@@ -23,6 +23,9 @@ What it centralises
       Word-style/outline-level union, using ``para_elems`` when given
       (subsumes ``structure._find_manuscript_section_idx_union`` and
       ``structure._find_section_header_idx``).
+* ``find_section_label_idx(paras, section)`` — the first paragraph that IS a
+  top-level section label ("C. Approach", "Significance:"), never a mere mention
+  or a subsection label ("C1. ..."); text-only.
 * ``section_span`` / ``section_text`` — "text from this heading to the next
   detected section" helpers.
 * ``is_heading_by_pstyle(p)`` — ONE copy of the Word pStyle/outlineLvl heading
@@ -609,6 +612,57 @@ def find_section_idx(
 
     candidates = [i for i in (text_idx, style_idx) if i is not None]
     return min(candidates) if candidates else None
+
+
+# A TOP-LEVEL section enumerator in front of a label heading: "A." / "B)" /
+# "IV." / "2." — one letter, a roman numeral or a one/two-digit number, then
+# "." or ")" and whitespace.  Deliberately NOT letter+digit ("A1.", "C3."):
+# those label SUBSECTIONS, which must never bound a top-level section.
+_TOP_LEVEL_LABEL_RE: Pattern = re.compile(
+    r"^\s*(?:[A-Za-z]|[IVXivx]{2,4}|\d{1,2})[.)]\s+"
+)
+# Punctuation that may trail the cue of a whole-line label ("Approach.",
+# "Significance:", "C. Approach —").
+_LABEL_TRAILING_PUNCT = " \t.:;)]}-–—"
+
+
+def find_section_label_idx(
+    paras: Sequence[str], section: Union[str, Pattern]
+) -> Optional[int]:
+    """Index of the first paragraph that IS a section label for *section*, or
+    ``None``.
+
+    Stricter than :func:`find_section_idx` ``mode="strict"`` (which takes the
+    first paragraph mentioning the cue anywhere, so a Specific Aims sentence
+    such as "our approach ..." outranks the real "C. Approach" heading).  Text
+    only: works on a render-then-split accepted view with no style info.  For
+    the un-anchored grant ``\\bword\\b`` cues (``SECTION_CUES``).
+
+    A paragraph qualifies when the cue sits at its START, after an optional
+    top-level enumerator (:data:`_TOP_LEVEL_LABEL_RE`: "A.", "IV.", "2)"; never a
+    subsection label such as "C1."), AND one of:
+
+      * only trailing punctuation follows the cue (whole-line label:
+        "Approach", "C. Approach", "Significance:");
+      * a colon follows the cue (inline header: "Significance: ...");
+      * an enumerator is present and either a period follows the cue (run-in
+        "A. Significance. Body ...") or the paragraph is heading-like by
+        :func:`is_likely_heading` ("A. Significance and Rationale").
+    """
+    pattern = _resolve_pattern(section, loose=False)
+    for i, p in enumerate(paras):
+        lbl = _TOP_LEVEL_LABEL_RE.match(p)
+        pos = lbl.end() if lbl else len(p) - len(p.lstrip())
+        m = pattern.search(p, pos)
+        if m is None or m.start() != pos:
+            continue
+        after = p[m.end():]
+        rest = after.lstrip()
+        if not after.strip(_LABEL_TRAILING_PUNCT) or rest.startswith(":"):
+            return i
+        if lbl is not None and (rest.startswith(".") or is_likely_heading(p)):
+            return i
+    return None
 
 
 # ---------------------------------------------------------------------------

@@ -752,27 +752,86 @@ def cite_into(
     return doc.save(Path(out) if out else Path(path))
 
 
+# -- complex-field structure walker -----------------------------------------
+class ComplexField:
+    """One Word complex field (``fldChar begin`` .. ``end``) found by
+    :func:`iter_complex_fields`.
+
+    ``begin`` / ``separate`` / ``end`` are the fldChar-bearing ``w:r`` elements
+    (``separate`` is ``None`` for a field with no result). ``code`` is the live
+    ``w:instrText`` only (what :func:`scan_citations` reads); ``instr`` also
+    includes ``w:delInstrText``, so a tracked-deleted field still names its type.
+    ``members`` is every ``w:r`` after ``begin`` up to and including ``end`` in
+    document order: instr runs, ``separate``, result runs, ``end``, and the runs
+    of any nested field. ``parent`` is the enclosing field, if any.
+    """
+
+    __slots__ = ("begin", "separate", "end", "code", "instr", "members", "parent")
+
+    def __init__(self, begin: etree._Element, parent: Optional["ComplexField"]) -> None:
+        self.begin = begin
+        self.separate: Optional[etree._Element] = None
+        self.end: Optional[etree._Element] = None
+        self.code = ""
+        self.instr = ""
+        self.members: List[etree._Element] = []
+        self.parent = parent
+
+    @property
+    def kind(self) -> str:
+        """The field type token: ``ZOTERO_ITEM`` for ``ADDIN ZOTERO_ITEM ...``,
+        ``PAGEREF`` for ``PAGEREF _Toc1 \\h``, ``""`` when the code is empty."""
+        words = self.instr.split()
+        if words and words[0].upper() == "ADDIN" and len(words) > 1:
+            return words[1]
+        return words[0] if words else ""
+
+
+def iter_complex_fields(root):
+    """Yield every complete complex field under ``root`` as a :class:`ComplexField`,
+    in the order their ``end`` is reached (an inner field before its outer one).
+
+    The single field-structure walker: fields split across many runs, spanning
+    paragraphs, and nested inside another field's code or result are handled with
+    a stack. An unmatched ``end`` is ignored and a field still open at the end of
+    ``root`` is not yielded. Runs are walked with ``root.iter`` (tracked wrappers,
+    hyperlinks, content controls and ``mc:Fallback`` copies included), so callers
+    that mutate the tree must materialise the generator first."""
+    fld_tag, typ = qn("w:fldChar"), qn("w:fldCharType")
+    instr_tag, dinstr_tag = qn("w:instrText"), qn("w:delInstrText")
+    stack: List[ComplexField] = []
+    for r in root.iter(qn("w:r")):
+        for f in stack:
+            f.members.append(r)
+        fld = r.find(fld_tag)
+        if fld is not None:
+            t = fld.get(typ)
+            if t == "begin":
+                stack.append(ComplexField(r, stack[-1] if stack else None))
+            elif t == "separate" and stack:
+                if stack[-1].separate is None:
+                    stack[-1].separate = r
+            elif t == "end" and stack:
+                f = stack.pop()
+                f.end = r
+                yield f
+            continue
+        if not stack or stack[-1].separate is not None:
+            continue
+        instr = r.find(instr_tag)
+        if instr is not None:
+            stack[-1].code += instr.text or ""
+            stack[-1].instr += instr.text or ""
+        dinstr = r.find(dinstr_tag)
+        if dinstr is not None:
+            stack[-1].instr += dinstr.text or ""
+
+
 # -- scanning / broken-link detection ---------------------------------------
 def _field_codes(root) -> List[str]:
     """Concatenated instrText for each Word complex field, in document order
     (handles field codes split across runs and nested fields via a stack)."""
-    codes: List[str] = []
-    stack: List[dict] = []
-    for r in root.iter(qn("w:r")):
-        fld = r.find(qn("w:fldChar"))
-        if fld is not None:
-            t = fld.get(qn("w:fldCharType"))
-            if t == "begin":
-                stack.append({"code": "", "sep": False})
-            elif t == "separate" and stack:
-                stack[-1]["sep"] = True
-            elif t == "end" and stack:
-                codes.append(stack.pop()["code"])
-            continue
-        instr = r.find(qn("w:instrText"))
-        if instr is not None and stack and not stack[-1]["sep"]:
-            stack[-1]["code"] += instr.text or ""
-    return codes
+    return [f.code for f in iter_complex_fields(root)]
 
 
 def _key_from_uri(uri: Optional[str]) -> Optional[str]:
@@ -942,19 +1001,212 @@ def _wrap_runs_as_del(runs: List[etree._Element], rev_id: int, author: str, date
     d.set(qn("w:date"), date)
     for r in runs:
         parent.remove(r)
-        # Use ``iter`` (not ``findall``) so text/instr nested below the run — e.g.
-        # under a Word built-in citation's ``<w:sdtContent>`` when ``r`` is the
-        # ``<w:sdt>`` itself — is converted to its tracked-deletion variant. With
-        # ``findall`` only the run's DIRECT children were touched, leaving a LIVE
-        # ``<w:instrText>``/``<w:t>`` (a live field + original text) inside the
-        # ``<w:del>`` for the sdt carrier.
-        for t in r.iter(qn("w:t")):
-            t.tag = qn("w:delText")
-        for it in r.iter(qn("w:instrText")):
-            it.tag = qn("w:delInstrText")
+        _as_deleted_text(r)
         d.append(r)
     parent.insert(idx, d)
     return d
+
+
+def _as_deleted_text(r: etree._Element) -> None:
+    """Convert ``r``'s ``w:t`` / ``w:instrText`` to their tracked-deletion
+    variants (``w:delText`` / ``w:delInstrText``), as content inside a ``w:del``
+    must be.
+
+    Uses ``iter`` (not ``findall``) so text/instr nested below the run — e.g.
+    under a Word built-in citation's ``<w:sdtContent>`` when ``r`` is the
+    ``<w:sdt>`` itself — is converted too. With ``findall`` only the run's DIRECT
+    children were touched, leaving a LIVE ``<w:instrText>``/``<w:t>`` (a live field
+    + original text) inside the ``<w:del>`` for the sdt carrier."""
+    for t in r.iter(qn("w:t")):
+        t.tag = qn("w:delText")
+    for it in r.iter(qn("w:instrText")):
+        it.tag = qn("w:delInstrText")
+
+
+# -- tracked-field consistency (field_tracking_mismatch) ---------------------
+# A field whose ``begin`` run sits in a tracked insertion/deletion must have EVERY
+# run up to its ``end`` removed in the same view(s); otherwise resolving the change
+# leaves a broken field or its stray result text. The shape in the wild: a Zotero
+# "Refresh" in Word rewrites the result runs of a tracked-inserted citation OUTSIDE
+# the field's ``w:ins``, so Reject All leaves a stray citation number (and, for a
+# tracked-deleted field, Accept All does). Word never writes this shape itself.
+_STORY_PART = re.compile(r"^word/(document|header\d*|footer\d*|footnotes|endnotes)\.xml$")
+_GONE_ON_REJECT = (qn("w:ins"), qn("w:moveTo"))
+_GONE_ON_ACCEPT = (qn("w:del"), qn("w:moveFrom"))
+
+
+def _story_parts(doc: Docx) -> List[str]:
+    """Body, header, footer, footnote and endnote parts (where fields live)."""
+    return [p for p in doc.parts() if _STORY_PART.match(p)]
+
+
+def _nearest(el: etree._Element, tags) -> Optional[etree._Element]:
+    anc = el.getparent()
+    while anc is not None:
+        if anc.tag in tags:
+            return anc
+        anc = anc.getparent()
+    return None
+
+
+def _field_mismatch(f: ComplexField) -> Optional[dict]:
+    """The inconsistency of one field, or ``None`` when it has none.
+
+    The begin's NEAREST ``w:ins`` / ``w:del`` ancestors are the templates (a begin
+    in ``ins > del`` needs both). A member run is loose when it is not removed in a
+    view that removes the begin: no ``w:ins``/``w:moveTo`` ancestor when the begin is
+    inserted, no ``w:del``/``w:moveFrom`` ancestor when it is deleted. A begin
+    tracked only by a move (``moveTo``/``moveFrom``) is out of scope."""
+    ins_t = _nearest(f.begin, (qn("w:ins"),))
+    del_t = _nearest(f.begin, (qn("w:del"),))
+    if ins_t is None and del_t is None:
+        return None
+    loose = []
+    for r in f.members:
+        need_ins = ins_t is not None and _nearest(r, _GONE_ON_REJECT) is None
+        need_del = del_t is not None and _nearest(r, _GONE_ON_ACCEPT) is None
+        if need_ins or need_del:
+            loose.append((r, need_ins, need_del))
+    if not loose:
+        return None
+    return {"field": f, "ins": ins_t, "del": del_t, "loose": loose}
+
+
+def _mismatches(root) -> List[dict]:
+    return [m for m in (_field_mismatch(f) for f in iter_complex_fields(root)) if m]
+
+
+def _describe(m: dict, part: str) -> dict:
+    tmpl = m["ins"] if m["ins"] is not None else m["del"]
+    kind = "+".join(k for k in ("ins", "del") if m[k] is not None)
+    text = "".join(t.text or "" for r, _, _ in m["loose"]
+                   for t in r.iter(qn("w:t"), qn("w:delText")))
+    return {
+        "part": part,
+        "field": m["field"].kind,
+        "tracked": kind,
+        "author": tmpl.get(qn("w:author")),
+        "date": tmpl.get(qn("w:date")),
+        "loose_runs": len(m["loose"]),
+        "loose_text": text,
+        "fixable": all(not (ni and _nearest(r, _GONE_ON_ACCEPT) is not None)
+                       for r, ni, _ in m["loose"]),
+    }
+
+
+def field_tracking_issues(doc: Docx) -> List[dict]:
+    """Read-only: one dict per complex field (any type; ZOTERO_ITEM is the case
+    seen in the wild) whose begin is tracked but some run up to its end is not
+    removed with it. Keys: ``part``, ``field`` (type token), ``tracked``
+    (``ins``/``del``/``ins+del``), the begin wrapper's ``author``/``date``,
+    ``loose_runs``, ``loose_text`` (the text that would be left stray) and
+    ``fixable`` (False only for a loose run already inside a bare deletion while
+    the field is inserted: wrapping it would need an insertion around a deletion).
+    Unparseable parts are skipped (the well-formedness check reports them)."""
+    from .docxio import DocxLoadError
+    out: List[dict] = []
+    for part in _story_parts(doc):
+        try:
+            root = doc.read_tree(part)
+        except DocxLoadError:
+            continue
+        out.extend(_describe(m, part) for m in _mismatches(root))
+    return out
+
+
+def _wrapper_like(template: etree._Element, ids) -> etree._Element:
+    """A new empty wrapper of ``template``'s tag carrying ALL its attributes
+    (author, date and any dateUtc/rsid) verbatim except a fresh ``w:id``."""
+    el = etree.Element(template.tag)
+    for k, v in template.attrib.items():
+        el.set(k, v)
+    el.set(qn("w:id"), ids.next())
+    return el
+
+
+def _wrap_group(runs: List[etree._Element], ins_t, del_t, ids) -> int:
+    """Wrap contiguous sibling ``runs`` in place: ``w:ins`` (copy of ``ins_t``)
+    outermost, then ``w:del`` (copy of ``del_t``) with its text converted to
+    delText — the ``ins > del`` shape Word writes. Returns wrappers created."""
+    parent, idx = runs[0].getparent(), runs[0].getparent().index(runs[0])
+    outer = inner = None
+    for t in (ins_t, del_t):
+        if t is None:
+            continue
+        w = _wrapper_like(t, ids)
+        if inner is None:
+            outer = w
+        else:
+            inner.append(w)
+        inner = w
+    for r in runs:
+        parent.remove(r)
+        if del_t is not None:
+            _as_deleted_text(r)
+        inner.append(r)
+    parent.insert(idx, outer)
+    return (ins_t is not None) + (del_t is not None)
+
+
+def fix_field_tracking(doc: Docx) -> dict:
+    """Re-wrap the loose runs of every tracked field (see
+    :func:`field_tracking_issues`) so the whole field resolves with its begin.
+
+    Each loose run gets a new wrapper of the kind it lacks, copying the begin
+    wrapper's author and ``w:date`` (and other attributes) verbatim, with a fresh
+    ``w:id`` unique across the story parts; text inside a new ``w:del`` becomes
+    ``w:delText`` / ``w:delInstrText``. Contiguous sibling runs share one wrapper.
+    The innermost field is repaired first, so a nested field's runs take their own
+    field's author. NOTHING is re-dated and no spread runs: the new wrappers
+    continue an existing mark, so they carry its exact date (the one deliberate
+    exception to the spread-own-marks rule). Consistent fields and every other
+    element are untouched; a second run is a no-op. An unfixable run (see
+    :func:`field_tracking_issues`) is left alone and counted in ``unfixed``.
+
+    Returns ``{"fields", "runs", "wrappers", "unfixed"}``."""
+    from .docxio import DocxLoadError
+    roots = {}
+    for part in _story_parts(doc):
+        try:
+            roots[part] = doc.read_tree(part)
+        except DocxLoadError:
+            continue
+    ids = _RevIds(etree.Element(qn("w:document")))      # one id space across parts
+    for root in roots.values():
+        ids.n = max(ids.n, _next_rev_id(root) - 1)
+    stats = {"fields": 0, "runs": 0, "wrappers": 0, "unfixed": 0}
+    for part, root in roots.items():
+        fields = list(iter_complex_fields(root))
+        touched = False
+        for f in fields:
+            m = _field_mismatch(f)       # re-evaluated: an inner fix may cover runs
+            if m is None:
+                continue
+            stats["fields"] += 1
+            groups: List[list] = []
+            loose_ids = {id(r) for r, _, _ in m["loose"]}
+            for r, need_ins, need_del in m["loose"]:
+                host = _nearest(r, (qn("w:r"),))
+                if host is not None and id(host) in loose_ids:
+                    continue                 # e.g. a textbox run: its host run is wrapped
+                if need_ins and _nearest(r, _GONE_ON_ACCEPT) is not None:
+                    stats["unfixed"] += 1
+                    continue
+                key = (need_ins, need_del)
+                g = groups[-1] if groups else None
+                if g and g[0] == key and g[1][-1].getnext() is r:
+                    g[1].append(r)
+                else:
+                    groups.append([key, [r]])
+            for (need_ins, need_del), runs in groups:
+                stats["wrappers"] += _wrap_group(
+                    runs, m["ins"] if need_ins else None,
+                    m["del"] if need_del else None, ids)
+                stats["runs"] += len(runs)
+                touched = True
+        if touched:
+            doc.tree(part)               # mark the part dirty for save
+    return stats
 
 
 def replace_field_with_zotero(
@@ -1289,16 +1541,18 @@ def _tracked_run_splice(root, para, marker_runs, new_runs, *, author: str, date:
       place (``revisions._wrap_run_as_deletion``; inside a foreign ``w:ins`` that
       is the valid ins>del nesting Word writes);
     * the field goes right after the marker: into the author's own insertion when
-      the marker's LAST run is in one, else as a NEW ``w:ins`` after the struck
-      span — a foreign insertion holding the last run is split there first, so the
-      new ``w:ins`` is a sibling (never nested) and lands exactly at the marker.
+      the marker's LAST run is in one written by THIS op (same ``w:date``), else as
+      a NEW ``w:ins`` after the struck span — an insertion holding the last run
+      (foreign, or the author's own from an earlier round) is split there first, so
+      the new ``w:ins`` is a sibling (never nested), lands exactly at the marker,
+      and an earlier round's insertion keeps its own ``w:date``.
     """
     from . import revisions
     ids = _RevIds(root)
     own = [_own_insertion(r, para, author) for r in marker_runs]
     last = marker_runs[-1]
-    new_ins = after = None
-    if own[-1] is not None:
+    new_ins = None
+    if own[-1] is not None and own[-1].get(qn("w:date")) == date:
         prev = last
         for x in new_runs:
             prev.addnext(x)
@@ -1319,7 +1573,11 @@ def _tracked_run_splice(root, para, marker_runs, new_runs, *, author: str, date:
                 for el in tail:
                     frag.append(el)
                 host.addnext(frag)
-            after = host
+            # Place the field now, between the host and its tail fragment: the
+            # loop below may empty and remove the host (an own earlier-round
+            # insertion holding only the marker), which would leave it detached.
+            host.addnext(new_ins)
+            new_ins = None
     for r, host in zip(marker_runs, own):
         if host is not None:
             host.remove(r)
@@ -1328,7 +1586,7 @@ def _tracked_run_splice(root, para, marker_runs, new_runs, *, author: str, date:
         else:
             revisions._wrap_run_as_deletion(r, ids, author, date)
     if new_ins is not None:
-        (after if after is not None else last.getparent()).addnext(new_ins)
+        last.getparent().addnext(new_ins)
 
 
 def _restore_children(para: etree._Element, snapshot: etree._Element) -> None:

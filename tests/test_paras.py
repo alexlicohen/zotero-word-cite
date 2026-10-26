@@ -173,17 +173,41 @@ def test_matches_read_views_accepted_content(tmp_path):
 # equivalence assertion has teeth even though find_paragraph(s) call ParaIndex.
 # ---------------------------------------------------------------------------
 
+def _own_story_text(p):
+    """Reference for the matching text, built independently of ``txbx_marker``: a copy
+    of ``p`` whose every text box (w:txbxContent) holds one U+FFFC run instead of its
+    paragraphs, read by the default paragraph_text (bug #5b: text-box text is a separate
+    story and never matches its host)."""
+    import copy
+
+    c = copy.deepcopy(p)
+    for tx in list(c.iter(qn("w:txbxContent"))):
+        if tx.getparent() is None:
+            continue
+        for ch in list(tx):
+            tx.remove(ch)
+        mp = etree.SubElement(tx, qn("w:p"))
+        etree.SubElement(etree.SubElement(mp, qn("w:r")), qn("w:t")).text = "\ufffc"
+    return paragraph_text(c)
+
+
 def _ref_find_all(root, anchor):
-    """The pre-ParaIndex find_paragraphs, verbatim (the contract under test)."""
+    """The pre-ParaIndex find_paragraphs over each paragraph's OWN story text (the
+    contract under test)."""
     a = _norm(anchor)
-    return [p for p in iter_paragraphs(root) if a in _norm(paragraph_text(p))]
+    return [p for p in iter_paragraphs(root) if a in _norm(_own_story_text(p))]
 
 
 def _ref_find(root, anchor):
+    from zoterocite.paras import TEXTBOX_ANCHOR_REASON
+
     hits = _ref_find_all(root, anchor)
     if len(hits) != 1:
-        raise LookupError(
-            f"anchor {anchor!r} matched {len(hits)} paragraphs (need exactly 1)")
+        msg = f"anchor {anchor!r} matched {len(hits)} paragraphs (need exactly 1)"
+        a = _norm(anchor)
+        if not hits and any(a in _norm(paragraph_text(p)) for p in iter_paragraphs(root)):
+            msg += f": {TEXTBOX_ANCHOR_REASON}"
+        raise LookupError(msg)
     return hits[0]
 
 
@@ -247,7 +271,7 @@ ANCHORS = [
     "shared marker (12)",            # AMBIGUOUS (two paragraphs, doc order)
     "STRUCK",                        # NOT FOUND (lives under w:del)
     "keep  tail",                    # unique, deletion gap preserved
-    "Figure caption alpha",          # textbox caption -> body p only, not the 2 inner
+    "Figure caption alpha",          # textbox caption -> NO paragraph (separate story)
     "no such anchor anywhere",       # NOT FOUND
     "  lesion   network  mapping  ", # whitespace-normalized to the unique anchor
 ]
@@ -284,14 +308,30 @@ def test_paraindex_find_matches_reference(anchor):
         assert str(ei_idx.value) == str(ei_ref.value) == str(ei_pub.value)
 
 
-def test_paraindex_excludes_textbox_inner_paragraphs():
-    # The caption resolves to exactly the ONE body paragraph; the duplicated
-    # Choice/Fallback w:txbxContent paragraphs are never returned (no "matched 3").
+def test_paraindex_textbox_caption_is_not_a_body_hit():
+    # Bug #5b: text that lives only in a text box resolves to NO paragraph -- neither
+    # the duplicated Choice/Fallback w:txbxContent paragraphs (no "matched 3") nor the
+    # host body paragraph, whose runs cannot reach it. in_textbox names the host so a
+    # caller can refuse with the explicit reason, and find() says why.
+    from zoterocite.paras import TEXTBOX_ANCHOR_REASON, anchor_in_textbox
+
     root, paras = _equivalence_root()
     idx = ParaIndex(root)
-    hits = idx.find_all("Figure caption alpha")
-    assert hits == [paras["textbox"]]
-    assert idx.find("Figure caption alpha") is paras["textbox"]
+    assert idx.find_all("Figure caption alpha") == []
+    assert idx.candidates("Figure caption alpha") == []
+    assert idx.in_textbox("Figure caption alpha") == [paras["textbox"]]
+    assert anchor_in_textbox(root, "Figure caption alpha")
+    with pytest.raises(LookupError) as ei:
+        idx.find("Figure caption alpha")
+    assert str(ei.value).endswith(TEXTBOX_ANCHOR_REASON)
+    # body text and an absent anchor are not text-box hits
+    assert idx.in_textbox("lesion network mapping") == []
+    assert not anchor_in_textbox(root, "no such anchor anywhere")
+    with pytest.raises(LookupError) as ei2:
+        idx.find("no such anchor anywhere")
+    assert TEXTBOX_ANCHOR_REASON not in str(ei2.value)
+    # paragraph_text (the views/reconstruction contract) still reads the caption once
+    assert paragraph_text(paras["textbox"]) == "Figure caption alpha"
 
 
 def test_tracked_move_source_excluded():
