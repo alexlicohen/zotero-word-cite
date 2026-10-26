@@ -118,6 +118,8 @@ ABSTRACT_HEADING_RE: Pattern = re.compile(r"^\s*abstract\s*:?\s*$", re.IGNORECAS
 # and refextract import THIS shared pattern.
 REFERENCES_HEADING_RE: Pattern = re.compile(
     r"^\s*(references|reference\s+list|references\s+cited|bibliography"
+    r"|bibliography\s*(?:&|and)\s*(?:literature|references)(?:\s+cited)?"
+    r"|references\s*(?:&|and)\s*(?:literature|citations)(?:\s+cited)?"
     r"|works\s+cited|literature\s+cited|citations|cited\s+literature)\s*:?\s*$",
     re.IGNORECASE,
 )
