@@ -53,6 +53,26 @@ MAX_NAME_LEN = 50
 _SAFE_RE = __import__("re").compile(r"[^A-Za-z0-9_\-]")
 _FILLER_RE = __import__("re").compile(r"^(draft|final|copy|version|ver|rev|v\d+)$", __import__("re").I)
 _COUNTER_RE = __import__("re").compile(r"^\d{1,3}$")
+_YEAR_RE = __import__("re").compile(r"^(?:19|20)\d{2}(?:\d{2}(?:\d{2})?)?$")
+_MONTH_RE = __import__("re").compile(
+    r"^(jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|june?|july?|aug(ust)?|"
+    r"sep(t(ember)?)?|oct(ober)?|nov(ember)?|dec(ember)?)$", __import__("re").I)
+
+
+def _date_prefix_len(tokens):
+    """Number of leading tokens forming a date prefix (``2026_Oct``, ``2026_10_26``,
+    ``202610``), else 0. Never consumes the whole name."""
+    if not tokens or not _YEAR_RE.match(tokens[0]):
+        return 0
+    n = 1
+    if len(tokens[0]) == 4 and len(tokens) > 1:
+        if _MONTH_RE.match(tokens[1]):
+            n = 2
+        elif _COUNTER_RE.match(tokens[1]) and len(tokens[1]) <= 2:
+            n = 2
+            if len(tokens) > 2 and _COUNTER_RE.match(tokens[2]) and len(tokens[2]) <= 2:
+                n = 3
+    return n if n < len(tokens) else 0
 
 
 def _filler_groups(tokens):
@@ -80,8 +100,11 @@ def short_name(name: str, *, max_len: int = MAX_NAME_LEN, taken=()) -> str:
     Order: (1) a clean name that fits is returned unchanged; (2) disallowed chars
     become ``_``; (3) whole filler words go first, last to first (``draft``, ``final``,
     ``copy``, ``version``, ``v2``, plus the counter after them or a trailing one);
-    (4) then whole words from the MIDDLE of the stem (first and last words stay);
-    (5) only if that cannot reach *max_len*, or the result is in *taken*, a 6-hex digest
+    (4) a leading date prefix (``2026_Oct_``, ``2026_10_26_``, ``202610_``) goes before any
+    PI/project word; (5) then whole words from the MIDDLE of the stem (first and last words
+    stay; after a date drop the first two words, mechanism and PI, stay and project words go
+    left to right while more than 3 remain);
+    (6) only if that cannot reach *max_len*, or the result is in *taken*, a 6-hex digest
     of the original name is prefixed to as many whole trailing words as fit (a word is
     cut only when the last word alone is too long). Extension kept."""
     import hashlib
@@ -103,8 +126,19 @@ def short_name(name: str, *, max_len: int = MAX_NAME_LEN, taken=()) -> str:
         drop = set(group)
         if len(drop) < len(tokens):
             tokens = [t for k, t in enumerate(tokens) if k not in drop]
+    dated = False
+    if not fits(tokens):
+        k = _date_prefix_len(tokens)
+        if k:
+            tokens = tokens[k:]
+            dated = True
     while not fits(tokens) and len(tokens) > 2:
-        del tokens[len(tokens) // 2]
+        if dated and len(tokens) > 3:
+            # keep the first two words (mechanism + PI) and the last (component);
+            # drop the earliest project words so the distinguishing tail words survive
+            del tokens[2]
+        else:
+            del tokens[len(tokens) // 2]
     cand = "_".join(tokens) + ext
     if fits(tokens) and cand not in taken:
         return cand
