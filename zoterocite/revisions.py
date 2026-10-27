@@ -1115,12 +1115,23 @@ _UNHANDLED_TABLE_REVISIONS = (
 # nested snapshot it carries (both share that same element name). See
 # _resolve_pr_changes.
 _PR_CHANGE_MARKS = (
+    ("w:rPrChange", "w:rPr"),
+    ("w:pPrChange", "w:pPr"),
     ("w:trPrChange", "w:trPr"),
     ("w:tcPrChange", "w:tcPr"),
     ("w:tblPrChange", "w:tblPr"),
     ("w:tblGridChange", "w:tblGrid"),
     ("w:sectPrChange", "w:sectPr"),
 )
+# Children of a properties element that are NOT part of its change snapshot, so a
+# reject keeps them (ECMA-376 17.13.5.29 / .31): a paragraph's pPrChange snapshot is
+# CT_PPrBase (no mark-run rPr, no sectPr), and a paragraph-mark rPr's revision
+# markers (ins/del/moveFrom/moveTo) record the MARK's revision, not its formatting.
+# ``(leading, trailing)``: kept children sit before / after the restored snapshot.
+_PR_CHANGE_KEEP = {
+    "w:pPr": ((), ("rPr", "sectPr")),
+    "w:rPr": (("ins", "del", "moveTo", "moveFrom"), ()),
+}
 
 
 def _guard_unhandled(root) -> None:
@@ -1157,10 +1168,14 @@ def _resolve_pr_changes(root, *, accept: bool) -> None:
 
     ACCEPT: drop the change record; the current properties already in place win.
     REJECT: replace the parent's current properties with the prior-properties
-            snapshot (then drop the change record). pPr/rPr changes are handled
-            separately by accept_all/reject_all and are intentionally untouched
-            here."""
+            snapshot (then drop the change record), as Word's Reject All does.
+            Children listed in _PR_CHANGE_KEEP are not part of the snapshot and stay
+            (a paragraph's mark-run rPr and sectPr; a mark rPr's revision markers).
+            A pPr/rPr left with no children at all is removed (both are optional)."""
     for change_name, props_name in _PR_CHANGE_MARKS:
+        lead_names, trail_names = _PR_CHANGE_KEEP.get(props_name, ((), ()))
+        lead = frozenset(qn("w:" + t) for t in lead_names)
+        keep = lead | frozenset(qn("w:" + t) for t in trail_names)
         for change in root.findall(".//" + qn(change_name)):
             parent = change.getparent()          # the props element (e.g. w:trPr)
             if parent is None:
@@ -1168,16 +1183,22 @@ def _resolve_pr_changes(root, *, accept: bool) -> None:
             if not accept:
                 snapshot = change.find(qn(props_name))   # nested prior-props
                 # Wipe the parent's current props (everything except the change
-                # record), then graft the prior props back in their place.
+                # record and the kept non-snapshot children), then graft the prior
+                # props back in after the leading kept children.
                 for child in list(parent):
-                    if child is not change:
+                    if child is not change and child.tag not in keep:
                         parent.remove(child)
                 if snapshot is not None:
-                    idx = parent.index(change)
+                    idx = sum(1 for c in parent if c.tag in lead)
                     for prior in list(snapshot):
+                        if prior.tag in keep or prior.tag == change.tag:
+                            continue
                         parent.insert(idx, prior)
                         idx += 1
             parent.remove(change)
+            if (not accept and props_name in _PR_CHANGE_KEEP and not len(parent)
+                    and parent.getparent() is not None):
+                parent.getparent().remove(parent)
 
 
 def _remove_move_range_markers(root) -> None:
@@ -1345,9 +1366,6 @@ def reject_all(doc: Docx) -> Docx:
     for mf in root.findall(".//" + qn("w:moveFrom")):
         _unwrap(mf)
     _remove_move_range_markers(root)
-    for ch in ("w:rPrChange", "w:pPrChange"):
-        for c in root.findall(".//" + qn(ch)):
-            c.getparent().remove(c)
     _resolve_pr_changes(root, accept=False)
     _reject_inserted_para_marks(root, marked)
     return doc
