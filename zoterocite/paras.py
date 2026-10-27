@@ -144,6 +144,180 @@ TEXTBOX_ANCHOR_REASON = (
     "anchor on body text)"
 )
 
+# -- Text-box LOCKSTEP resolution (tracked TEXT edits only) ------------------
+# A Word text box is stored twice inside one ``mc:AlternateContent``: the DrawingML
+# copy (``mc:Choice`` > ... > ``wps:txbx`` > ``w:txbxContent``) and the legacy VML copy
+# (``mc:Fallback`` > ``w:pict`` > ``v:shape`` > ``v:textbox`` > ``w:txbxContent``). A
+# tracked text edit must change BOTH, identically, or Word (Choice) and older readers
+# (Fallback) show different text. :meth:`ParaIndex.textbox_target` resolves an anchor
+# that lives only in a text box to the pair; :func:`textbox_copies` pairs a text-box
+# paragraph with its twin. Comments, citations and every other caller keep refusing
+# with :data:`TEXTBOX_ANCHOR_REASON`. Refusals:
+TEXTBOX_DRIFT_REASON = (
+    "text box copies differ: the paragraph's DrawingML (mc:Choice) and VML "
+    "(mc:Fallback) copies do not carry the same text, or the twin is missing, so a "
+    "lockstep edit cannot be placed safely (edit it in Word)")
+TEXTBOX_VML_ONLY_REASON = (
+    "text box is VML-only (no DrawingML mc:Choice copy): legacy VML text boxes are not "
+    "edited (edit it in Word)")
+TEXTBOX_AMBIGUOUS_REASON = (
+    "anchor matches more than one text-box paragraph (extend it so it is unique)")
+TEXTBOX_UNSUPPORTED_REASON = (
+    "text box shape not supported for editing: a text box nested in a text box, a "
+    "text box outside the document body, an unrecognised AlternateContent shape, or "
+    "tracked changes that already differ between its two copies (edit it in Word)")
+
+_MC_CHOICE, _MC_FALLBACK = qn("mc:Choice"), qn("mc:Fallback")
+_MC_AC = qn("mc:AlternateContent")
+_V_TEXTBOX = "{urn:schemas-microsoft-com:vml}textbox"
+_TXBX = qn("w:txbxContent")
+_NOT_BODY_ROOTS = frozenset(qn(t) for t in ("w:hdr", "w:ftr", "w:footnotes",
+                                            "w:endnotes", "w:comments"))
+# Revision elements compared between the two copies (ids excluded: each copy has its own).
+_COPY_REV_TAGS = tuple(qn("w:" + t) for t in ("ins", "del", "moveFrom", "moveTo",
+                                              "rPrChange", "pPrChange"))
+
+
+class TextboxTarget:
+    """A resolved text-box edit target: ``choice`` (the DrawingML copy's paragraph, or
+    the only copy), ``fallback`` (its VML twin, ``None`` for a Choice-only box) and
+    ``reason`` (``None`` when resolved, else one of the ``TEXTBOX_*`` refusals, in
+    which case both elements are ``None``)."""
+
+    __slots__ = ("choice", "fallback", "reason")
+
+    def __init__(self, choice=None, fallback=None, reason: Optional[str] = None):
+        self.choice, self.fallback, self.reason = choice, fallback, reason
+
+    @property
+    def copies(self) -> List[etree._Element]:
+        return [c for c in (self.choice, self.fallback) if c is not None]
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"TextboxTarget(copies={len(self.copies)}, reason={self.reason!r})"
+
+
+def _story_of(p: etree._Element) -> Optional[etree._Element]:
+    return next(p.iterancestors(_TXBX), None)
+
+
+def _story_paras(story: etree._Element) -> List[etree._Element]:
+    """The story's OWN paragraphs (not those of a text box nested inside it)."""
+    return [q for q in story.iter(qn("w:p")) if _story_of(q) is story]
+
+
+def _branch_of(story: etree._Element) -> Optional[etree._Element]:
+    """The nearest ``mc:Choice`` / ``mc:Fallback`` enclosing the text box."""
+    for anc in story.iterancestors():
+        if anc.tag in (_MC_CHOICE, _MC_FALLBACK):
+            return anc
+    return None
+
+
+def textbox_twin(p: etree._Element) -> Optional[etree._Element]:
+    """STRUCTURAL twin of a text-box paragraph: the paragraph at the same index of the
+    same-order text box in the OTHER branch (Choice <-> Fallback) of the same
+    ``mc:AlternateContent``, or ``None`` (not in a text box, no other branch, or the
+    branches' text-box / paragraph counts differ). Text is NOT compared: the timestamp
+    spreader uses this so a pair always shares one stamp."""
+    story = _story_of(p)
+    if story is None:
+        return None
+    branch = _branch_of(story)
+    ac = branch.getparent() if branch is not None else None
+    if ac is None or ac.tag != _MC_AC:
+        return None
+    choices = ac.findall(_MC_CHOICE)
+    fb = ac.find(_MC_FALLBACK)
+    if len(choices) != 1 or fb is None:
+        return None
+    other = fb if branch.tag == _MC_CHOICE else choices[0]
+    own_stories = list(branch.iter(_TXBX))
+    other_stories = list(other.iter(_TXBX))
+    if len(own_stories) != len(other_stories):
+        return None
+    twin_story = other_stories[own_stories.index(story)]
+    own, twin = _story_paras(story), _story_paras(twin_story)
+    if len(own) != len(twin):
+        return None
+    return twin[own.index(p)]
+
+
+def _rejected_text(p: etree._Element) -> str:
+    """``p``'s text with every tracked change rejected (insertions gone, deletions
+    back) — only for comparing the two copies of a text-box paragraph."""
+    out = []
+    skip = (qn("w:ins"), qn("w:moveTo"), _MC_FALLBACK, qn("w:pPr"))
+    text_tags = (qn("w:t"), qn("w:delText"))
+    for node in p.iter(*text_tags, qn("w:tab"), qn("w:br"), qn("w:cr")):
+        anc, hidden = node.getparent(), False
+        while anc is not None and anc is not p:
+            if anc.tag in skip:
+                hidden = True
+                break
+            anc = anc.getparent()
+        if hidden:
+            continue
+        out.append((node.text or "") if node.tag in text_tags
+                   else ("\t" if node.tag == qn("w:tab") else "\n"))
+    return "".join(out)
+
+
+def textbox_copy_signature(p: etree._Element):
+    """What must be identical between a text-box paragraph and its twin: accepted text,
+    rejected text, and every revision mark's kind, author and date in document order
+    (``w:id`` excluded: each copy carries its own)."""
+    aq, dq = qn("w:author"), qn("w:date")
+    revs = tuple((el.tag, el.get(aq), el.get(dq)) for el in p.iter(*_COPY_REV_TAGS))
+    return paragraph_text(p), _rejected_text(p), revs
+
+
+def textbox_copies(p: etree._Element) -> Optional[TextboxTarget]:
+    """Pair a text-box paragraph with its twin for a LOCKSTEP tracked text edit.
+
+    ``None`` when ``p`` is not in a text box (an ordinary paragraph: edit it alone).
+    Otherwise a :class:`TextboxTarget`: both copies (``p`` may be either one), the
+    single copy of a DrawingML box with no ``mc:Fallback``, or a refusal:
+    :data:`TEXTBOX_VML_ONLY_REASON` (no DrawingML copy), :data:`TEXTBOX_DRIFT_REASON`
+    (the Fallback holds no matching twin, or the twins' text differs),
+    :data:`TEXTBOX_UNSUPPORTED_REASON` (a nested text box, a part other than the
+    document body, an unrecognised AlternateContent, or tracked changes that already
+    differ between the copies)."""
+    story = _story_of(p)
+    if story is None:
+        return None
+    refuse = TextboxTarget
+    if (_story_of(story) is not None or any(t is not story for t in story.iter(_TXBX))
+            or p.getroottree().getroot().tag in _NOT_BODY_ROOTS):
+        return refuse(reason=TEXTBOX_UNSUPPORTED_REASON)
+    holder = story.getparent()
+    vml = holder is not None and holder.tag == _V_TEXTBOX
+    branch = _branch_of(story)
+    if branch is None:
+        # A bare text box (no AlternateContent): DrawingML = its one copy; VML-only refuses.
+        return refuse(reason=TEXTBOX_VML_ONLY_REASON) if vml else TextboxTarget(p, None)
+    ac = branch.getparent()
+    if ac is None or ac.tag != _MC_AC or len(ac.findall(_MC_CHOICE)) != 1:
+        return refuse(reason=TEXTBOX_UNSUPPORTED_REASON)
+    choice, fb = ac.find(_MC_CHOICE), ac.find(_MC_FALLBACK)
+    if branch.tag == _MC_FALLBACK and next(choice.iter(_TXBX), None) is None:
+        return refuse(reason=TEXTBOX_VML_ONLY_REASON)    # the Choice is no text box
+    if branch.tag == _MC_CHOICE and vml:
+        return refuse(reason=TEXTBOX_UNSUPPORTED_REASON)  # a VML box as the Choice
+    if branch.tag == _MC_CHOICE and fb is None:
+        return TextboxTarget(p, None)                     # Choice only: one copy
+    twin = textbox_twin(p)
+    if twin is None:
+        return refuse(reason=TEXTBOX_DRIFT_REASON)
+    c_p, f_p = (p, twin) if branch.tag == _MC_CHOICE else (twin, p)
+    if _story_of(f_p).getparent().tag != _V_TEXTBOX:
+        return refuse(reason=TEXTBOX_DRIFT_REASON)        # the Fallback is no VML text box
+    if paragraph_text(c_p) != paragraph_text(f_p):
+        return refuse(reason=TEXTBOX_DRIFT_REASON)
+    if textbox_copy_signature(c_p) != textbox_copy_signature(f_p):
+        return refuse(reason=TEXTBOX_UNSUPPORTED_REASON)  # tracked changes differ
+    return TextboxTarget(c_p, f_p)
+
 
 # -- Table-of-contents detection (anchor tie-break) --------------------------
 # A TOC entry repeats its heading's text, so a heading anchor substring-matches
@@ -277,7 +451,7 @@ class ParaIndex:
     invariant.
     """
 
-    __slots__ = ("_entries", "_root", "_toc_fields", "_txbx_entries")
+    __slots__ = ("_entries", "_root", "_toc_fields", "_txbx_entries", "_txbx_paras")
 
     def __init__(self, root: etree._Element) -> None:
         self._root = root
@@ -289,6 +463,7 @@ class ParaIndex:
             if _TXBX_MARK in own:
                 self._txbx_entries.append((p, own, _norm(paragraph_text(p))))
         self._toc_fields = None   # lazily built on the first ambiguous anchor
+        self._txbx_paras = None   # lazily built on the first textbox_target()
 
     def find_all(self, anchor: str) -> List[etree._Element]:
         a = _norm(anchor)
@@ -301,6 +476,35 @@ class ParaIndex:
         :data:`TEXTBOX_ANCHOR_REASON` instead of a plain "not found"."""
         a = _norm(anchor)
         return [p for (p, own, full) in self._txbx_entries if a in full and a not in own]
+
+    def textbox_target(self, anchor: str) -> Optional[TextboxTarget]:
+        """Resolve an anchor that lives ONLY in a text box (:meth:`in_textbox` is
+        non-empty) to a lockstep pair, for tracked TEXT edits only; every other caller
+        keeps refusing with :data:`TEXTBOX_ANCHOR_REASON`. ``None`` when the anchor is
+        not a text-box anchor.
+
+        The anchor must lie in ONE text-box paragraph's own text (normalized as
+        :meth:`find_all` does; a nested box stands in as one marker), matched over
+        every text-box paragraph except the ``mc:Fallback`` copies, which are paired,
+        never matched. That paragraph and its twin come from :func:`textbox_copies`.
+        Refusals: :data:`TEXTBOX_ANCHOR_REASON` (the anchor spans body and box text,
+        or two box paragraphs), :data:`TEXTBOX_AMBIGUOUS_REASON` (several box
+        paragraphs match), else :func:`textbox_copies`' own."""
+        if not self.in_textbox(anchor):
+            return None
+        if self._txbx_paras is None:
+            self._txbx_paras = [
+                (q, _norm(paragraph_text(q, txbx_marker=_TXBX_MARK)))
+                for q in self._root.iter(qn("w:p"))
+                if _story_of(q) is not None
+                and next(q.iterancestors(_MC_FALLBACK), None) is None]
+        a = _norm(anchor)
+        hits = [q for (q, t) in self._txbx_paras if a in t]
+        if not hits:
+            return TextboxTarget(reason=TEXTBOX_ANCHOR_REASON)
+        if len(hits) > 1:
+            return TextboxTarget(reason=TEXTBOX_AMBIGUOUS_REASON)
+        return textbox_copies(hits[0])
 
     def is_toc(self, p: etree._Element) -> bool:
         """Is *p* a table-of-contents paragraph? True if its pStyle starts with
