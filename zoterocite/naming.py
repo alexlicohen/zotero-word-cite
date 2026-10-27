@@ -37,7 +37,7 @@ def rename_to_convention(path: str | Path, *, apply: bool = False,
     fields.setdefault("ext", path.suffix or ".docx")
     name = convention_name(**fields)
     if short_names:
-        name = short_name(name)
+        name = short_name(name, drop_date=True)
     new = path.with_name(name)
     if apply and new != path:
         if new.exists() and new.resolve() != path.resolve():
@@ -94,7 +94,8 @@ def _filler_groups(tokens):
     return groups
 
 
-def short_name(name: str, *, max_len: int = MAX_NAME_LEN, taken=()) -> str:
+def short_name(name: str, *, max_len: int = MAX_NAME_LEN, taken=(),
+               drop_date: bool = False) -> str:
     """Deterministically shorten *name* to <= *max_len* chars incl. extension.
 
     Order: (1) a clean name that fits is returned unchanged; (2) disallowed chars
@@ -106,16 +107,26 @@ def short_name(name: str, *, max_len: int = MAX_NAME_LEN, taken=()) -> str:
     left to right while more than 3 remain);
     (6) only if that cannot reach *max_len*, or the result is in *taken*, a 6-hex digest
     of the original name is prefixed to as many whole trailing words as fit (a word is
-    cut only when the last word alone is too long). Extension kept."""
+    cut only when the last word alone is too long). Extension kept.
+
+    *drop_date* strips the leading date prefix unconditionally, even when the name
+    already fits (a submission set then shares one pattern); the word-dropping
+    rules then treat the name as dated."""
     import hashlib
     import os
     stem, ext = os.path.splitext(name)
     ext = "." + _SAFE_RE.sub("_", ext.lstrip(".")) if ext else ""
     clean = _SAFE_RE.sub("_", stem)
     cand = clean + ext
-    if len(cand) <= max_len and clean == stem and cand not in taken:
-        return cand
     tokens = [t for t in clean.split("_") if t] or ["file"]
+    dated = False
+    if drop_date:
+        k = _date_prefix_len(tokens)
+        if k and len(tokens) > k:
+            tokens = tokens[k:]
+            dated = True
+    if not dated and len(cand) <= max_len and clean == stem and cand not in taken:
+        return cand
 
     def fits(toks):
         return len("_".join(toks)) + len(ext) <= max_len
@@ -126,8 +137,7 @@ def short_name(name: str, *, max_len: int = MAX_NAME_LEN, taken=()) -> str:
         drop = set(group)
         if len(drop) < len(tokens):
             tokens = [t for k, t in enumerate(tokens) if k not in drop]
-    dated = False
-    if not fits(tokens):
+    if not dated and not fits(tokens):
         k = _date_prefix_len(tokens)
         if k:
             tokens = tokens[k:]
