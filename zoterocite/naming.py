@@ -109,9 +109,9 @@ def short_name(name: str, *, max_len: int = MAX_NAME_LEN, taken=(),
     of the original name is prefixed to as many whole trailing words as fit (a word is
     cut only when the last word alone is too long). Extension kept.
 
-    *drop_date* strips the leading date prefix unconditionally, even when the name
-    already fits (a submission set then shares one pattern); the word-dropping
-    rules then treat the name as dated."""
+    *drop_date* strips the leading date prefix AND the filler words/counters
+    (``draft_1``) unconditionally, even when the name already fits (a submission set
+    then shares one pattern); the word-dropping rules then treat the name as dated."""
     import hashlib
     import os
     stem, ext = os.path.splitext(name)
@@ -132,7 +132,9 @@ def short_name(name: str, *, max_len: int = MAX_NAME_LEN, taken=(),
         return len("_".join(toks)) + len(ext) <= max_len
 
     for group in reversed(_filler_groups(tokens)):
-        if fits(tokens):
+        # drop_date (rename --short-names) drops filler/counters unconditionally too,
+        # so names that already fit share the set's pattern
+        if fits(tokens) and not drop_date:
             break
         drop = set(group)
         if len(drop) < len(tokens):
